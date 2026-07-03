@@ -154,7 +154,8 @@ html, body {
 .topbar {
   display: flex;
   align-items: center;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
   margin-bottom: 20px;
 }
 
@@ -170,6 +171,56 @@ html, body {
 }
 
 .search-input:focus { outline: none; border-color: var(--accent); }
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.filter-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  margin-right: 4px;
+}
+
+.filter-input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: var(--mono);
+}
+
+.filter-input:focus { outline: none; border-color: var(--accent); }
+.filter-input::placeholder { color: var(--text-muted); }
+
+.filter-input-num { width: 68px; }
+.filter-input-day { width: 44px; }
+.filter-input-month { width: 44px; }
+
+.filter-select {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 6px;
+  font-size: 13px;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+
+.filter-select:focus { outline: none; border-color: var(--accent); }
+
+.filter-sep {
+  color: var(--text-muted);
+  font-size: 13px;
+  user-select: none;
+}
 
 .status-text {
   font-family: var(--mono);
