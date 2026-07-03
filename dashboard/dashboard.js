@@ -9,8 +9,14 @@ let state = { channels: {}, folders: {}, tags: {}, apiKey: "", gistToken: "", gi
 let currentFolderId = "all";
 let activeTagFilters = new Set();
 let searchQuery = "";
+let viewMode = "card"; // "card" | "list"
 // what the folder modal is currently doing: create-folder | rename-folder | rename-tag
 let folderModalMode = { type: "create-folder", id: null };
+
+// Infinite scroll: render channels in batches as the user scrolls near the bottom.
+const PAGE_SIZE = 40;
+let pendingChannels = []; // filtered channels not yet appended to the grid
+let scrollObserver = null;
 
 const el = {
   folderList: document.getElementById("folderList"),
@@ -37,6 +43,10 @@ const el = {
   folderSave: document.getElementById("folderSave"),
   folderCancel: document.getElementById("folderCancel"),
   contextMenu: document.getElementById("contextMenu"),
+  cardViewBtn: document.getElementById("cardViewBtn"),
+  listViewBtn: document.getElementById("listViewBtn"),
+  scrollSentinel: document.getElementById("scrollSentinel"),
+  main: document.querySelector(".main"),
 };
 
 init();
@@ -66,13 +76,28 @@ async function loadState() {
   state.gistToken = data.gistToken || "";
   state.gistId = data.gistId || "";
   state.lastSyncedAt = data.lastSyncedAt || null;
+  viewMode = data.viewMode === "list" ? "list" : "card";
 }
 
 // ---------- Render ----------
 
 function render() {
+  updateViewToggle();
   renderFolders();
   renderTagFilters();
+  renderGrid();
+}
+
+function updateViewToggle() {
+  el.cardViewBtn.classList.toggle("active", viewMode === "card");
+  el.listViewBtn.classList.toggle("active", viewMode === "list");
+}
+
+function setViewMode(mode) {
+  if (mode === viewMode) return;
+  viewMode = mode;
+  chrome.storage.local.set({ viewMode });
+  updateViewToggle();
   renderGrid();
 }
 
@@ -130,13 +155,43 @@ function renderTagFilters() {
 }
 
 function renderGrid() {
-  const list = getFilteredChannels();
+  pendingChannels = getFilteredChannels();
   el.channelGrid.innerHTML = "";
+  el.channelGrid.classList.toggle("list-view", viewMode === "list");
   el.emptyState.hidden = Object.keys(state.channels).length > 0;
 
-  for (const ch of list) {
-    el.channelGrid.appendChild(buildChannelCard(ch));
+  appendNextPage();
+  setupScrollObserver();
+}
+
+// Append the next batch of channels, then keep the sentinel positioned after them.
+function appendNextPage() {
+  const batch = pendingChannels.splice(0, PAGE_SIZE);
+  const frag = document.createDocumentFragment();
+  const build = viewMode === "list" ? buildChannelRow : buildChannelCard;
+  for (const ch of batch) frag.appendChild(build(ch));
+  el.channelGrid.appendChild(frag);
+
+  if (pendingChannels.length === 0 && scrollObserver) {
+    scrollObserver.unobserve(el.scrollSentinel);
   }
+}
+
+// Lazily create an IntersectionObserver that appends more channels as the
+// sentinel below the grid scrolls into view.
+function setupScrollObserver() {
+  if (!scrollObserver) {
+    scrollObserver = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting) && pendingChannels.length) {
+          appendNextPage();
+        }
+      },
+      { root: el.main, rootMargin: "400px 0px" }
+    );
+  }
+  scrollObserver.unobserve(el.scrollSentinel);
+  if (pendingChannels.length) scrollObserver.observe(el.scrollSentinel);
 }
 
 function getFilteredChannels() {
@@ -163,30 +218,9 @@ function buildChannelCard(ch) {
   card.className = "channel-card";
   card.dataset.channelId = ch.id;
 
-  const thumb = ch.thumbnail
-    ? `<img class="channel-thumb" src="${ch.thumbnail}" alt="" />`
-    : `<div class="channel-thumb"></div>`;
-
-  const folderOptions = Object.entries(state.folders)
-    .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
-    .map(
-      ([id, f]) =>
-        `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${escapeHtml(f.name)}</option>`
-    )
-    .join("");
-
-  const tagChips = (ch.tags || [])
-    .map((tid) => state.tags[tid])
-    .filter(Boolean)
-    .map(
-      (t, i) =>
-        `<span class="tag-chip" style="border-color:${t.color};color:${t.color}" data-role="remove-tag" data-tag-name="${escapeHtml(t.name)}">${escapeHtml(t.name)} ×</span>`
-    )
-    .join("");
-
   card.innerHTML = `
     <div class="channel-head">
-      ${thumb}
+      ${thumbHtml(ch)}
       <div class="channel-name-wrap">
         <div class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</div>
         <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
@@ -197,14 +231,67 @@ function buildChannelCard(ch) {
       <span>Videos: <b>${ch.videoCount ?? "—"}</b></span>
     </div>
     <div class="channel-tags">
-      ${tagChips}
+      ${tagChipsHtml(ch)}
       <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
     </div>
     <div class="channel-controls">
-      <select class="folder-select" data-role="move-folder">${folderOptions}</select>
+      <select class="folder-select" data-role="move-folder">${folderOptionsHtml(ch)}</select>
     </div>
   `;
   return card;
+}
+
+function buildChannelRow(ch) {
+  const row = document.createElement("div");
+  row.className = "channel-row";
+  row.dataset.channelId = ch.id;
+
+  row.innerHTML = `
+    ${thumbHtml(ch)}
+    <div class="channel-name-wrap">
+      <div class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</div>
+      <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
+    </div>
+    <div class="channel-stats">
+      <span>Last: <b>${formatRelativeDate(ch.lastVideoDate)}</b></span>
+      <span>Videos: <b>${ch.videoCount ?? "—"}</b></span>
+    </div>
+    <div class="channel-tags">
+      ${tagChipsHtml(ch)}
+      <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
+    </div>
+    <div class="channel-controls">
+      <select class="folder-select" data-role="move-folder">${folderOptionsHtml(ch)}</select>
+    </div>
+  `;
+  return row;
+}
+
+function thumbHtml(ch) {
+  return ch.thumbnail
+    ? `<img class="channel-thumb" src="${ch.thumbnail}" alt="" />`
+    : `<div class="channel-thumb"></div>`;
+}
+
+function folderOptionsHtml(ch) {
+  return Object.entries(state.folders)
+    .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
+    .map(
+      ([id, f]) =>
+        `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${escapeHtml(f.name)}</option>`
+    )
+    .join("");
+}
+
+function tagChipsHtml(ch) {
+  return (ch.tags || [])
+    .map((tid) => state.tags[tid])
+    .filter(Boolean)
+    .map(
+      (t) =>
+        `<span class="tag-chip" style="border-color:${t.color};color:${t.color}" data-role="remove-tag" data-tag-name="${escapeHtml(t.name)}">${escapeHtml(t.name)} ×</span>`
+    )
+    .join("");
 }
 
 // ---------- Helpers ----------
@@ -272,6 +359,9 @@ function bindEvents() {
     renderGrid();
   });
 
+  el.cardViewBtn.addEventListener("click", () => setViewMode("card"));
+  el.listViewBtn.addEventListener("click", () => setViewMode("list"));
+
   el.scanBtn.addEventListener("click", () => {
     chrome.tabs.create({ url: "https://www.youtube.com/feed/channels" });
   });
@@ -286,7 +376,7 @@ function bindEvents() {
 
   // Folder change / tag add-remove / channel card clicks
   el.channelGrid.addEventListener("click", async (e) => {
-    const channelCard = e.target.closest(".channel-card");
+    const channelCard = e.target.closest("[data-channel-id]");
     if (!channelCard) return;
     const channelId = channelCard.dataset.channelId;
 
@@ -312,7 +402,7 @@ function bindEvents() {
 
   el.channelGrid.addEventListener("change", async (e) => {
     if (e.target.dataset.role !== "move-folder") return;
-    const channelCard = e.target.closest(".channel-card");
+    const channelCard = e.target.closest("[data-channel-id]");
     const channelId = channelCard.dataset.channelId;
     state.channels[channelId].folderId = e.target.value;
     await chrome.storage.local.set({ channels: state.channels });
