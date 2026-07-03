@@ -47,6 +47,7 @@ const el = {
   listViewBtn: document.getElementById("listViewBtn"),
   scrollSentinel: document.getElementById("scrollSentinel"),
   main: document.querySelector(".main"),
+  clearDataBtn: document.getElementById("clearDataBtn"),
 };
 
 init();
@@ -518,6 +519,17 @@ function bindEvents() {
   });
   el.gistTokenInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") el.settingsSave.click();
+  });
+
+  el.clearDataBtn.addEventListener("click", async () => {
+    if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
+    await chrome.storage.local.clear();
+    state = { channels: {}, folders: { unsorted: { name: "Unsorted", order: 0 } }, tags: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null };
+    currentFolderId = "all";
+    activeTagFilters.clear();
+    searchQuery = "";
+    el.settingsModal.hidden = true;
+    render();
   });
 
   // Clicking the dark backdrop closes a modal

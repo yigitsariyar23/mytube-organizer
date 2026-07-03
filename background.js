@@ -20,6 +20,7 @@ const REFRESH_PERIOD_MIN = 180; // auto-refresh every 3 hours
 chrome.runtime.onInstalled.addListener(async () => {
   const data = await chrome.storage.local.get(["channels", "folders", "tags"]);
   if (!data.channels) await chrome.storage.local.set({ channels: {} });
+  else await repairDoubledNames(data.channels);
   if (!data.folders) {
     await chrome.storage.local.set({
       folders: { unsorted: { name: "Unsorted", order: 0 } },
@@ -79,6 +80,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
+// A scraper bug (fixed) saved every channel name doubled ("Zach Star Zach
+// Star"). Halve names that are an exact "X X" repetition. A genuinely doubled
+// name like "Duran Duran" was stored quadrupled by the same bug, so halving
+// is correct for it too; the next scan re-syncs names from YouTube anyway.
+async function repairDoubledNames(channels) {
+  let changed = false;
+  for (const ch of Object.values(channels)) {
+    const name = ch.name || "";
+    const mid = (name.length - 1) / 2;
+    if (name.length >= 3 && name[mid] === " " && name.slice(0, mid) === name.slice(mid + 1)) {
+      ch.name = name.slice(0, mid);
+      changed = true;
+    }
+  }
+  if (changed) await chrome.storage.local.set({ channels });
+}
+
 // ---------- Write scraped channels to storage ----------
 
 async function mergeScrapedChannels(scraped) {
@@ -118,12 +136,30 @@ async function resolveHandles(list) {
   const { apiKey } = await chrome.storage.local.get("apiKey");
   const { channels = {} } = await chrome.storage.local.get("channels");
 
-  const knownHandles = new Set(
-    Object.values(channels)
-      .map((c) => c.handle?.toLowerCase())
-      .filter(Boolean)
-  );
-  const pending = list.filter((c) => !knownHandles.has(c.handle.toLowerCase()));
+  // Already-known handles need no network resolution, but still take the
+  // freshly scraped name/thumbnail so a rescan heals stale or bad names.
+  const byHandle = new Map();
+  for (const c of Object.values(channels)) {
+    if (c.handle) byHandle.set(c.handle.toLowerCase(), c);
+  }
+  const pending = [];
+  let updated = false;
+  for (const c of list) {
+    const existing = byHandle.get(c.handle.toLowerCase());
+    if (!existing) {
+      pending.push(c);
+      continue;
+    }
+    if (c.name && c.name !== existing.name) {
+      existing.name = c.name;
+      updated = true;
+    }
+    if (c.thumbnail && c.thumbnail !== existing.thumbnail) {
+      existing.thumbnail = c.thumbnail;
+      updated = true;
+    }
+  }
+  if (updated) await chrome.storage.local.set({ channels });
 
   for (const group of chunk(pending, 5)) {
     await Promise.allSettled(
@@ -143,7 +179,13 @@ async function resolveHandles(list) {
             subscriberCount: null,
             lastFetched: null,
           };
-        } else if (!id) {
+        } else if (id) {
+          // already stored (e.g. via a /channel/UC… link that carried no
+          // handle) — attach the handle and refresh name/thumbnail
+          if (c.name) channels[id].name = c.name;
+          if (c.handle) channels[id].handle = c.handle;
+          if (c.thumbnail) channels[id].thumbnail = c.thumbnail;
+        } else {
           console.warn("could not resolve handle:", c.handle);
         }
       })
@@ -167,7 +209,10 @@ async function resolveHandleViaApi(handle, apiKey) {
 
 async function resolveHandleViaPage(handle) {
   try {
-    const res = await fetch(`https://www.youtube.com/${encodeURIComponent(handle)}`);
+    // Keep the leading "@" literal and encode only the (possibly non-ASCII)
+    // handle body, so Unicode handles like @DeğişikYollarda resolve correctly.
+    const body = handle.startsWith("@") ? handle.slice(1) : handle;
+    const res = await fetch(`https://www.youtube.com/@${encodeURIComponent(body)}`);
     if (!res.ok) return null;
     const text = await res.text();
     const match =
