@@ -28,7 +28,29 @@
     <main class="main">
       <div class="topbar">
         <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
-<span id="statusText" class="status-text"></span>
+        <div class="filter-group">
+          <label class="filter-label">Min videos</label>
+          <input id="filterMinCount" class="filter-input filter-input-num" type="number" min="0" placeholder="—" />
+          <label class="filter-label">Max videos</label>
+          <input id="filterMaxCount" class="filter-input filter-input-num" type="number" min="0" placeholder="—" />
+        </div>
+        <div class="filter-group">
+          <label class="filter-label">Last video after</label>
+          <input id="filterAfterDay" class="filter-input filter-input-day" type="number" min="1" max="31" placeholder="DD" />
+          <span class="filter-sep">/</span>
+          <input id="filterAfterMonth" class="filter-input filter-input-month" type="number" min="1" max="12" placeholder="MM" />
+          <span class="filter-sep">/</span>
+          <select id="filterAfterYear" class="filter-select"></select>
+        </div>
+        <div class="filter-group">
+          <label class="filter-label">Last video before</label>
+          <input id="filterBeforeDay" class="filter-input filter-input-day" type="number" min="1" max="31" placeholder="DD" />
+          <span class="filter-sep">/</span>
+          <input id="filterBeforeMonth" class="filter-input filter-input-month" type="number" min="1" max="12" placeholder="MM" />
+          <span class="filter-sep">/</span>
+          <select id="filterBeforeYear" class="filter-select"></select>
+        </div>
+        <span id="statusText" class="status-text"></span>
       </div>
 
       <div id="tagFilterBar" class="tag-filter-bar" hidden></div>

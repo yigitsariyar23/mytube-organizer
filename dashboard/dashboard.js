@@ -14,6 +14,12 @@ let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
 // what the folder modal is currently doing: create-folder | rename-folder | rename-tag
 let folderModalMode = { type: "create-folder", id: null };
 
+// Advanced filters
+let filterMinCount = null;
+let filterMaxCount = null;
+let filterAfterDate = null;  // ISO date string lower bound (inclusive)
+let filterBeforeDate = null; // ISO date string upper bound (inclusive)
+
 // Infinite scroll: render channels in batches as the user scrolls near the bottom.
 const PAGE_SIZE = 40;
 let pendingChannels = []; // filtered channels not yet appended to the grid
@@ -56,6 +62,14 @@ const el = {
   listTableHeader: document.getElementById("listTableHeader"),
   main: document.querySelector(".main"),
   clearDataBtn: document.getElementById("clearDataBtn"),
+  filterMinCount: document.getElementById("filterMinCount"),
+  filterMaxCount: document.getElementById("filterMaxCount"),
+  filterAfterDay: document.getElementById("filterAfterDay"),
+  filterAfterMonth: document.getElementById("filterAfterMonth"),
+  filterAfterYear: document.getElementById("filterAfterYear"),
+  filterBeforeDay: document.getElementById("filterBeforeDay"),
+  filterBeforeMonth: document.getElementById("filterBeforeMonth"),
+  filterBeforeYear: document.getElementById("filterBeforeYear"),
   scanDiffModal: document.getElementById("scanDiffModal"),
   scanDiffSummary: document.getElementById("scanDiffSummary"),
   scanDiffWarning: document.getElementById("scanDiffWarning"),
@@ -66,8 +80,18 @@ const el = {
 
 init();
 
+function populateYearDropdowns() {
+  const currentYear = new Date().getFullYear();
+  const years = ["—"];
+  for (let y = currentYear; y >= 2005; y--) years.push(y);
+  for (const sel of [el.filterAfterYear, el.filterBeforeYear]) {
+    sel.innerHTML = years.map(y => `<option value="${y}">${y}</option>`).join("");
+  }
+}
+
 async function init() {
   await loadState();
+  populateYearDropdowns();
   render();
   bindEvents();
 
@@ -221,6 +245,18 @@ function getFilteredChannels() {
     list = list.filter(
       (c) => c.name?.toLowerCase().includes(q) || c.handle?.toLowerCase().includes(q)
     );
+  }
+  if (filterMinCount !== null) {
+    list = list.filter((c) => (c.videoCount ?? 0) >= filterMinCount);
+  }
+  if (filterMaxCount !== null) {
+    list = list.filter((c) => (c.videoCount ?? 0) <= filterMaxCount);
+  }
+  if (filterAfterDate) {
+    list = list.filter((c) => c.lastVideoDate && c.lastVideoDate >= filterAfterDate);
+  }
+  if (filterBeforeDate) {
+    list = list.filter((c) => c.lastVideoDate && c.lastVideoDate <= filterBeforeDate);
   }
   list.sort(compareChannels);
   return list;
@@ -555,6 +591,41 @@ function bindEvents() {
     searchQuery = e.target.value;
     renderGrid();
   });
+
+  el.filterMinCount.addEventListener("input", (e) => {
+    filterMinCount = e.target.value !== "" ? parseInt(e.target.value, 10) : null;
+    renderGrid();
+  });
+  el.filterMaxCount.addEventListener("input", (e) => {
+    filterMaxCount = e.target.value !== "" ? parseInt(e.target.value, 10) : null;
+    renderGrid();
+  });
+
+  function readDateFilter(dayEl, monthEl, yearEl) {
+    const year = yearEl.value;
+    const day = dayEl.value;
+    const month = monthEl.value;
+    if (!year || year === "—") return null;
+    const yy = year.padStart(4, "0");
+    const mm = (month || "1").padStart(2, "0");
+    const dd = (day || "1").padStart(2, "0");
+    return `${yy}-${mm}-${dd}`;
+  }
+
+  const onAfterChange = () => {
+    filterAfterDate = readDateFilter(el.filterAfterDay, el.filterAfterMonth, el.filterAfterYear);
+    renderGrid();
+  };
+  const onBeforeChange = () => {
+    filterBeforeDate = readDateFilter(el.filterBeforeDay, el.filterBeforeMonth, el.filterBeforeYear);
+    renderGrid();
+  };
+  el.filterAfterDay.addEventListener("input", onAfterChange);
+  el.filterAfterMonth.addEventListener("input", onAfterChange);
+  el.filterAfterYear.addEventListener("change", onAfterChange);
+  el.filterBeforeDay.addEventListener("input", onBeforeChange);
+  el.filterBeforeMonth.addEventListener("input", onBeforeChange);
+  el.filterBeforeYear.addEventListener("change", onBeforeChange);
 
   el.listTableHeader.addEventListener("click", (e) => {
     const col = e.target.closest(".lth-sort-col");
