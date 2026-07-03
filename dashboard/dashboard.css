@@ -59,13 +59,34 @@ html, body {
   letter-spacing: 0.02em;
 }
 
-.section-label {
+.section-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-top: 14px;
+}
+
+.section-label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-muted);
 }
+
+.folder-sort-select {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 2px;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.folder-sort-select:hover { color: var(--text); }
+.folder-sort-select option { background: var(--panel); color: var(--text); }
 
 .folder-list {
   list-style: none;
@@ -86,12 +107,130 @@ html, body {
   color: var(--text-muted);
 }
 
+.folder-item .folder-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drag-handle {
+  cursor: grab;
+  opacity: 0;
+  margin-right: 6px;
+  font-size: 14px;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+  line-height: 1;
+  user-select: none;
+}
+
+.folder-item:hover .drag-handle { opacity: 0.5; }
+.folder-item .drag-handle:active { cursor: grabbing; }
+
+.folder-emoji {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+  user-select: none;
+}
+
+.folder-emoji:hover { background: rgba(255,255,255,0.08); }
+
+.folder-emoji-placeholder {
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.folder-item:hover .folder-emoji-placeholder { opacity: 1; }
+
+.folder-emoji-picker {
+  position: fixed;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+
+.folder-emoji-input {
+  width: 52px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 18px;
+  text-align: center;
+  padding: 4px 6px;
+  outline: none;
+}
+
+.folder-emoji-input:focus { border-color: var(--accent); }
+
+.folder-emoji-clear {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+.folder-emoji-clear:hover { color: var(--danger); background: rgba(224,112,90,0.1); }
+
+.folder-item.dragging {
+  opacity: 0.4;
+}
+
+.folder-item.drag-over {
+  background: var(--accent-dim);
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+
 .folder-item:hover { background: var(--panel-2); color: var(--text); }
 
 .folder-item.active {
   background: var(--accent-dim);
   color: var(--accent);
   font-weight: 600;
+}
+
+.folder-item--parent {
+  cursor: pointer;
+}
+
+
+.folder-item--hidden {
+  display: none;
+}
+
+.folder-item--child {
+  padding-left: 22px;
+  font-size: 12px;
+}
+
+.folder-item--child::before {
+  content: "↳";
+  margin-right: 6px;
+  opacity: 0.4;
+  flex-shrink: 0;
 }
 
 .folder-count {
@@ -539,6 +678,68 @@ html, body {
 .context-menu button:hover { background: var(--panel); }
 
 .context-menu button.danger { color: var(--danger); }
+
+.context-menu button.has-submenu {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.context-menu button.has-submenu::after {
+  content: "▶";
+  font-size: 10px;
+  opacity: 0.6;
+  margin-left: 8px;
+}
+
+.context-menu-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.context-submenu {
+  position: fixed;
+  z-index: 2001;
+  min-width: 160px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.context-submenu[hidden] { display: none; }
+
+.context-submenu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: var(--sans);
+  cursor: pointer;
+}
+
+.context-submenu button:hover { background: var(--panel); }
+.context-submenu button.active-folder { font-weight: 600; }
+
+.context-submenu button.has-submenu {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.context-submenu button.has-submenu::after {
+  content: "▶";
+  font-size: 10px;
+  opacity: 0.6;
+  margin-left: 8px;
+}
 
 /* ---------- Scan review dialog ---------- */
 

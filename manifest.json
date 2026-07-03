@@ -21,7 +21,17 @@
       "run_at": "document_idle"
     }
   ],
+  "_icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "action": {
-    "default_title": "Open MyTube Organizer"
+    "default_title": "Open MyTube Organizer",
+    "_default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   }
 }

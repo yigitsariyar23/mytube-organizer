@@ -16,7 +16,15 @@
       <button id="scanBtn" class="btn btn-primary btn-block">Scan Channels</button>
       <button id="refreshBtn" class="btn btn-ghost btn-block">Refresh Stats</button>
 
-      <div class="section-label">Folders</div>
+      <div class="section-label-row">
+        <span class="section-label">Folders</span>
+        <select id="folderSortSelect" class="folder-sort-select">
+          <option value="custom">Custom</option>
+          <option value="alpha">A → Z</option>
+          <option value="count-desc">Count ↓</option>
+          <option value="count-asc">Count ↑</option>
+        </select>
+      </div>
       <ul id="folderList" class="folder-list"></ul>
       <button id="addFolderBtn" class="btn btn-text">+ New folder</button>
 
@@ -88,7 +96,7 @@
         APIs & Services → Credentials.
       </p>
       <label class="field-label" for="gistTokenInput">GitHub token — cross-device sync</label>
-      <input id="gistTokenInput" class="field-input" type="password" placeholder="github_pat_… / ghp_…" />
+      <input id="gistTokenInput" class="field-input" type="text" placeholder="github_pat_… / ghp_…" />
       <p class="field-hint">
         Syncs your folders, tags and channels through a secret GitHub Gist. Create a token at
         github.com → Settings → Developer settings → Personal access tokens, granting only the
@@ -114,6 +122,10 @@
       <h2 id="folderModalTitle">New folder</h2>
       <label id="folderNameLabel" class="field-label" for="folderNameInput">Folder name</label>
       <input id="folderNameInput" class="field-input" type="text" placeholder="e.g. Gaming, Science, Music" />
+      <div id="folderParentRow" hidden>
+        <label class="field-label" for="folderParentSelect">Inside folder (optional)</label>
+        <select id="folderParentSelect" class="field-input"></select>
+      </div>
       <div class="modal-actions">
         <button id="folderCancel" class="btn btn-ghost">Cancel</button>
         <button id="folderSave" class="btn btn-primary">Create</button>
@@ -151,6 +163,8 @@
 
   <!-- Right-click menu -->
   <div id="contextMenu" class="context-menu" hidden></div>
+  <div id="contextSubmenu" class="context-submenu" hidden></div>
+  <div id="contextSubSubmenu" class="context-submenu" hidden></div>
 
   <script src="dashboard.js"></script>
 </body>

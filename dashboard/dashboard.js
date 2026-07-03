@@ -11,6 +11,8 @@ let activeTagFilters = new Set();
 let searchQuery = "";
 let sortDate = "desc"; // "desc" (newest first) | "asc" (oldest first) | "none"
 let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
+let folderSort = "custom"; // "custom" | "alpha" | "count"
+const collapsedFolders = new Set(); // parent folder ids that are collapsed
 // what the folder modal is currently doing: create-folder | rename-folder | rename-tag
 let folderModalMode = { type: "create-folder", id: null };
 
@@ -27,6 +29,7 @@ let scrollObserver = null;
 
 const el = {
   folderList: document.getElementById("folderList"),
+  folderSortSelect: document.getElementById("folderSortSelect"),
   tagFilterBar: document.getElementById("tagFilterBar"),
   channelGrid: document.getElementById("channelGrid"),
   emptyState: document.getElementById("emptyState"),
@@ -55,9 +58,13 @@ const el = {
   folderModalTitle: document.getElementById("folderModalTitle"),
   folderNameLabel: document.getElementById("folderNameLabel"),
   folderNameInput: document.getElementById("folderNameInput"),
+  folderParentRow: document.getElementById("folderParentRow"),
+  folderParentSelect: document.getElementById("folderParentSelect"),
   folderSave: document.getElementById("folderSave"),
   folderCancel: document.getElementById("folderCancel"),
   contextMenu: document.getElementById("contextMenu"),
+  contextSubmenu: document.getElementById("contextSubmenu"),
+  contextSubSubmenu: document.getElementById("contextSubSubmenu"),
   scrollSentinel: document.getElementById("scrollSentinel"),
   listTableHeader: document.getElementById("listTableHeader"),
   main: document.querySelector(".main"),
@@ -115,7 +122,7 @@ async function init() {
 async function loadState() {
   const data = await chrome.storage.local.get([
     "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
-    "sortDate", "sortCount",
+    "sortDate", "sortCount", "folderSort",
   ]);
   state.channels = data.channels || {};
   state.folders = data.folders || { unsorted: { name: "Unsorted", order: 0 } };
@@ -127,6 +134,7 @@ async function loadState() {
   state.pendingScan = data.pendingScan || null;
   sortDate = data.sortDate === "asc" || data.sortDate === "none" ? data.sortDate : "desc";
   sortCount = data.sortCount === "desc" || data.sortCount === "asc" ? data.sortCount : "none";
+  folderSort = ["alpha", "count-desc", "count-asc"].includes(data.folderSort) ? data.folderSort : "custom";
 }
 
 // ---------- Render ----------
@@ -137,26 +145,223 @@ function render() {
   renderGrid();
 }
 
-function renderFolders() {
-  const all = Object.values(state.channels).length;
-  const items = [{ id: "all", name: "All", count: all, deletable: false }];
+// Returns child folder ids for a given parent
+function getChildFolderIds(parentId) {
+  return Object.keys(state.folders).filter((id) => state.folders[id].parentId === parentId);
+}
 
-  const sortedFolders = Object.entries(state.folders).sort(
-    (a, b) => (a[1].order ?? 0) - (b[1].order ?? 0)
-  );
-  for (const [id, folder] of sortedFolders) {
-    const count = Object.values(state.channels).filter((c) => c.folderId === id).length;
-    items.push({ id, name: folder.name, count, deletable: id !== "unsorted" });
-  }
+// Count channels in a folder and all its children
+function getFolderChannelCount(folderId) {
+  const childIds = getChildFolderIds(folderId);
+  const allIds = new Set([folderId, ...childIds]);
+  return Object.values(state.channels).filter((c) => allIds.has(c.folderId)).length;
+}
+
+function renderFolders() {
+  if (el.folderSortSelect) el.folderSortSelect.value = folderSort;
 
   el.folderList.innerHTML = "";
-  for (const item of items) {
-    const li = document.createElement("li");
-    li.className = "folder-item" + (item.id === currentFolderId ? " active" : "");
-    li.dataset.folderId = item.id;
-    li.innerHTML = `<span>${escapeHtml(item.name)}</span><span class="folder-count">${item.count}</span>`;
-    el.folderList.appendChild(li);
+
+  // "All" virtual item
+  const allLi = document.createElement("li");
+  allLi.className = "folder-item" + (currentFolderId === "all" ? " active" : "");
+  allLi.dataset.folderId = "all";
+  allLi.innerHTML = `<span class="folder-name">All</span><span class="folder-count">${Object.values(state.channels).length}</span>`;
+  el.folderList.appendChild(allLi);
+
+  // Separate top-level and child folders
+  const topLevelEntries = Object.entries(state.folders)
+    .filter(([, f]) => !f.parentId)
+    .map(([id, folder]) => ({
+      id,
+      name: folder.name,
+      count: getFolderChannelCount(id),
+      order: folder.order ?? 0,
+    }));
+
+  const unsorted = topLevelEntries.find((f) => f.id === "unsorted");
+  let rest = topLevelEntries.filter((f) => f.id !== "unsorted");
+
+  if (folderSort === "alpha") {
+    rest.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (folderSort === "count-desc") {
+    rest.sort((a, b) => b.count - a.count);
+  } else if (folderSort === "count-asc") {
+    rest.sort((a, b) => a.count - b.count);
+  } else {
+    rest.sort((a, b) => a.order - b.order);
   }
+
+  const topLevelSorted = unsorted ? [unsorted, ...rest] : rest;
+
+  for (const f of topLevelSorted) {
+    const draggable = f.id !== "unsorted" && folderSort === "custom";
+    const li = document.createElement("li");
+    const hasChildren = f.id !== "unsorted" && Object.values(state.folders).some((cf) => cf.parentId === f.id);
+    const isCollapsed = hasChildren && collapsedFolders.has(f.id);
+    li.className = "folder-item" + (f.id === currentFolderId ? " active" : "") + (hasChildren ? " folder-item--parent" : "") + (isCollapsed ? " folder-item--collapsed" : "");
+    li.dataset.folderId = f.id;
+    if (hasChildren) li.dataset.parentFolder = "1";
+    li.draggable = draggable;
+    const emoji = state.folders[f.id]?.emoji || "";
+    li.innerHTML = `${folderEmojiSlotHtml(f.id, emoji)}<span class="folder-name">${escapeHtml(f.name)}</span><span class="folder-count">${f.count}</span>`;
+    el.folderList.appendChild(li);
+
+    // Render children under this parent
+    if (f.id !== "unsorted") {
+      const children = Object.entries(state.folders)
+        .filter(([, cf]) => cf.parentId === f.id)
+        .map(([id, cf]) => ({ id, name: cf.name, order: cf.order ?? 0, emoji: cf.emoji || "",
+          count: Object.values(state.channels).filter((c) => c.folderId === id).length }))
+        .sort((a, b) => a.order - b.order);
+
+      for (const child of children) {
+        const childLi = document.createElement("li");
+        childLi.className = "folder-item folder-item--child" + (child.id === currentFolderId ? " active" : "") + (isCollapsed ? " folder-item--hidden" : "");
+        childLi.dataset.folderId = child.id;
+        childLi.innerHTML = `${folderEmojiSlotHtml(child.id, child.emoji)}<span class="folder-name">${escapeHtml(child.name)}</span><span class="folder-count">${child.count}</span>`;
+        el.folderList.appendChild(childLi);
+      }
+    }
+  }
+
+  initFolderDrag();
+  initFolderEmojiSlots();
+}
+
+function folderEmojiSlotHtml(folderId, emoji) {
+  if (folderId === "unsorted") return "";
+  return `<span class="folder-emoji" data-folder-id="${folderId}" title="Set emoji">${emoji || '<span class="folder-emoji-placeholder">+</span>'}</span>`;
+}
+
+function initFolderEmojiSlots() {
+  el.folderList.querySelectorAll(".folder-emoji").forEach((slot) => {
+    slot.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const folderId = slot.dataset.folderId;
+      openEmojiInput(slot, folderId);
+    });
+  });
+}
+
+function openEmojiInput(anchorEl, folderId) {
+  // Remove any existing picker
+  document.querySelector(".folder-emoji-picker")?.remove();
+
+  const picker = document.createElement("div");
+  picker.className = "folder-emoji-picker";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "folder-emoji-input";
+  input.placeholder = "😀";
+  input.value = state.folders[folderId]?.emoji || "";
+  input.maxLength = 4; // room for one emoji (some are multi-codepoint)
+
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "folder-emoji-clear";
+  clearBtn.textContent = "✕";
+  clearBtn.title = "Clear emoji";
+
+  picker.appendChild(input);
+  picker.appendChild(clearBtn);
+  document.body.appendChild(picker);
+
+  // Position below the slot
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.left = rect.left + "px";
+  picker.style.top = (rect.bottom + 4) + "px";
+
+  input.focus();
+  input.select();
+
+  const save = async (value) => {
+    const emoji = [...value.trim()].slice(0, 2).join(""); // take first emoji (may be 2 codepoints)
+    if (state.folders[folderId]) {
+      if (emoji) state.folders[folderId].emoji = emoji;
+      else delete state.folders[folderId].emoji;
+      await chrome.storage.local.set({ folders: state.folders });
+      renderFolders();
+    }
+    picker.remove();
+  };
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") save(input.value);
+    if (e.key === "Escape") picker.remove();
+  });
+
+  // Auto-save when a single emoji is typed
+  input.addEventListener("input", () => {
+    const chars = [...input.value.trim()];
+    if (chars.length >= 1) save(input.value);
+  });
+
+  clearBtn.addEventListener("click", () => save(""));
+
+  // Dismiss on outside click
+  setTimeout(() => {
+    document.addEventListener("click", function outside(e) {
+      if (!picker.contains(e.target)) {
+        picker.remove();
+        document.removeEventListener("click", outside);
+      }
+    });
+  }, 0);
+}
+
+function initFolderDrag() {
+  let dragSrc = null;
+
+  el.folderList.querySelectorAll(".folder-item[draggable]").forEach((li) => {
+    li.addEventListener("dragstart", (e) => {
+      dragSrc = li;
+      li.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+    });
+
+    li.addEventListener("dragend", () => {
+      li.classList.remove("dragging");
+      el.folderList.querySelectorAll(".folder-item").forEach((x) => x.classList.remove("drag-over"));
+      dragSrc = null;
+    });
+
+    li.addEventListener("dragover", (e) => {
+      if (!dragSrc || dragSrc === li) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      el.folderList.querySelectorAll(".folder-item").forEach((x) => x.classList.remove("drag-over"));
+      li.classList.add("drag-over");
+    });
+
+    li.addEventListener("dragleave", () => {
+      li.classList.remove("drag-over");
+    });
+
+    li.addEventListener("drop", (e) => {
+      e.preventDefault();
+      if (!dragSrc || dragSrc === li) return;
+      li.classList.remove("drag-over");
+
+      // Reorder DOM
+      const items = [...el.folderList.querySelectorAll(".folder-item[draggable]")];
+      const srcIdx = items.indexOf(dragSrc);
+      const dstIdx = items.indexOf(li);
+      if (srcIdx < dstIdx) {
+        li.after(dragSrc);
+      } else {
+        li.before(dragSrc);
+      }
+
+      // Persist new order (skip "all" which has no entry in state.folders)
+      const ordered = [...el.folderList.querySelectorAll(".folder-item[draggable]")];
+      ordered.forEach((item, i) => {
+        const id = item.dataset.folderId;
+        if (state.folders[id]) state.folders[id].order = i;
+      });
+      chrome.storage.local.set({ folders: state.folders });
+    });
+  });
 }
 
 function renderTagFilters() {
@@ -235,7 +440,9 @@ function getFilteredChannels() {
   let list = Object.values(state.channels);
 
   if (currentFolderId !== "all") {
-    list = list.filter((c) => c.folderId === currentFolderId);
+    const childIds = getChildFolderIds(currentFolderId);
+    const allIds = new Set([currentFolderId, ...childIds]);
+    list = list.filter((c) => allIds.has(c.folderId));
   }
   if (activeTagFilters.size) {
     list = list.filter((c) => c.tags?.some((t) => activeTagFilters.has(t)));
@@ -352,13 +559,38 @@ function thumbHtml(ch) {
 }
 
 function folderOptionsHtml(ch) {
-  return Object.entries(state.folders)
-    .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
-    .map(
-      ([id, f]) =>
-        `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${escapeHtml(f.name)}</option>`
+  return buildOrderedFolderList()
+    .filter(({ id }) => {
+      // Exclude parent folders that have children — channels can only live in leaf folders
+      return !Object.values(state.folders).some((f) => f.parentId === id);
+    })
+    .map(({ id, f, isChild }) =>
+      `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${isChild ? "  " : ""}${escapeHtml(f.name)}</option>`
     )
     .join("");
+}
+
+// Returns folders in sidebar order: top-level (unsorted first, then rest), each followed by their children
+function buildOrderedFolderList() {
+  const topLevel = Object.entries(state.folders)
+    .filter(([, f]) => !f.parentId)
+    .sort((a, b) => {
+      if (a[0] === "unsorted") return -1;
+      if (b[0] === "unsorted") return 1;
+      return (a[1].order ?? 0) - (b[1].order ?? 0);
+    });
+
+  const result = [];
+  for (const [id, f] of topLevel) {
+    result.push({ id, f, isChild: false });
+    const children = Object.entries(state.folders)
+      .filter(([, cf]) => cf.parentId === id)
+      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0));
+    for (const [cid, cf] of children) {
+      result.push({ id: cid, f: cf, isChild: true });
+    }
+  }
+  return result;
 }
 
 function tagChipsHtml(ch) {
@@ -572,6 +804,13 @@ function bindEvents() {
   el.folderList.addEventListener("click", (e) => {
     const li = e.target.closest(".folder-item");
     if (!li) return;
+    if (li.dataset.parentFolder) {
+      const fid = li.dataset.folderId;
+      if (collapsedFolders.has(fid)) collapsedFolders.delete(fid);
+      else collapsedFolders.add(fid);
+      renderFolders();
+      return;
+    }
     currentFolderId = li.dataset.folderId;
     activeTagFilters.clear(); // filters are per-folder-view
     render();
@@ -642,6 +881,12 @@ function bindEvents() {
     renderGrid();
   });
 
+  el.folderSortSelect.addEventListener("change", () => {
+    folderSort = el.folderSortSelect.value;
+    chrome.storage.local.set({ folderSort });
+    renderFolders();
+  });
+
   el.scanBtn.addEventListener("click", () => {
     chrome.tabs.create({ url: "https://www.youtube.com/feed/channels" });
   });
@@ -694,6 +939,29 @@ function bindEvents() {
       e.preventDefault();
       chrome.tabs.create({ url: `https://www.youtube.com/channel/${channelCard.dataset.channelId}/videos`, active: false });
     }
+  });
+
+  // Right-click menu on channel cards/rows
+  el.channelGrid.addEventListener("contextmenu", (e) => {
+    const channelCard = e.target.closest("[data-channel-id]");
+    if (!channelCard) return;
+    e.preventDefault();
+    const channelId = channelCard.dataset.channelId;
+    const ch = state.channels[channelId];
+    if (!ch) return;
+
+    showContextMenu(e.clientX, e.clientY, [
+      {
+        label: "Move to folder",
+        submenu: () => buildFolderSubmenu(channelId, ch),
+      },
+      { separator: true },
+      {
+        label: "Delete channel",
+        danger: true,
+        action: () => deleteChannel(channelId),
+      },
+    ]);
   });
 
   el.channelGrid.addEventListener("change", async (e) => {
@@ -760,8 +1028,14 @@ function bindEvents() {
       await chrome.storage.local.set({ tags: state.tags });
     } else if (type === "create-folder") {
       const newId = slugify(name) + "-" + Date.now().toString(36).slice(-4);
-      const order = Object.keys(state.folders).length;
-      state.folders[newId] = { name, order };
+      const parentId = el.folderParentSelect.value || null;
+      const siblings = Object.values(state.folders).filter((f) =>
+        parentId ? f.parentId === parentId : !f.parentId
+      );
+      const order = siblings.length;
+      const folderData = { name, order };
+      if (parentId) folderData.parentId = parentId;
+      state.folders[newId] = folderData;
       await chrome.storage.local.set({ folders: state.folders });
     }
     el.folderModal.hidden = true;
@@ -775,11 +1049,17 @@ function bindEvents() {
     e.preventDefault();
     const id = li.dataset.folderId;
     if (id === "all") return; // virtual folder, nothing to manage
-    const items = [{ label: "Rename…", action: () => openFolderModal("rename-folder", id) }];
-    if (id !== "unsorted") {
-      items.push({ label: "Delete", danger: true, action: () => deleteFolder(id) });
+    const folder = state.folders[id];
+    const isChild = !!folder?.parentId;
+    const menuItems = [{ label: "Rename…", action: () => openFolderModal("rename-folder", id) }];
+    // Only allow subfolders one level deep (top-level folders can have children)
+    if (!isChild && id !== "unsorted") {
+      menuItems.push({ label: "New subfolder…", action: () => openFolderModal("create-folder", null, id) });
     }
-    showContextMenu(e.clientX, e.clientY, items);
+    if (id !== "unsorted") {
+      menuItems.push({ label: "Delete", danger: true, action: () => deleteFolder(id) });
+    }
+    showContextMenu(e.clientX, e.clientY, menuItems);
   });
 
   // Right-click menu on tag filter chips
@@ -925,7 +1205,7 @@ function bindEvents() {
 
 // ---------- Folder / tag management ----------
 
-function openFolderModal(type, id = null) {
+function openFolderModal(type, id = null, defaultParentId = null) {
   folderModalMode = { type, id };
   const texts = {
     "create-folder": { title: "New folder", label: "Folder name", save: "Create", value: "" },
@@ -937,6 +1217,21 @@ function openFolderModal(type, id = null) {
   el.folderNameLabel.textContent = t.label;
   el.folderSave.textContent = t.save;
   el.folderNameInput.value = t.value;
+
+  // Show parent selector only when creating a folder
+  const isCreate = type === "create-folder";
+  el.folderParentRow.hidden = !isCreate;
+  if (isCreate) {
+    // Populate with top-level folders (excluding unsorted, which can't be a parent)
+    const parentOptions = Object.entries(state.folders)
+      .filter(([fid, f]) => !f.parentId && fid !== "unsorted")
+      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
+      .map(([fid, f]) => `<option value="${fid}"${defaultParentId === fid ? " selected" : ""}>${escapeHtml(f.name)}</option>`)
+      .join("");
+    el.folderParentSelect.innerHTML = `<option value="">— None (top-level)</option>${parentOptions}`;
+    el.folderParentSelect.value = defaultParentId || "";
+  }
+
   el.folderModal.hidden = false;
   el.folderNameInput.focus();
   el.folderNameInput.select();
@@ -945,17 +1240,31 @@ function openFolderModal(type, id = null) {
 async function deleteFolder(id) {
   const folder = state.folders[id];
   if (!folder || id === "unsorted") return;
-  const count = Object.values(state.channels).filter((c) => c.folderId === id).length;
-  const msg = count
-    ? `Delete folder "${folder.name}"? Its ${count} channel${count === 1 ? "" : "s"} will move to Unsorted.`
-    : `Delete folder "${folder.name}"?`;
+
+  const childIds = getChildFolderIds(id);
+  const directCount = Object.values(state.channels).filter((c) => c.folderId === id).length;
+  const childCount = Object.values(state.channels).filter((c) => childIds.includes(c.folderId)).length;
+  const totalCount = directCount + childCount;
+
+  let msg = `Delete folder "${folder.name}"?`;
+  if (childIds.length) {
+    msg += ` Its ${childIds.length} subfolder${childIds.length === 1 ? "" : "s"} will become top-level.`;
+  }
+  if (totalCount) {
+    msg += ` ${totalCount} channel${totalCount === 1 ? "" : "s"} will move to Unsorted.`;
+  }
   if (!confirm(msg)) return;
 
+  // Move channels to unsorted
   for (const ch of Object.values(state.channels)) {
-    if (ch.folderId === id) ch.folderId = "unsorted";
+    if (ch.folderId === id || childIds.includes(ch.folderId)) ch.folderId = "unsorted";
+  }
+  // Promote children to top-level
+  for (const childId of childIds) {
+    delete state.folders[childId].parentId;
   }
   delete state.folders[id];
-  if (currentFolderId === id) currentFolderId = "all";
+  if (currentFolderId === id || childIds.includes(currentFolderId)) currentFolderId = "all";
   await chrome.storage.local.set({ channels: state.channels, folders: state.folders });
   render();
 }
@@ -979,16 +1288,37 @@ async function deleteTag(id) {
 function showContextMenu(x, y, items) {
   const menu = el.contextMenu;
   menu.innerHTML = "";
+  hideSubmenu();
+
   for (const item of items) {
+    if (item.separator) {
+      const sep = document.createElement("div");
+      sep.className = "context-menu-separator";
+      menu.appendChild(sep);
+      continue;
+    }
+
     const btn = document.createElement("button");
     btn.textContent = item.label;
     if (item.danger) btn.classList.add("danger");
-    btn.addEventListener("click", () => {
-      hideContextMenu();
-      item.action();
-    });
+
+    if (item.submenu) {
+      btn.classList.add("has-submenu");
+      btn.addEventListener("mouseenter", () => {
+        const btnRect = btn.getBoundingClientRect();
+        showSubmenu(btnRect.right, btnRect.top, item.submenu());
+      });
+    } else {
+      btn.addEventListener("mouseenter", hideSubmenu);
+      btn.addEventListener("click", () => {
+        hideContextMenu();
+        item.action();
+      });
+    }
+
     menu.appendChild(btn);
   }
+
   menu.hidden = false;
   // keep the menu inside the viewport
   const rect = menu.getBoundingClientRect();
@@ -996,8 +1326,122 @@ function showContextMenu(x, y, items) {
   menu.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
 }
 
+function showSubmenu(x, y, items) {
+  const sub = el.contextSubmenu;
+  sub.innerHTML = "";
+  hideSubSubmenu();
+
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.textContent = item.label;
+    if (item.active) btn.classList.add("active-folder");
+
+    if (item.submenu) {
+      btn.classList.add("has-submenu");
+      btn.addEventListener("mouseenter", () => {
+        const r = btn.getBoundingClientRect();
+        showSubSubmenu(r.right, r.top, item.submenu());
+      });
+    } else {
+      btn.addEventListener("mouseenter", hideSubSubmenu);
+      btn.addEventListener("click", () => {
+        hideContextMenu();
+        item.action();
+      });
+    }
+
+    sub.appendChild(btn);
+  }
+
+  sub.hidden = false;
+  const rect = sub.getBoundingClientRect();
+  const left = x + 4;
+  const adjustedLeft = left + rect.width + 8 > window.innerWidth ? x - rect.width - 4 : left;
+  sub.style.left = Math.max(4, adjustedLeft) + "px";
+  sub.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
+}
+
+function showSubSubmenu(x, y, items) {
+  const sub = el.contextSubSubmenu;
+  sub.innerHTML = "";
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.textContent = item.label;
+    if (item.active) btn.classList.add("active-folder");
+    btn.addEventListener("click", () => {
+      hideContextMenu();
+      item.action();
+    });
+    sub.appendChild(btn);
+  }
+  sub.hidden = false;
+  const rect = sub.getBoundingClientRect();
+  const left = x + 4;
+  const adjustedLeft = left + rect.width + 8 > window.innerWidth ? x - rect.width - 4 : left;
+  sub.style.left = Math.max(4, adjustedLeft) + "px";
+  sub.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
+}
+
+function hideSubSubmenu() {
+  el.contextSubSubmenu.hidden = true;
+}
+
+function hideSubmenu() {
+  el.contextSubmenu.hidden = true;
+  hideSubSubmenu();
+}
+
 function hideContextMenu() {
   el.contextMenu.hidden = true;
+  hideSubmenu();
+}
+
+function buildFolderSubmenu(channelId, ch) {
+  const moveTo = async (folderId) => {
+    state.channels[channelId].folderId = folderId;
+    await chrome.storage.local.set({ channels: state.channels });
+    renderFolders();
+    if (currentFolderId !== "all") renderGrid();
+  };
+
+  const topLevel = Object.entries(state.folders)
+    .filter(([, f]) => !f.parentId)
+    .sort((a, b) => {
+      if (a[0] === "unsorted") return -1;
+      if (b[0] === "unsorted") return 1;
+      return (a[1].order ?? 0) - (b[1].order ?? 0);
+    });
+
+  return topLevel.map(([id, f]) => {
+    const children = Object.entries(state.folders)
+      .filter(([, cf]) => cf.parentId === id)
+      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0));
+
+    if (children.length === 0) {
+      return { label: f.name, active: ch.folderId === id, action: () => moveTo(id) };
+    }
+
+    // Parent has subfolders — only subfolders are valid destinations
+    return {
+      label: f.name,
+      active: children.some(([cid]) => cid === ch.folderId),
+      submenu: () => children.map(([cid, cf]) => ({
+        label: cf.name,
+        active: ch.folderId === cid,
+        action: () => moveTo(cid),
+      })),
+    };
+  });
+}
+
+async function deleteChannel(channelId) {
+  const ch = state.channels[channelId];
+  if (!ch) return;
+  const confirmed = confirm(`Delete "${ch.name}" from MyTube? This cannot be undone.`);
+  if (!confirmed) return;
+  delete state.channels[channelId];
+  await chrome.storage.local.set({ channels: state.channels });
+  render();
 }
 
 function openTagInput(cardEl, channelId) {
