@@ -621,8 +621,8 @@ function bindEvents() {
 
   el.clearDataBtn.addEventListener("click", async () => {
     if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
-    await chrome.storage.local.clear();
-    state = { channels: {}, folders: { unsorted: { name: "Unsorted", order: 0 } }, tags: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null };
+    await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt", "viewMode"]);
+    state = { channels: {}, folders: { unsorted: { name: "Unsorted", order: 0 } }, tags: {}, apiKey: state.apiKey, gistToken: state.gistToken, gistId: "", lastSyncedAt: null };
     currentFolderId = "all";
     activeTagFilters.clear();
     searchQuery = "";
