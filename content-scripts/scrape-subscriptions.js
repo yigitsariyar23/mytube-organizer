@@ -24,17 +24,19 @@
   await autoScrollUntilStable();
 
   const channels = collectChannels();
-  const resolved = channels.filter((c) => c.channelId);
-  const needsResolve = channels.filter((c) => !c.channelId && c.handle);
+  // Keep everything we can key on: a channelId, or a handle the background can
+  // resolve to one. The background diffs this whole set against the stored
+  // library and opens a review dialog rather than merging straight away.
+  const scanned = channels.filter((c) => c.channelId || c.handle);
 
-  if (resolved.length) {
-    chrome.runtime.sendMessage({ type: "SCRAPED_CHANNELS", channels: resolved });
-  }
-  if (needsResolve.length) {
-    chrome.runtime.sendMessage({ type: "RESOLVE_HANDLES", channels: needsResolve });
+  // Only trigger a diff when we actually found channels. An empty result almost
+  // always means YouTube's layout changed, not that every subscription is gone
+  // — sending it would flag the whole library for removal.
+  if (scanned.length) {
+    chrome.runtime.sendMessage({ type: "SCAN_RESULT", channels: scanned });
   }
 
-  showBanner(resolved.length, needsResolve.length);
+  showBanner(scanned.length);
 
   function channelAnchorRoot() {
     // ytd-browse is the main content container; the guide sidebar and masthead
@@ -181,13 +183,10 @@
     });
   }
 
-  function showBanner(resolvedCount, pendingCount) {
-    const total = resolvedCount + pendingCount;
+  function showBanner(total) {
     const el = document.createElement("div");
     el.textContent = total
-      ? `MyTube Organizer: scanned ${total} channels${
-          pendingCount ? ` (${pendingCount} resolving in the background…)` : ""
-        }.`
+      ? `MyTube Organizer: scanned ${total} channels — review the changes in the dashboard.`
       : "MyTube Organizer: no channels found — YouTube's page layout may have changed.";
     Object.assign(el.style, {
       position: "fixed",

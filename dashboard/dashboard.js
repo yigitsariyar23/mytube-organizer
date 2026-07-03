@@ -5,7 +5,7 @@ const TAG_PALETTE = [
   "#F2777A", "#82D9C5", "#D9A86C", "#9FA8DA",
 ];
 
-let state = { channels: {}, folders: {}, tags: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null };
+let state = { channels: {}, folders: {}, tags: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null };
 let currentFolderId = "all";
 let activeTagFilters = new Set();
 let searchQuery = "";
@@ -48,6 +48,12 @@ const el = {
   scrollSentinel: document.getElementById("scrollSentinel"),
   main: document.querySelector(".main"),
   clearDataBtn: document.getElementById("clearDataBtn"),
+  scanDiffModal: document.getElementById("scanDiffModal"),
+  scanDiffSummary: document.getElementById("scanDiffSummary"),
+  scanDiffWarning: document.getElementById("scanDiffWarning"),
+  scanDiffBody: document.getElementById("scanDiffBody"),
+  scanDiffApply: document.getElementById("scanDiffApply"),
+  scanDiffCancel: document.getElementById("scanDiffCancel"),
 };
 
 init();
@@ -57,18 +63,26 @@ async function init() {
   render();
   bindEvents();
 
+  // A scan finished while the dashboard was closed — review it on open.
+  if (state.pendingScan) openScanDiffModal(state.pendingScan);
+
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
     if (changes.channels) state.channels = changes.channels.newValue || {};
     if (changes.folders) state.folders = changes.folders.newValue || {};
     if (changes.tags) state.tags = changes.tags.newValue || {};
+    if (changes.pendingScan) {
+      state.pendingScan = changes.pendingScan.newValue || null;
+      if (state.pendingScan) openScanDiffModal(state.pendingScan);
+      else el.scanDiffModal.hidden = true;
+    }
     render();
   });
 }
 
 async function loadState() {
   const data = await chrome.storage.local.get([
-    "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt",
+    "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
   ]);
   state.channels = data.channels || {};
   state.folders = data.folders || { unsorted: { name: "Unsorted", order: 0 } };
@@ -77,6 +91,7 @@ async function loadState() {
   state.gistToken = data.gistToken || "";
   state.gistId = data.gistId || "";
   state.lastSyncedAt = data.lastSyncedAt || null;
+  state.pendingScan = data.pendingScan || null;
   viewMode = data.viewMode === "list" ? "list" : "card";
 }
 
@@ -334,6 +349,89 @@ function renderSyncStatus() {
   }
 }
 
+// ---------- Scan review dialog ----------
+
+function openScanDiffModal(scan) {
+  const { added = [], modified = [], removed = [], unresolved = 0, scannedCount = 0 } = scan;
+
+  el.scanDiffSummary.textContent =
+    `Scanned ${scannedCount} channel${scannedCount === 1 ? "" : "s"} — ` +
+    `${added.length} new, ${modified.length} changed, ${removed.length} not seen.`;
+
+  // Removals are destructive and can be false positives when a scan is
+  // incomplete, so warn and never pre-select them.
+  if (removed.length && unresolved > 0) {
+    el.scanDiffWarning.hidden = false;
+    el.scanDiffWarning.textContent =
+      `${unresolved} channel${unresolved === 1 ? "" : "s"} couldn't be resolved this scan, so the ` +
+      `“not seen” list may include channels you're still subscribed to. Removals are unchecked by ` +
+      `default — only tick the ones you're sure about.`;
+  } else if (removed.length) {
+    el.scanDiffWarning.hidden = false;
+    el.scanDiffWarning.textContent =
+      `Removing a channel deletes it from MyTube along with its folder and tags. Removals are ` +
+      `unchecked by default — tick only the ones you want gone.`;
+  } else {
+    el.scanDiffWarning.hidden = true;
+  }
+
+  el.scanDiffBody.innerHTML = "";
+  el.scanDiffBody.appendChild(buildDiffSection("New channels", "add", added, false));
+  el.scanDiffBody.appendChild(buildDiffSection("Name / handle changes", "mod", modified, false));
+  el.scanDiffBody.appendChild(buildDiffSection("Not seen in this scan", "del", removed, true));
+
+  el.scanDiffApply.disabled = added.length === 0 && modified.length === 0 && removed.length === 0;
+  el.scanDiffModal.hidden = false;
+}
+
+function buildDiffSection(title, kind, items, checkable) {
+  const sec = document.createElement("div");
+  sec.className = "scan-diff-section";
+
+  const head = document.createElement("div");
+  head.className = "scan-diff-head";
+  head.innerHTML =
+    `<span class="scan-diff-title scan-${kind}">${escapeHtml(title)}</span>` +
+    `<span class="folder-count">${items.length}</span>`;
+  sec.appendChild(head);
+
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "scan-diff-empty";
+    empty.textContent = "None";
+    sec.appendChild(empty);
+    return sec;
+  }
+
+  if (checkable) {
+    const all = document.createElement("label");
+    all.className = "scan-diff-row scan-diff-selectall";
+    all.innerHTML =
+      `<input type="checkbox" data-role="select-all-removals" /> <span>Select all for removal</span>`;
+    sec.appendChild(all);
+  }
+
+  const list = document.createElement("div");
+  list.className = "scan-diff-list";
+  for (const it of items) {
+    const main =
+      kind === "mod"
+        ? `${escapeHtml(it.oldName || "—")} <span class="scan-diff-arrow">→</span> <b>${escapeHtml(it.name)}</b>`
+        : `<b>${escapeHtml(it.name || it.handle || it.id)}</b>`;
+    const sub = escapeHtml(it.handle || it.id);
+    const text = `<span class="scan-diff-text">${main}<span class="scan-diff-sub">${sub}</span></span>`;
+
+    const row = document.createElement(checkable ? "label" : "div");
+    row.className = "scan-diff-row";
+    row.innerHTML = checkable
+      ? `<input type="checkbox" data-remove-id="${escapeHtml(it.id)}" />${text}`
+      : text;
+    list.appendChild(row);
+  }
+  sec.appendChild(list);
+  return sec;
+}
+
 // ---------- Events ----------
 
 function bindEvents() {
@@ -530,6 +628,36 @@ function bindEvents() {
     searchQuery = "";
     el.settingsModal.hidden = true;
     render();
+  });
+
+  // Scan review dialog
+  el.scanDiffBody.addEventListener("change", (e) => {
+    if (e.target.dataset.role !== "select-all-removals") return;
+    const on = e.target.checked;
+    el.scanDiffBody
+      .querySelectorAll("input[data-remove-id]")
+      .forEach((box) => (box.checked = on));
+  });
+
+  el.scanDiffApply.addEventListener("click", async () => {
+    const removeIds = Array.from(
+      el.scanDiffBody.querySelectorAll("input[data-remove-id]:checked")
+    ).map((box) => box.dataset.removeId);
+    el.scanDiffApply.disabled = true;
+    el.statusText.textContent = "Applying scan…";
+    const res = await chrome.runtime.sendMessage({ type: "APPLY_SCAN", removeIds });
+    el.scanDiffApply.disabled = false;
+    el.scanDiffModal.hidden = true;
+    await loadState();
+    render();
+    el.statusText.textContent = res?.ok
+      ? `Scan applied: +${res.added} added, ${res.modified} updated, −${res.removed} removed.`
+      : res?.error || "Could not apply scan.";
+  });
+
+  el.scanDiffCancel.addEventListener("click", async () => {
+    el.scanDiffModal.hidden = true;
+    await chrome.runtime.sendMessage({ type: "DISCARD_SCAN" });
   });
 
   // Clicking the dark backdrop closes a modal

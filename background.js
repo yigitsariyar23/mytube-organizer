@@ -8,6 +8,9 @@
 //   gistToken:    string (GitHub personal access token with the "gist" scope, for cross-device sync)
 //   gistId:       string (id of the secret gist holding the synced state)
 //   lastSyncedAt: number (epoch ms of the last successful gist sync)
+//   pendingScan:  { scannedAt, scannedCount, unresolved, added[], modified[], removed[] }
+//                 — a scan awaiting review in the dashboard; not applied to
+//                   `channels` until the user confirms, and never synced.
 
 const API_BASE = "https://www.googleapis.com/youtube/v3";
 const GIST_API = "https://api.github.com/gists";
@@ -44,7 +47,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 // ---------- Toolbar icon click -> open / focus the dashboard ----------
 
-chrome.action.onClicked.addListener(async () => {
+chrome.action.onClicked.addListener(() => openDashboard());
+
+async function openDashboard() {
   const url = chrome.runtime.getURL("dashboard/dashboard.html");
   const tabs = await chrome.tabs.query({ url });
   if (tabs.length > 0) {
@@ -53,17 +58,21 @@ chrome.action.onClicked.addListener(async () => {
   } else {
     chrome.tabs.create({ url });
   }
-});
+}
 
 // ---------- Message routing ----------
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "SCRAPED_CHANNELS") {
-    mergeScrapedChannels(msg.channels).then((n) => sendResponse({ ok: true, added: n }));
+  if (msg.type === "SCAN_RESULT") {
+    handleScanResult(msg.channels).then(sendResponse);
     return true;
   }
-  if (msg.type === "RESOLVE_HANDLES") {
-    resolveHandles(msg.channels).then(() => sendResponse({ ok: true }));
+  if (msg.type === "APPLY_SCAN") {
+    applyScan(msg.removeIds || []).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "DISCARD_SCAN") {
+    chrome.storage.local.remove("pendingScan").then(() => sendResponse({ ok: true }));
     return true;
   }
   if (msg.type === "REFRESH_STATS") {
@@ -97,19 +106,139 @@ async function repairDoubledNames(channels) {
   if (changed) await chrome.storage.local.set({ channels });
 }
 
-// ---------- Write scraped channels to storage ----------
+// ---------- Turn a scrape into a reviewable diff ----------
+// A scan no longer writes to `channels` directly. It resolves every scraped
+// entry to a channelId, diffs the resulting set against the stored library,
+// stashes the result in `pendingScan`, and pops the dashboard so the user can
+// review adds / modifications / removals before anything is committed.
 
-async function mergeScrapedChannels(scraped) {
+async function handleScanResult(scraped) {
+  const pendingScan = await computeScanDiff(scraped);
+  await chrome.storage.local.set({ pendingScan });
+  await openDashboard();
+  return {
+    ok: true,
+    added: pendingScan.added.length,
+    modified: pendingScan.modified.length,
+    removed: pendingScan.removed.length,
+  };
+}
+
+async function computeScanDiff(scraped) {
+  const { apiKey } = await chrome.storage.local.get("apiKey");
   const { channels = {} } = await chrome.storage.local.get("channels");
+
+  // Known handles resolve for free against the stored library.
+  const idByHandle = new Map();
+  for (const c of Object.values(channels)) {
+    if (c.handle) idByHandle.set(c.handle.toLowerCase(), c.id);
+  }
+
+  const scrapedById = new Map(); // id -> { id, name, handle, thumbnail }
+  const needResolve = [];
+  for (const c of scraped) {
+    if (c.channelId) {
+      addScraped(scrapedById, c.channelId, c);
+    } else if (c.handle) {
+      const known = idByHandle.get(c.handle.toLowerCase());
+      if (known) addScraped(scrapedById, known, c);
+      else needResolve.push(c);
+    }
+  }
+
+  // Handle-only channels new to us need a network lookup to get their UC id.
+  // Any that fail are counted so the dashboard can warn that the "removed"
+  // list may include still-subscribed channels this scan simply missed.
+  let unresolved = 0;
+  for (const group of chunk(needResolve, 5)) {
+    const results = await Promise.allSettled(
+      group.map(async (c) => {
+        const id =
+          (apiKey && (await resolveHandleViaApi(c.handle, apiKey))) ||
+          (await resolveHandleViaPage(c.handle));
+        return { c, id };
+      })
+    );
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value.id) addScraped(scrapedById, r.value.id, r.value.c);
+      else unresolved++;
+    }
+  }
+
+  const added = [];
+  const modified = [];
+  for (const [id, s] of scrapedById) {
+    const existing = channels[id];
+    if (!existing) {
+      added.push({ id, name: s.name, handle: s.handle, thumbnail: s.thumbnail });
+      continue;
+    }
+    // Don't count a card that yielded no real name (fell back to the handle or
+    // "Unknown channel") as a rename that would clobber a good stored name.
+    const realName = s.name && s.name !== "Unknown channel" && s.name !== s.handle;
+    const nameChanged = realName && s.name !== existing.name;
+    const handleChanged = s.handle && s.handle !== existing.handle;
+    if (nameChanged || handleChanged) {
+      modified.push({
+        id,
+        name: nameChanged ? s.name : existing.name,
+        handle: handleChanged ? s.handle : existing.handle,
+        thumbnail: s.thumbnail,
+        oldName: existing.name,
+        oldHandle: existing.handle,
+      });
+    }
+  }
+
+  const removed = [];
+  for (const [id, c] of Object.entries(channels)) {
+    if (!scrapedById.has(id)) removed.push({ id, name: c.name, handle: c.handle });
+  }
+
+  return {
+    scannedAt: Date.now(),
+    scannedCount: scrapedById.size,
+    unresolved,
+    added,
+    modified,
+    removed,
+  };
+}
+
+// Fold duplicate scraped rows for one channel into a single record, keeping the
+// first non-empty name / handle / thumbnail we saw.
+function addScraped(map, id, c) {
+  const prev = map.get(id);
+  if (!prev) {
+    map.set(id, { id, name: c.name || "", handle: c.handle || null, thumbnail: c.thumbnail || null });
+    return;
+  }
+  if (!prev.name && c.name) prev.name = c.name;
+  if (!prev.handle && c.handle) prev.handle = c.handle;
+  if (!prev.thumbnail && c.thumbnail) prev.thumbnail = c.thumbnail;
+}
+
+// ---------- Commit a reviewed scan ----------
+// Adds and modifications are always applied; removals only for the ids the user
+// explicitly ticked in the review dialog (and only if they were genuine
+// "removed" candidates). Organizing data — folder, tags, stats — is preserved
+// on modification and only lost when a channel is deliberately removed.
+
+async function applyScan(removeIds = []) {
+  const { pendingScan, channels = {} } = await chrome.storage.local.get(["pendingScan", "channels"]);
+  if (!pendingScan) return { ok: false, error: "No pending scan to apply." };
+
   let added = 0;
-  for (const ch of scraped) {
-    if (!ch.channelId) continue;
-    if (!channels[ch.channelId]) {
-      channels[ch.channelId] = {
-        id: ch.channelId,
-        name: ch.name,
-        handle: ch.handle || null,
-        thumbnail: ch.thumbnail || null,
+  let modified = 0;
+  let removed = 0;
+
+  for (const a of pendingScan.added || []) {
+    if (!channels[a.id]) {
+      channels[a.id] = {
+        id: a.id,
+        name: a.name || a.handle || "Unknown channel",
+        handle: a.handle || null,
+        thumbnail: a.thumbnail || null,
         folderId: "unsorted",
         tags: [],
         lastVideoDate: null,
@@ -118,82 +247,34 @@ async function mergeScrapedChannels(scraped) {
         lastFetched: null,
       };
       added++;
-    } else {
-      channels[ch.channelId].name = ch.name;
-      if (ch.handle) channels[ch.channelId].handle = ch.handle;
-      if (ch.thumbnail) channels[ch.channelId].thumbnail = ch.thumbnail;
     }
   }
+
+  for (const m of pendingScan.modified || []) {
+    const ch = channels[m.id];
+    if (!ch) continue;
+    if (m.name) ch.name = m.name;
+    if (m.handle) ch.handle = m.handle;
+    if (m.thumbnail) ch.thumbnail = m.thumbnail;
+    modified++;
+  }
+
+  const allowedRemovals = new Set((pendingScan.removed || []).map((r) => r.id));
+  for (const id of removeIds) {
+    if (allowedRemovals.has(id) && channels[id]) {
+      delete channels[id];
+      removed++;
+    }
+  }
+
   await chrome.storage.local.set({ channels });
-  return added;
+  await chrome.storage.local.remove("pendingScan");
+  return { ok: true, added, modified, removed };
 }
 
-// ---------- Resolve handle-only (@channel) entries to channelIds ----------
+// ---------- Resolve a handle (@channel) to its channelId ----------
 // With an API key: channels.list with forHandle (1 unit / channel).
 // Without one: fetch the channel page and read the canonical UC id out of it.
-
-async function resolveHandles(list) {
-  const { apiKey } = await chrome.storage.local.get("apiKey");
-  const { channels = {} } = await chrome.storage.local.get("channels");
-
-  // Already-known handles need no network resolution, but still take the
-  // freshly scraped name/thumbnail so a rescan heals stale or bad names.
-  const byHandle = new Map();
-  for (const c of Object.values(channels)) {
-    if (c.handle) byHandle.set(c.handle.toLowerCase(), c);
-  }
-  const pending = [];
-  let updated = false;
-  for (const c of list) {
-    const existing = byHandle.get(c.handle.toLowerCase());
-    if (!existing) {
-      pending.push(c);
-      continue;
-    }
-    if (c.name && c.name !== existing.name) {
-      existing.name = c.name;
-      updated = true;
-    }
-    if (c.thumbnail && c.thumbnail !== existing.thumbnail) {
-      existing.thumbnail = c.thumbnail;
-      updated = true;
-    }
-  }
-  if (updated) await chrome.storage.local.set({ channels });
-
-  for (const group of chunk(pending, 5)) {
-    await Promise.allSettled(
-      group.map(async (c) => {
-        const id = (apiKey && (await resolveHandleViaApi(c.handle, apiKey))) ||
-          (await resolveHandleViaPage(c.handle));
-        if (id && !channels[id]) {
-          channels[id] = {
-            id,
-            name: c.name,
-            handle: c.handle,
-            thumbnail: c.thumbnail,
-            folderId: "unsorted",
-            tags: [],
-            lastVideoDate: null,
-            videoCount: null,
-            subscriberCount: null,
-            lastFetched: null,
-          };
-        } else if (id) {
-          // already stored (e.g. via a /channel/UC… link that carried no
-          // handle) — attach the handle and refresh name/thumbnail
-          if (c.name) channels[id].name = c.name;
-          if (c.handle) channels[id].handle = c.handle;
-          if (c.thumbnail) channels[id].thumbnail = c.thumbnail;
-        } else {
-          console.warn("could not resolve handle:", c.handle);
-        }
-      })
-    );
-    // write per batch so the dashboard fills in while long lists resolve
-    await chrome.storage.local.set({ channels });
-  }
-}
 
 async function resolveHandleViaApi(handle, apiKey) {
   try {

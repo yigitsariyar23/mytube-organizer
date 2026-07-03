@@ -404,6 +404,14 @@ html, body {
 /* display:flex above beats the UA's [hidden] { display:none } — restore it */
 .modal[hidden] { display: none; }
 
+.modal-box-wide {
+  width: 560px;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+}
+
 .modal-box {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -480,3 +488,103 @@ html, body {
 .context-menu button:hover { background: var(--panel); }
 
 .context-menu button.danger { color: var(--danger); }
+
+/* ---------- Scan review dialog ---------- */
+
+.scan-warning {
+  background: rgba(224, 112, 90, 0.12);
+  border: 1px solid var(--danger);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  margin: 12px 0 4px;
+}
+
+.scan-diff-body {
+  overflow-y: auto;
+  margin: 6px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.scan-diff-section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.scan-diff-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.scan-diff-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.scan-diff-title.scan-add { color: #6fcf97; }
+.scan-diff-title.scan-mod { color: var(--accent); }
+.scan-diff-title.scan-del { color: var(--danger); }
+
+.scan-diff-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.scan-diff-list {
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.scan-diff-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.scan-diff-row:first-child { border-top: none; }
+
+.scan-diff-selectall {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+label.scan-diff-row { cursor: pointer; }
+
+.scan-diff-row input[type="checkbox"] {
+  accent-color: var(--danger);
+  flex-shrink: 0;
+}
+
+.scan-diff-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+
+.scan-diff-text b { font-weight: 600; }
+
+.scan-diff-arrow { color: var(--text-muted); }
+
+.scan-diff-sub {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
