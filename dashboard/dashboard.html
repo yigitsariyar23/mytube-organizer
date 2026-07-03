@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>MyTube Organizer</title>
+<link rel="stylesheet" href="dashboard.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">◧</span>
+        <span class="brand-name">MyTube</span>
+      </div>
+
+      <button id="scanBtn" class="btn btn-primary btn-block">Scan Channels</button>
+      <button id="refreshBtn" class="btn btn-ghost btn-block">Refresh Stats</button>
+
+      <div class="section-label">Folders</div>
+      <ul id="folderList" class="folder-list"></ul>
+      <button id="addFolderBtn" class="btn btn-text">+ New folder</button>
+
+      <div class="sidebar-footer">
+        <button id="settingsBtn" class="btn btn-text">⚙ Settings</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
+        <span id="statusText" class="status-text"></span>
+      </div>
+
+      <div id="tagFilterBar" class="tag-filter-bar" hidden></div>
+
+      <div id="emptyState" class="empty-state" hidden>
+        <p class="empty-title">No channels scanned yet</p>
+        <p class="empty-body">
+          Click "Scan Channels" to open YouTube's subscriptions page in a new tab,
+          where the channels you're subscribed to will be read automatically and imported here.
+        </p>
+      </div>
+
+      <div id="channelGrid" class="channel-grid"></div>
+    </main>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settingsModal" class="modal" hidden>
+    <div class="modal-box">
+      <h2>Settings</h2>
+      <label class="field-label" for="apiKeyInput">YouTube Data API v3 key</label>
+      <input id="apiKeyInput" class="field-input" type="text" placeholder="AIza..." />
+      <p class="field-hint">
+        Needed for video count and subscriber count (optional — without it, only the last
+        video date is fetched via RSS). You can get one for free from Google Cloud Console →
+        APIs & Services → Credentials.
+      </p>
+      <label class="field-label" for="gistTokenInput">GitHub token — cross-device sync</label>
+      <input id="gistTokenInput" class="field-input" type="password" placeholder="github_pat_… / ghp_…" />
+      <p class="field-hint">
+        Syncs your folders, tags and channels through a secret GitHub Gist. Create a token at
+        github.com → Settings → Developer settings → Personal access tokens, granting only the
+        <b>gist</b> scope, then paste the same token on each device and press Sync.
+        Syncing merges both sides; deletions don't propagate.
+      </p>
+      <div class="modal-actions" style="justify-content: flex-start">
+        <button id="syncNowBtn" class="btn btn-ghost">Sync now</button>
+        <span id="syncStatus" class="field-hint" style="margin: auto 0"></span>
+      </div>
+      <div class="modal-actions">
+        <button id="settingsCancel" class="btn btn-ghost">Cancel</button>
+        <button id="settingsSave" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New folder / rename panel -->
+  <div id="folderModal" class="modal" hidden>
+    <div class="modal-box">
+      <h2 id="folderModalTitle">New folder</h2>
+      <label id="folderNameLabel" class="field-label" for="folderNameInput">Folder name</label>
+      <input id="folderNameInput" class="field-input" type="text" placeholder="e.g. Gaming, Science, Music" />
+      <div class="modal-actions">
+        <button id="folderCancel" class="btn btn-ghost">Cancel</button>
+        <button id="folderSave" class="btn btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right-click menu -->
+  <div id="contextMenu" class="context-menu" hidden></div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>

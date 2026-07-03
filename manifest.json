@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "MyTube Organizer",
+  "short_name": "MyTube",
+  "version": "0.1.0",
+  "description": "Organize your YouTube subscriptions into folders and tags; track last video date and video count.",
+  "permissions": ["storage", "alarms", "unlimitedStorage"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://www.googleapis.com/*",
+    "https://api.github.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/feed/channels*"],
+      "js": ["content-scripts/scrape-subscriptions.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Open MyTube Organizer"
+  }
+}
