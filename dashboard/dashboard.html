@@ -28,14 +28,18 @@
     <main class="main">
       <div class="topbar">
         <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
-        <div class="view-toggle" role="group" aria-label="View mode">
-          <button id="cardViewBtn" class="view-btn" title="Card view" aria-label="Card view">▦</button>
-          <button id="listViewBtn" class="view-btn" title="List view" aria-label="List view">☰</button>
-        </div>
-        <span id="statusText" class="status-text"></span>
+<span id="statusText" class="status-text"></span>
       </div>
 
       <div id="tagFilterBar" class="tag-filter-bar" hidden></div>
+
+      <div id="listTableHeader" class="list-table-header" hidden>
+        <div class="lth-channel">Channel</div>
+        <div class="lth-sort-col" data-sort="date">Last Video <span class="lth-arrow"></span></div>
+        <div class="lth-sort-col" data-sort="count">Videos <span class="lth-arrow"></span></div>
+        <div>Tags</div>
+        <div>Folder</div>
+      </div>
 
       <div id="emptyState" class="empty-state" hidden>
         <p class="empty-title">No channels scanned yet</p>
@@ -69,8 +73,9 @@
         <b>gist</b> scope, then paste the same token on each device and press Sync.
         Syncing merges both sides; deletions don't propagate.
       </p>
-      <div class="modal-actions" style="justify-content: flex-start">
-        <button id="syncNowBtn" class="btn btn-ghost">Sync now</button>
+      <div class="modal-actions" style="justify-content: flex-start; gap: 8px">
+        <button id="syncUploadBtn" class="btn btn-ghost">&#8593; Upload</button>
+        <button id="syncDownloadBtn" class="btn btn-ghost">&#8595; Download</button>
         <span id="syncStatus" class="field-hint" style="margin: auto 0"></span>
       </div>
       <div class="modal-actions">
@@ -104,6 +109,20 @@
       <div class="modal-actions">
         <button id="scanDiffCancel" class="btn btn-ghost">Cancel</button>
         <button id="scanDiffApply" class="btn btn-primary">Apply changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sync diff panel -->
+  <div id="syncDiffModal" class="modal" hidden>
+    <div class="modal-box modal-box-wide">
+      <h2 id="syncDiffTitle">Review changes</h2>
+      <p id="syncDiffSummary" class="field-hint" style="margin-top: 0"></p>
+      <div id="syncDiffWarning" class="scan-warning" hidden></div>
+      <div id="syncDiffBody" class="scan-diff-body"></div>
+      <div class="modal-actions">
+        <button id="syncDiffCancel" class="btn btn-ghost">Cancel</button>
+        <button id="syncDiffApply" class="btn btn-primary">Apply</button>
       </div>
     </div>
   </div>

@@ -177,34 +177,6 @@ html, body {
   color: var(--text-muted);
 }
 
-/* ---------- View toggle ---------- */
-
-.view-toggle {
-  display: flex;
-  gap: 2px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 2px;
-}
-
-.view-btn {
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-  border-radius: 6px;
-  padding: 5px 10px;
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.view-btn:hover { color: var(--text); }
-
-.view-btn.active {
-  background: var(--panel-2);
-  color: var(--accent);
-}
 
 .tag-filter-bar {
   display: flex;
@@ -237,52 +209,75 @@ html, body {
 
 .empty-body { line-height: 1.5; }
 
-/* ---------- Channel grid ---------- */
-
-.channel-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 14px;
-}
-
-.channel-card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  transition: border-color 0.15s ease, transform 0.1s ease;
-}
-
-.channel-card:hover { border-color: var(--accent); }
-
 /* ---------- Channel list view ---------- */
 
-.channel-grid.list-view {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
+/* Shared column template used by both the header and every data row */
+.list-table-header,
 .channel-row {
   display: grid;
-  grid-template-columns: auto minmax(160px, 1.6fr) auto minmax(0, 1.4fr) 150px;
+  grid-template-columns: minmax(180px, 2fr) 130px 70px minmax(0, 1fr) 150px;
   align-items: center;
   gap: 16px;
+  padding: 8px 14px;
+}
+
+.channel-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Table header */
+.list-table-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+  user-select: none;
+}
+
+.lth-sort-col {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.lth-sort-col:hover { color: var(--text); }
+
+.lth-sort-col.lth-active { color: var(--accent); }
+
+.lth-arrow { font-style: normal; }
+
+/* Data rows */
+.channel-row {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 8px 14px;
+  cursor: pointer;
   transition: border-color 0.15s ease;
 }
 
 .channel-row:hover { border-color: var(--accent); }
 
+.channel-row .channel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
 .channel-row .channel-thumb {
   width: 32px;
   height: 32px;
+  flex-shrink: 0;
+}
+
+.row-date,
+.row-count {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  white-space: nowrap;
 }
 
 .channel-row .channel-tags {
@@ -293,11 +288,18 @@ html, body {
   margin-top: 0;
 }
 
+.channel-row .tag-chip,
+.channel-row select {
+  cursor: default;
+}
+
 /* On narrow widths, drop the tag column so rows stay readable */
 @media (max-width: 720px) {
+  .list-table-header,
   .channel-row {
-    grid-template-columns: auto 1fr auto 140px;
+    grid-template-columns: minmax(140px, 2fr) 110px 60px 140px;
   }
+  .list-table-header > :nth-child(4),
   .channel-row .channel-tags { display: none; }
 }
 
@@ -407,9 +409,6 @@ html, body {
 .modal-box-wide {
   width: 560px;
   max-width: calc(100vw - 48px);
-  max-height: calc(100vh - 64px);
-  display: flex;
-  flex-direction: column;
 }
 
 .modal-box {
@@ -418,6 +417,7 @@ html, body {
   border-radius: var(--radius);
   padding: 22px;
   width: 360px;
+  box-sizing: border-box;
 }
 
 .modal-box h2 { margin: 0 0 14px; font-size: 15px; }
@@ -503,18 +503,19 @@ html, body {
 }
 
 .scan-diff-body {
-  overflow-y: auto;
+  max-height: calc(100vh - 280px);
+  overflow-y: scroll;
   margin: 6px 0 2px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
 }
 
 .scan-diff-section {
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
+  margin-bottom: 14px;
 }
+
+.scan-diff-section:last-child { margin-bottom: 0; }
 
 .scan-diff-head {
   display: flex;
@@ -543,8 +544,7 @@ html, body {
 }
 
 .scan-diff-list {
-  max-height: 220px;
-  overflow-y: auto;
+  overflow: visible;
 }
 
 .scan-diff-row {
@@ -566,6 +566,9 @@ html, body {
 }
 
 label.scan-diff-row { cursor: pointer; }
+
+.scan-diff-row-link[data-channel-id] { cursor: pointer; }
+.scan-diff-row-link[data-channel-id]:hover { background: var(--panel-2); }
 
 .scan-diff-row input[type="checkbox"] {
   accent-color: var(--danger);

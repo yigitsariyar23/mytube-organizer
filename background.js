@@ -87,6 +87,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     syncWithGist().then(sendResponse);
     return true;
   }
+  if (msg.type === "FETCH_SYNC_DIFF") {
+    computeSyncDiff(msg.direction).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "APPLY_UPLOAD") {
+    applyUpload(msg.removeFromGistIds || []).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "APPLY_DOWNLOAD") {
+    applyDownload(msg.removeLocalIds || []).then(sendResponse);
+    return true;
+  }
 });
 
 // A scraper bug (fixed) saved every channel name doubled ("Zach Star Zach
@@ -362,9 +374,14 @@ async function fetchLastVideoDate(channelId) {
     const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`);
     if (!res.ok) return null;
     const text = await res.text();
-    // No DOMParser in service workers; the RSS structure is fixed, so a regex is enough.
-    const match = text.match(/<published>([^<]+)<\/published>/);
-    return match ? match[1] : null;
+    // The feed's first <published> is the channel's creation date — the video
+    // dates live inside <entry> elements. Entries are newest-first, but take the
+    // max to be safe. No DOMParser in service workers, so scan with a regex.
+    const entriesStart = text.indexOf("<entry>");
+    if (entriesStart === -1) return null;
+    const dates = [...text.slice(entriesStart).matchAll(/<published>([^<]+)<\/published>/g)].map((m) => m[1]);
+    if (!dates.length) return null;
+    return dates.reduce((a, b) => (b > a ? b : a));
   } catch (e) {
     return null;
   }
@@ -374,6 +391,143 @@ function chunk(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+}
+
+// ---------- Directional sync: compute diff, upload, download ----------
+
+async function computeSyncDiff(direction) {
+  const { gistToken } = await chrome.storage.local.get("gistToken");
+  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
+
+  try {
+    let { gistId } = await chrome.storage.local.get("gistId");
+    if (!gistId) gistId = await findExistingGist(gistToken);
+
+    const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
+    const localState = {
+      channels: local.channels || {},
+      folders: local.folders || {},
+      tags: local.tags || {},
+    };
+
+    let remoteState = null;
+    if (gistId) remoteState = await fetchGistState(gistToken, gistId);
+
+    if (direction === "download" && !remoteState) {
+      return { ok: false, error: gistId ? "Gist has no usable state yet." : "No Gist found — upload first to create one." };
+    }
+    if (!remoteState) remoteState = { channels: {}, folders: {}, tags: {} };
+
+    const src = direction === "upload" ? localState : remoteState;
+    const tgt = direction === "upload" ? remoteState : localState;
+    const srcCh = src.channels || {};
+    const tgtCh = tgt.channels || {};
+
+    const added = [], removed = [], modified = [];
+
+    for (const [id, sc] of Object.entries(srcCh)) {
+      const tc = tgtCh[id];
+      if (!tc) {
+        added.push({ id, name: sc.name, handle: sc.handle });
+      } else {
+        const changes = [];
+        if (sc.name !== tc.name) changes.push("name");
+        if ((sc.folderId || "") !== (tc.folderId || "")) changes.push("folder");
+        const srcTags = [...(sc.tags || [])].sort().join(",");
+        const tgtTags = [...(tc.tags || [])].sort().join(",");
+        if (srcTags !== tgtTags) changes.push("tags");
+        if (changes.length) modified.push({ id, name: sc.name, handle: sc.handle, changes });
+      }
+    }
+
+    for (const [id, tc] of Object.entries(tgtCh)) {
+      if (!srcCh[id]) removed.push({ id, name: tc.name, handle: tc.handle });
+    }
+
+    return { ok: true, direction, channels: { added, removed, modified } };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+async function applyUpload(removeFromGistIds = []) {
+  const { gistToken } = await chrome.storage.local.get("gistToken");
+  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
+
+  try {
+    let { gistId } = await chrome.storage.local.get("gistId");
+    if (!gistId) gistId = await findExistingGist(gistToken);
+
+    const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
+    let uploadChannels = { ...(local.channels || {}) };
+
+    // Re-include any Gist-only channels the user chose to keep
+    if (removeFromGistIds.length < Infinity && gistId) {
+      const remoteState = await fetchGistState(gistToken, gistId);
+      if (remoteState) {
+        const removeSet = new Set(removeFromGistIds);
+        for (const [id, rc] of Object.entries(remoteState.channels || {})) {
+          if (!uploadChannels[id] && !removeSet.has(id)) uploadChannels[id] = rc;
+        }
+      }
+    }
+
+    const uploadState = {
+      channels: uploadChannels,
+      folders: local.folders || {},
+      tags: local.tags || {},
+    };
+    const body = {
+      description: "MyTube Organizer sync data",
+      files: { [GIST_FILENAME]: { content: JSON.stringify(uploadState, null, 2) } },
+    };
+
+    if (gistId) {
+      await ghApi(gistToken, `${GIST_API}/${gistId}`, "PATCH", body);
+    } else {
+      const created = await ghApi(gistToken, GIST_API, "POST", { ...body, public: false });
+      gistId = created.id;
+    }
+
+    const lastSyncedAt = Date.now();
+    await chrome.storage.local.set({ gistId, lastSyncedAt });
+    return { ok: true, gistId, lastSyncedAt };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+async function applyDownload(removeLocalIds = []) {
+  const { gistToken } = await chrome.storage.local.get("gistToken");
+  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
+
+  try {
+    let { gistId } = await chrome.storage.local.get("gistId");
+    if (!gistId) gistId = await findExistingGist(gistToken);
+    if (!gistId) return { ok: false, error: "No Gist found to download from." };
+
+    const remoteState = await fetchGistState(gistToken, gistId);
+    if (!remoteState) return { ok: false, error: "Gist has no usable state yet." };
+
+    const local = await chrome.storage.local.get(["channels", "folders"]);
+    const removeSet = new Set(removeLocalIds);
+
+    // Start with Gist channels, then re-add local-only channels user chose to keep
+    const channels = { ...remoteState.channels };
+    for (const [id, lc] of Object.entries(local.channels || {})) {
+      if (!channels[id] && !removeSet.has(id)) channels[id] = lc;
+    }
+
+    // Gist folders win, but keep local folders referenced by preserved local-only channels
+    const folders = { ...(local.folders || {}), ...remoteState.folders };
+
+    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {} });
+    const lastSyncedAt = Date.now();
+    await chrome.storage.local.set({ gistId, lastSyncedAt });
+    return { ok: true, gistId, lastSyncedAt };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
 }
 
 // ---------- Cross-device sync via a secret GitHub Gist ----------

@@ -9,7 +9,8 @@ let state = { channels: {}, folders: {}, tags: {}, apiKey: "", gistToken: "", gi
 let currentFolderId = "all";
 let activeTagFilters = new Set();
 let searchQuery = "";
-let viewMode = "card"; // "card" | "list"
+let sortDate = "desc"; // "desc" (newest first) | "asc" (oldest first) | "none"
+let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
 // what the folder modal is currently doing: create-folder | rename-folder | rename-tag
 let folderModalMode = { type: "create-folder", id: null };
 
@@ -32,8 +33,16 @@ const el = {
   settingsModal: document.getElementById("settingsModal"),
   apiKeyInput: document.getElementById("apiKeyInput"),
   gistTokenInput: document.getElementById("gistTokenInput"),
-  syncNowBtn: document.getElementById("syncNowBtn"),
+  syncUploadBtn: document.getElementById("syncUploadBtn"),
+  syncDownloadBtn: document.getElementById("syncDownloadBtn"),
   syncStatus: document.getElementById("syncStatus"),
+  syncDiffModal: document.getElementById("syncDiffModal"),
+  syncDiffTitle: document.getElementById("syncDiffTitle"),
+  syncDiffSummary: document.getElementById("syncDiffSummary"),
+  syncDiffWarning: document.getElementById("syncDiffWarning"),
+  syncDiffBody: document.getElementById("syncDiffBody"),
+  syncDiffApply: document.getElementById("syncDiffApply"),
+  syncDiffCancel: document.getElementById("syncDiffCancel"),
   settingsSave: document.getElementById("settingsSave"),
   settingsCancel: document.getElementById("settingsCancel"),
   folderModal: document.getElementById("folderModal"),
@@ -43,9 +52,8 @@ const el = {
   folderSave: document.getElementById("folderSave"),
   folderCancel: document.getElementById("folderCancel"),
   contextMenu: document.getElementById("contextMenu"),
-  cardViewBtn: document.getElementById("cardViewBtn"),
-  listViewBtn: document.getElementById("listViewBtn"),
   scrollSentinel: document.getElementById("scrollSentinel"),
+  listTableHeader: document.getElementById("listTableHeader"),
   main: document.querySelector(".main"),
   clearDataBtn: document.getElementById("clearDataBtn"),
   scanDiffModal: document.getElementById("scanDiffModal"),
@@ -83,6 +91,7 @@ async function init() {
 async function loadState() {
   const data = await chrome.storage.local.get([
     "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
+    "sortDate", "sortCount",
   ]);
   state.channels = data.channels || {};
   state.folders = data.folders || { unsorted: { name: "Unsorted", order: 0 } };
@@ -92,28 +101,15 @@ async function loadState() {
   state.gistId = data.gistId || "";
   state.lastSyncedAt = data.lastSyncedAt || null;
   state.pendingScan = data.pendingScan || null;
-  viewMode = data.viewMode === "list" ? "list" : "card";
+  sortDate = data.sortDate === "asc" || data.sortDate === "none" ? data.sortDate : "desc";
+  sortCount = data.sortCount === "desc" || data.sortCount === "asc" ? data.sortCount : "none";
 }
 
 // ---------- Render ----------
 
 function render() {
-  updateViewToggle();
   renderFolders();
   renderTagFilters();
-  renderGrid();
-}
-
-function updateViewToggle() {
-  el.cardViewBtn.classList.toggle("active", viewMode === "card");
-  el.listViewBtn.classList.toggle("active", viewMode === "list");
-}
-
-function setViewMode(mode) {
-  if (mode === viewMode) return;
-  viewMode = mode;
-  chrome.storage.local.set({ viewMode });
-  updateViewToggle();
   renderGrid();
 }
 
@@ -173,8 +169,10 @@ function renderTagFilters() {
 function renderGrid() {
   pendingChannels = getFilteredChannels();
   el.channelGrid.innerHTML = "";
-  el.channelGrid.classList.toggle("list-view", viewMode === "list");
+  el.channelGrid.classList.add("list-view");
+  el.listTableHeader.hidden = false;
   el.emptyState.hidden = Object.keys(state.channels).length > 0;
+  updateSortHeaders();
 
   appendNextPage();
   setupScrollObserver();
@@ -184,8 +182,7 @@ function renderGrid() {
 function appendNextPage() {
   const batch = pendingChannels.splice(0, PAGE_SIZE);
   const frag = document.createDocumentFragment();
-  const build = viewMode === "list" ? buildChannelRow : buildChannelCard;
-  for (const ch of batch) frag.appendChild(build(ch));
+  for (const ch of batch) frag.appendChild(buildChannelRow(ch));
   el.channelGrid.appendChild(frag);
 
   if (pendingChannels.length === 0 && scrollObserver) {
@@ -225,8 +222,37 @@ function getFilteredChannels() {
       (c) => c.name?.toLowerCase().includes(q) || c.handle?.toLowerCase().includes(q)
     );
   }
-  list.sort((a, b) => (b.lastVideoDate || "").localeCompare(a.lastVideoDate || ""));
+  list.sort(compareChannels);
   return list;
+}
+
+// When enabled, last video date is the primary key; video count is applied
+// next (as the sole key if date sorting is off, otherwise as a tiebreaker).
+function compareChannels(a, b) {
+  if (sortDate !== "none") {
+    const dateDir = sortDate === "asc" ? 1 : -1;
+    const dateCmp = (a.lastVideoDate || "").localeCompare(b.lastVideoDate || "");
+    if (dateCmp !== 0) return dateDir * dateCmp;
+  }
+
+  if (sortCount !== "none") {
+    const countDir = sortCount === "asc" ? 1 : -1;
+    const ca = a.videoCount ?? -1;
+    const cb = b.videoCount ?? -1;
+    if (ca !== cb) return countDir * (ca - cb);
+  }
+  return 0;
+}
+
+function updateSortHeaders() {
+  const ARROWS = { none: "", desc: " ↓", asc: " ↑" };
+  for (const col of el.listTableHeader.querySelectorAll(".lth-sort-col")) {
+    const key = col.dataset.sort;
+    const val = key === "date" ? sortDate : sortCount;
+    const arrow = col.querySelector(".lth-arrow");
+    arrow.textContent = ARROWS[val] || "";
+    col.classList.toggle("lth-active", val !== "none");
+  }
 }
 
 function buildChannelCard(ch) {
@@ -243,7 +269,7 @@ function buildChannelCard(ch) {
       </div>
     </div>
     <div class="channel-stats">
-      <span>Last video: <b>${formatRelativeDate(ch.lastVideoDate)}</b></span>
+      <span title="${escapeHtml(formatAbsoluteDate(ch.lastVideoDate))}">Last video: <b>${formatRelativeDate(ch.lastVideoDate)}</b></span>
       <span>Videos: <b>${ch.videoCount ?? "—"}</b></span>
     </div>
     <div class="channel-tags">
@@ -263,15 +289,15 @@ function buildChannelRow(ch) {
   row.dataset.channelId = ch.id;
 
   row.innerHTML = `
-    ${thumbHtml(ch)}
-    <div class="channel-name-wrap">
-      <div class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</div>
-      <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
+    <div class="channel-head">
+      ${thumbHtml(ch)}
+      <div class="channel-name-wrap">
+        <div class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</div>
+        <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
+      </div>
     </div>
-    <div class="channel-stats">
-      <span>Last: <b>${formatRelativeDate(ch.lastVideoDate)}</b></span>
-      <span>Videos: <b>${ch.videoCount ?? "—"}</b></span>
-    </div>
+    <div class="row-date" title="${escapeHtml(formatAbsoluteDate(ch.lastVideoDate))}">${formatRelativeDate(ch.lastVideoDate)}</div>
+    <div class="row-count">${ch.videoCount ?? "—"}</div>
     <div class="channel-tags">
       ${tagChipsHtml(ch)}
       <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
@@ -285,7 +311,7 @@ function buildChannelRow(ch) {
 
 function thumbHtml(ch) {
   return ch.thumbnail
-    ? `<img class="channel-thumb" src="${ch.thumbnail}" alt="" />`
+    ? `<img class="channel-thumb" src="${ch.thumbnail}" alt="" onerror="this.outerHTML='<div class=&quot;channel-thumb&quot;></div>'" />`
     : `<div class="channel-thumb"></div>`;
 }
 
@@ -316,14 +342,20 @@ function formatRelativeDate(iso) {
   if (!iso) return "—";
   const date = new Date(iso);
   if (isNaN(date)) return "—";
-  const diffMs = Date.now() - date.getTime();
-  const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-  if (days <= 0) return "today";
-  if (days === 1) return "yesterday";
-  if (days < 30) return `${days} days ago`;
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months} mo ago`;
-  return `${Math.floor(months / 12)} yr ago`;
+  return date.toLocaleDateString(undefined, {
+    year: "numeric", month: "short", day: "numeric",
+  });
+}
+
+// Full date + time for tooltips, e.g. "Jul 3, 2026, 2:15 PM"
+function formatAbsoluteDate(iso) {
+  if (!iso) return "Unknown";
+  const date = new Date(iso);
+  if (isNaN(date)) return "Unknown";
+  return date.toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit",
+  });
 }
 
 function escapeHtml(str) {
@@ -384,7 +416,72 @@ function openScanDiffModal(scan) {
   el.scanDiffModal.hidden = false;
 }
 
-function buildDiffSection(title, kind, items, checkable) {
+// ---------- Sync review dialog ----------
+
+let pendingSyncDiff = null;
+
+function openSyncDiffModal(diff) {
+  pendingSyncDiff = diff;
+  const { direction, channels: { added, removed, modified } } = diff;
+  const isUpload = direction === "upload";
+
+  el.syncDiffTitle.textContent = isUpload ? "Review upload" : "Review download";
+
+  const totalChanges = added.length + removed.length + modified.length;
+  el.syncDiffSummary.textContent = totalChanges === 0
+    ? "No differences — already in sync."
+    : `${added.length} to add, ${modified.length} to overwrite, ${removed.length} to remove.`;
+
+  if (removed.length) {
+    el.syncDiffWarning.hidden = false;
+    const n = removed.length;
+    el.syncDiffWarning.textContent = isUpload
+      ? `${n} channel${n === 1 ? "" : "s"} exist${n === 1 ? "s" : ""} in the Gist but not locally and will be removed from it. Uncheck any you want to keep in the Gist.`
+      : `${n} channel${n === 1 ? "" : "s"} exist${n === 1 ? "s" : ""} locally but not in the Gist and will be removed. Uncheck any you want to keep.`;
+  } else {
+    el.syncDiffWarning.hidden = true;
+  }
+
+  el.syncDiffBody.innerHTML = "";
+  const addLabel = isUpload ? "Will be added to Gist" : "Will be added locally";
+  const delLabel = isUpload ? "Will be removed from Gist" : "Will be removed locally";
+  el.syncDiffBody.appendChild(buildDiffSection(addLabel, "add", added, false));
+  el.syncDiffBody.appendChild(buildDiffSection(delLabel, "del", removed, true, isUpload));
+  if (modified.length) el.syncDiffBody.appendChild(buildSyncModSection(isUpload ? "Will overwrite in Gist" : "Will overwrite locally", modified));
+
+  el.syncDiffApply.textContent = isUpload ? "Apply upload" : "Apply download";
+  el.syncDiffApply.disabled = totalChanges === 0;
+  el.syncDiffModal.hidden = false;
+}
+
+function buildSyncModSection(title, items) {
+  const sec = document.createElement("div");
+  sec.className = "scan-diff-section";
+
+  const head = document.createElement("div");
+  head.className = "scan-diff-head";
+  head.innerHTML =
+    `<span class="scan-diff-title scan-mod">${escapeHtml(title)}</span>` +
+    `<span class="folder-count">${items.length}</span>`;
+  sec.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "scan-diff-list";
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "scan-diff-row scan-diff-row-link";
+    if (it.id) row.dataset.channelId = it.id;
+    const name = escapeHtml(it.name || it.handle || it.id);
+    const sub = escapeHtml(it.handle || it.id);
+    const changes = escapeHtml(it.changes.join(", "));
+    row.innerHTML = `<span class="scan-diff-text"><b>${name}</b><span class="scan-diff-sub">${sub} · ${changes}</span></span>`;
+    list.appendChild(row);
+  }
+  sec.appendChild(list);
+  return sec;
+}
+
+function buildDiffSection(title, kind, items, checkable, defaultChecked = false) {
   const sec = document.createElement("div");
   sec.className = "scan-diff-section";
 
@@ -407,7 +504,7 @@ function buildDiffSection(title, kind, items, checkable) {
     const all = document.createElement("label");
     all.className = "scan-diff-row scan-diff-selectall";
     all.innerHTML =
-      `<input type="checkbox" data-role="select-all-removals" /> <span>Select all for removal</span>`;
+      `<input type="checkbox" data-role="select-all-removals"${defaultChecked ? " checked" : ""} /> <span>Select all for removal</span>`;
     sec.appendChild(all);
   }
 
@@ -422,9 +519,10 @@ function buildDiffSection(title, kind, items, checkable) {
     const text = `<span class="scan-diff-text">${main}<span class="scan-diff-sub">${sub}</span></span>`;
 
     const row = document.createElement(checkable ? "label" : "div");
-    row.className = "scan-diff-row";
+    row.className = "scan-diff-row scan-diff-row-link";
+    if (it.id) row.dataset.channelId = it.id;
     row.innerHTML = checkable
-      ? `<input type="checkbox" data-remove-id="${escapeHtml(it.id)}" />${text}`
+      ? `<input type="checkbox" data-remove-id="${escapeHtml(it.id)}"${defaultChecked ? " checked" : ""} />${text}`
       : text;
     list.appendChild(row);
   }
@@ -458,8 +556,20 @@ function bindEvents() {
     renderGrid();
   });
 
-  el.cardViewBtn.addEventListener("click", () => setViewMode("card"));
-  el.listViewBtn.addEventListener("click", () => setViewMode("list"));
+  el.listTableHeader.addEventListener("click", (e) => {
+    const col = e.target.closest(".lth-sort-col");
+    if (!col) return;
+    const key = col.dataset.sort;
+    const CYCLE = { none: "desc", desc: "asc", asc: "none" };
+    if (key === "date") {
+      sortDate = CYCLE[sortDate];
+      chrome.storage.local.set({ sortDate });
+    } else {
+      sortCount = CYCLE[sortCount];
+      chrome.storage.local.set({ sortCount });
+    }
+    renderGrid();
+  });
 
   el.scanBtn.addEventListener("click", () => {
     chrome.tabs.create({ url: "https://www.youtube.com/feed/channels" });
@@ -473,7 +583,11 @@ function bindEvents() {
     el.statusText.textContent = "Last updated: " + new Date().toLocaleTimeString();
   });
 
-  // Folder change / tag add-remove / channel card clicks
+  function isInteractiveTarget(t) {
+    return t.closest(".tag-chip") || t.closest("select") || t.closest(".tag-input-popover");
+  }
+
+  // Folder change / tag add-remove / row clicks
   el.channelGrid.addEventListener("click", async (e) => {
     const channelCard = e.target.closest("[data-channel-id]");
     if (!channelCard) return;
@@ -494,8 +608,20 @@ function bindEvents() {
       return;
     }
 
-    if (e.target.classList.contains("channel-name") || e.target.classList.contains("channel-thumb")) {
+    // Left-click anywhere on the row that isn't a tag/select opens the channel
+    if (!isInteractiveTarget(e.target)) {
       chrome.tabs.create({ url: `https://www.youtube.com/channel/${channelId}/videos` });
+    }
+  });
+
+  // Middle-click: open in background tab without leaving the dashboard
+  el.channelGrid.addEventListener("auxclick", (e) => {
+    if (e.button !== 1) return;
+    const channelCard = e.target.closest("[data-channel-id]");
+    if (!channelCard) return;
+    if (!isInteractiveTarget(e.target)) {
+      e.preventDefault();
+      chrome.tabs.create({ url: `https://www.youtube.com/channel/${channelCard.dataset.channelId}/videos`, active: false });
     }
   });
 
@@ -524,28 +650,29 @@ function bindEvents() {
     el.settingsModal.hidden = true;
   });
 
-  el.syncNowBtn.addEventListener("click", async () => {
-    // save the token first so pasting + clicking Sync works in one go
+  async function startSyncFlow(direction) {
     state.gistToken = el.gistTokenInput.value.trim();
     await chrome.storage.local.set({ gistToken: state.gistToken });
     if (!state.gistToken) {
       el.syncStatus.textContent = "Enter a GitHub token first.";
       return;
     }
-    el.syncNowBtn.disabled = true;
-    el.syncStatus.textContent = "Syncing…";
-    const res = await chrome.runtime.sendMessage({ type: "SYNC_GIST" });
-    el.syncNowBtn.disabled = false;
-    if (res?.ok) {
-      state.gistId = res.gistId;
-      state.lastSyncedAt = res.lastSyncedAt;
-      await loadState();
-      render();
-      renderSyncStatus();
-    } else {
-      el.syncStatus.textContent = res?.error || "Sync failed.";
+    const btn = direction === "upload" ? el.syncUploadBtn : el.syncDownloadBtn;
+    btn.disabled = true;
+    el.syncStatus.textContent = "Fetching diff…";
+    const diff = await chrome.runtime.sendMessage({ type: "FETCH_SYNC_DIFF", direction });
+    btn.disabled = false;
+    el.syncStatus.textContent = "";
+    if (!diff?.ok) {
+      el.syncStatus.textContent = diff?.error || "Failed to fetch diff.";
+      return;
     }
-  });
+    el.settingsModal.hidden = true;
+    openSyncDiffModal(diff);
+  }
+
+  el.syncUploadBtn.addEventListener("click", () => startSyncFlow("upload"));
+  el.syncDownloadBtn.addEventListener("click", () => startSyncFlow("download"));
 
   // New folder / rename modal
   el.addFolderBtn.addEventListener("click", () => openFolderModal("create-folder"));
@@ -621,7 +748,7 @@ function bindEvents() {
 
   el.clearDataBtn.addEventListener("click", async () => {
     if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
-    await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt", "viewMode"]);
+    await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt"]);
     state = { channels: {}, folders: { unsorted: { name: "Unsorted", order: 0 } }, tags: {}, apiKey: state.apiKey, gistToken: state.gistToken, gistId: "", lastSyncedAt: null };
     currentFolderId = "all";
     activeTagFilters.clear();
@@ -630,7 +757,17 @@ function bindEvents() {
     render();
   });
 
-  // Scan review dialog
+  // Scan review dialog — click row to open channel
+  function handleDiffRowClick(e) {
+    const row = e.target.closest(".scan-diff-row-link[data-channel-id]");
+    if (!row) return;
+    // Don't navigate when clicking a checkbox itself
+    if (e.target.tagName === "INPUT") return;
+    chrome.tabs.create({ url: `https://www.youtube.com/channel/${row.dataset.channelId}/videos` });
+  }
+  el.scanDiffBody.addEventListener("click", handleDiffRowClick);
+  document.getElementById("syncDiffBody").addEventListener("click", handleDiffRowClick);
+
   el.scanDiffBody.addEventListener("change", (e) => {
     if (e.target.dataset.role !== "select-all-removals") return;
     const on = e.target.checked;
@@ -660,12 +797,59 @@ function bindEvents() {
     await chrome.runtime.sendMessage({ type: "DISCARD_SCAN" });
   });
 
+  // Sync diff dialog
+  el.syncDiffBody.addEventListener("change", (e) => {
+    if (e.target.dataset.role !== "select-all-removals") return;
+    const on = e.target.checked;
+    el.syncDiffBody.querySelectorAll("input[data-remove-id]").forEach((box) => (box.checked = on));
+  });
+
+  el.syncDiffApply.addEventListener("click", async () => {
+    if (!pendingSyncDiff) return;
+    const { direction } = pendingSyncDiff;
+    const removeIds = Array.from(
+      el.syncDiffBody.querySelectorAll("input[data-remove-id]:checked")
+    ).map((box) => box.dataset.removeId);
+
+    el.syncDiffApply.disabled = true;
+    el.statusText.textContent = direction === "upload" ? "Uploading…" : "Downloading…";
+
+    const res = direction === "upload"
+      ? await chrome.runtime.sendMessage({ type: "APPLY_UPLOAD", removeFromGistIds: removeIds })
+      : await chrome.runtime.sendMessage({ type: "APPLY_DOWNLOAD", removeLocalIds: removeIds });
+
+    el.syncDiffApply.disabled = false;
+    el.syncDiffModal.hidden = true;
+    pendingSyncDiff = null;
+
+    if (res?.ok) {
+      state.gistId = res.gistId;
+      state.lastSyncedAt = res.lastSyncedAt;
+      await loadState();
+      render();
+      el.statusText.textContent = direction === "upload" ? "Upload complete." : "Download complete.";
+    } else {
+      el.statusText.textContent = res?.error || "Sync failed.";
+    }
+  });
+
+  el.syncDiffCancel.addEventListener("click", () => {
+    el.syncDiffModal.hidden = true;
+    pendingSyncDiff = null;
+  });
+
   // Clicking the dark backdrop closes a modal
   for (const modal of [el.settingsModal, el.folderModal]) {
     modal.addEventListener("mousedown", (e) => {
       if (e.target === modal) modal.hidden = true;
     });
   }
+  el.syncDiffModal.addEventListener("mousedown", (e) => {
+    if (e.target === el.syncDiffModal) {
+      el.syncDiffModal.hidden = true;
+      pendingSyncDiff = null;
+    }
+  });
 }
 
 // ---------- Folder / tag management ----------

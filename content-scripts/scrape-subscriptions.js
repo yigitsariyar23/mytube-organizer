@@ -3,11 +3,15 @@
 //
 // NOTE: YouTube's DOM changes from time to time (ytd-channel-renderer was
 // replaced by yt-lockup-view-model style components in some rollouts), so this
-// script does NOT depend on renderer tag names. It scrolls until the page
-// stops growing, then collects every link that points at a channel
-// (/channel/UC... or /@handle) inside the main browse area.
+// script does NOT depend on renderer tag names. It injects a "Scan channels"
+// button — scroll the page manually until all channels are loaded, then click
+// it to collect every link that points at a channel (/channel/UC... or /@handle)
+// inside the main browse area.
 
 (async function () {
+  // Show a persistent "Scan now" button so the user can scroll manually first,
+  // then trigger the scrape whenever the full list is visible.
+  showScanButton();
   // Channel-name candidates inside a link, best first. Purely a quality
   // heuristic — if none match we still keep the channel with a fallback name.
   // Queried one by one (a single comma-list querySelector would return the
@@ -21,22 +25,14 @@
     "[class*='title']",
   ];
 
-  await autoScrollUntilStable();
-
-  const channels = collectChannels();
-  // Keep everything we can key on: a channelId, or a handle the background can
-  // resolve to one. The background diffs this whole set against the stored
-  // library and opens a review dialog rather than merging straight away.
-  const scanned = channels.filter((c) => c.channelId || c.handle);
-
-  // Only trigger a diff when we actually found channels. An empty result almost
-  // always means YouTube's layout changed, not that every subscription is gone
-  // — sending it would flag the whole library for removal.
-  if (scanned.length) {
-    chrome.runtime.sendMessage({ type: "SCAN_RESULT", channels: scanned });
+  function runScan() {
+    const channels = collectChannels();
+    const scanned = channels.filter((c) => c.channelId || c.handle);
+    if (scanned.length) {
+      chrome.runtime.sendMessage({ type: "SCAN_RESULT", channels: scanned });
+    }
+    showBanner(scanned.length);
   }
-
-  showBanner(scanned.length);
 
   function channelAnchorRoot() {
     // ytd-browse is the main content container; the guide sidebar and masthead
@@ -77,7 +73,7 @@
       if (parsed.handle && !entry.handle) entry.handle = parsed.handle;
 
       const img = a.querySelector("img");
-      if (img && img.src && !entry.thumbnail) entry.thumbnail = img.src;
+      if (img && img.naturalWidth > 0 && img.src && !entry.thumbnail) entry.thumbnail = img.src;
 
       considerName(entry, a, img);
     }
@@ -155,43 +151,45 @@
     }
   }
 
-  function autoScrollUntilStable() {
-    return new Promise((resolve) => {
-      let lastHeight = -1;
-      let lastCount = -1;
-      let stableTicks = 0;
-      const interval = setInterval(() => {
-        window.scrollTo(0, document.documentElement.scrollHeight);
-        const height = document.documentElement.scrollHeight;
-        const count = collectChannels().length;
-        if (height === lastHeight && count === lastCount) {
-          stableTicks++;
-        } else {
-          stableTicks = 0;
-          lastHeight = height;
-          lastCount = count;
-        }
-        if (stableTicks >= 5) {
-          clearInterval(interval);
-          resolve();
-        }
-      }, 700);
-      setTimeout(() => {
-        clearInterval(interval);
-        resolve();
-      }, 45000);
+  function showScanButton() {
+    const btn = document.createElement("button");
+    btn.id = "mytube-scan-btn";
+    btn.textContent = "📋 Scan channels";
+    Object.assign(btn.style, {
+      position: "fixed",
+      bottom: "24px",
+      right: "24px",
+      background: "#FF8C00",
+      color: "#000",
+      border: "none",
+      borderRadius: "8px",
+      padding: "10px 18px",
+      fontFamily: "system-ui, sans-serif",
+      fontSize: "14px",
+      fontWeight: "600",
+      cursor: "pointer",
+      zIndex: 999999,
+      boxShadow: "0 4px 16px rgba(0,0,0,.4)",
     });
+    btn.addEventListener("click", () => {
+      btn.textContent = "⏳ Scanning…";
+      btn.style.opacity = "0.7";
+      btn.style.pointerEvents = "none";
+      runScan();
+    });
+    document.body.appendChild(btn);
   }
 
   function showBanner(total) {
+    document.getElementById("mytube-scan-btn")?.remove();
     const el = document.createElement("div");
     el.textContent = total
       ? `MyTube Organizer: scanned ${total} channels — review the changes in the dashboard.`
       : "MyTube Organizer: no channels found — YouTube's page layout may have changed.";
     Object.assign(el.style, {
       position: "fixed",
-      bottom: "20px",
-      right: "20px",
+      bottom: "24px",
+      right: "24px",
       background: total ? "#17161A" : "#5A1E1E",
       color: "#EDEAE4",
       padding: "10px 16px",
