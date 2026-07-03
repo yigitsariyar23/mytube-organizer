@@ -28,6 +28,10 @@
     <main class="main">
       <div class="topbar">
         <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
+        <div class="view-toggle" role="group" aria-label="View mode">
+          <button id="cardViewBtn" class="view-btn" title="Card view" aria-label="Card view">▦</button>
+          <button id="listViewBtn" class="view-btn" title="List view" aria-label="List view">☰</button>
+        </div>
         <span id="statusText" class="status-text"></span>
       </div>
 
@@ -42,6 +46,7 @@
       </div>
 
       <div id="channelGrid" class="channel-grid"></div>
+      <div id="scrollSentinel" class="scroll-sentinel" aria-hidden="true"></div>
     </main>
   </div>
 

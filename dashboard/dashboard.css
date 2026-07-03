@@ -177,6 +177,35 @@ html, body {
   color: var(--text-muted);
 }
 
+/* ---------- View toggle ---------- */
+
+.view-toggle {
+  display: flex;
+  gap: 2px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+}
+
+.view-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.view-btn:hover { color: var(--text); }
+
+.view-btn.active {
+  background: var(--panel-2);
+  color: var(--accent);
+}
+
 .tag-filter-bar {
   display: flex;
   flex-wrap: wrap;
@@ -228,6 +257,53 @@ html, body {
 }
 
 .channel-card:hover { border-color: var(--accent); }
+
+/* ---------- Channel list view ---------- */
+
+.channel-grid.list-view {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.channel-row {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1.6fr) auto minmax(0, 1.4fr) 150px;
+  align-items: center;
+  gap: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  transition: border-color 0.15s ease;
+}
+
+.channel-row:hover { border-color: var(--accent); }
+
+.channel-row .channel-thumb {
+  width: 32px;
+  height: 32px;
+}
+
+.channel-row .channel-tags {
+  justify-content: flex-end;
+}
+
+.channel-row .channel-controls {
+  margin-top: 0;
+}
+
+/* On narrow widths, drop the tag column so rows stay readable */
+@media (max-width: 720px) {
+  .channel-row {
+    grid-template-columns: auto 1fr auto 140px;
+  }
+  .channel-row .channel-tags { display: none; }
+}
+
+.scroll-sentinel {
+  height: 1px;
+}
 
 .channel-head {
   display: flex;
