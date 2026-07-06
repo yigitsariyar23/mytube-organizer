@@ -463,7 +463,7 @@ html, body {
 .list-table-header,
 .channel-row {
   display: grid;
-  grid-template-columns: minmax(180px, 2fr) 130px 70px minmax(0, 1fr) 150px;
+  grid-template-columns: minmax(180px, 2fr) 130px 70px 70px minmax(0, 1fr) 150px;
   align-items: center;
   gap: 16px;
   padding: 8px 14px;
@@ -521,7 +521,8 @@ html, body {
 }
 
 .row-date,
-.row-count {
+.row-count,
+.row-subs {
   font-family: var(--mono);
   font-size: 11.5px;
   color: var(--text);
@@ -545,9 +546,9 @@ html, body {
 @media (max-width: 720px) {
   .list-table-header,
   .channel-row {
-    grid-template-columns: minmax(140px, 2fr) 110px 60px 140px;
+    grid-template-columns: minmax(140px, 2fr) 110px 60px 60px 140px;
   }
-  .list-table-header > :nth-child(4),
+  .list-table-header > :nth-child(5),
   .channel-row .channel-tags { display: none; }
 }
 
@@ -585,16 +586,6 @@ html, body {
   font-size: 11px;
   color: var(--text-muted);
 }
-
-.channel-stats {
-  display: flex;
-  gap: 14px;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
-
-.channel-stats b { color: var(--text); font-weight: 600; }
 
 .channel-tags {
   display: flex;

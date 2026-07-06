@@ -591,34 +591,6 @@ function updateSortHeaders() {
   }
 }
 
-function buildChannelCard(ch) {
-  const card = document.createElement("div");
-  card.className = "channel-card";
-  card.dataset.channelId = ch.id;
-
-  card.innerHTML = `
-    <div class="channel-head">
-      ${thumbHtml(ch)}
-      <div class="channel-name-wrap">
-        <div class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</div>
-        <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
-      </div>
-    </div>
-    <div class="channel-stats">
-      <span title="${escapeHtml(formatAbsoluteDate(ch.lastVideoDate))}">Last video: <b>${formatRelativeDate(ch.lastVideoDate)}</b></span>
-      <span>Videos: <b>${ch.videoCount ?? "—"}</b></span>
-    </div>
-    <div class="channel-tags">
-      ${tagChipsHtml(ch)}
-      <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
-    </div>
-    <div class="channel-controls">
-      <select class="folder-select" data-role="move-folder">${folderOptionsHtml(ch)}</select>
-    </div>
-  `;
-  return card;
-}
-
 function buildChannelRow(ch) {
   const row = document.createElement("div");
   row.className = "channel-row";
@@ -634,6 +606,7 @@ function buildChannelRow(ch) {
     </div>
     <div class="row-date" title="${escapeHtml(formatAbsoluteDate(ch.lastVideoDate))}">${formatRelativeDate(ch.lastVideoDate)}</div>
     <div class="row-count">${ch.videoCount ?? "—"}</div>
+    <div class="row-subs" title="${escapeHtml(subscriberTitle(ch.subscriberCount))}">${formatSubscribers(ch.subscriberCount)}</div>
     <div class="channel-tags">
       ${tagChipsHtml(ch)}
       <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
@@ -717,6 +690,25 @@ function formatAbsoluteDate(iso) {
     year: "numeric", month: "short", day: "numeric",
     hour: "numeric", minute: "2-digit",
   });
+}
+
+// Compact subscriber count for the list, e.g. 1.2M / 45.3K / 812. null means
+// hidden or not-yet-fetched (needs an API key) and shows as an em dash.
+function formatSubscribers(n) {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1_000_000) return trimZero(n / 1_000_000) + "M";
+  if (n >= 1_000) return trimZero(n / 1_000) + "K";
+  return String(n);
+}
+
+function trimZero(x) {
+  return x.toFixed(1).replace(/\.0$/, "");
+}
+
+// Exact count (or a reason) for the cell's hover tooltip.
+function subscriberTitle(n) {
+  if (n === null || n === undefined) return "Subscriber count unavailable (needs an API key, or the channel hides it)";
+  return n.toLocaleString() + " subscribers";
 }
 
 function escapeHtml(str) {

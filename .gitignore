@@ -1,0 +1,11 @@
+# Personal dev utilities / data dumps — not part of the shipped extension.
+# (Kept locally, just untracked. See CLAUDE.md "Cruft".)
+scraped-ids.txt
+csv-ids.txt
+check-missing.sh
+
+# OS / editor noise
+.DS_Store
+
+# Claude Code transient worktrees
+.claude/worktrees/
