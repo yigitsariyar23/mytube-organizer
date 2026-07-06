@@ -164,6 +164,10 @@ html, body {
 .folder-item:hover .drag-handle { opacity: 0.5; }
 .folder-item .drag-handle:active { cursor: grabbing; }
 
+/* Non-interactive slot: it inherits the folder row's cursor, so clicking the
+   emoji selects the folder just like clicking its name. Kept at a fixed width
+   (even when empty) so folder names stay aligned. Emoji is set from the folder
+   right-click menu. */
 .folder-emoji {
   flex-shrink: 0;
   width: 20px;
@@ -174,21 +178,8 @@ html, body {
   margin-right: 6px;
   font-size: 14px;
   line-height: 1;
-  cursor: pointer;
-  border-radius: 4px;
   user-select: none;
 }
-
-.folder-emoji:hover { background: rgba(255,255,255,0.08); }
-
-.folder-emoji-placeholder {
-  font-size: 11px;
-  color: var(--text-muted);
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.folder-item:hover .folder-emoji-placeholder { opacity: 1; }
 
 .folder-emoji-picker {
   position: fixed;

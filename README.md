@@ -78,7 +78,8 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
   - **Drag and drop** (in "Custom" sort only): drop onto the middle of a
     top-level folder to nest inside it, or onto the top/bottom edge of a folder
     to reorder as a sibling.
-  - A per-folder **emoji** (click the `+` slot next to the name).
+  - A per-folder **emoji** (right-click the folder → **Set emoji…**). Clicking
+    the emoji itself just opens the folder, like clicking its name.
   - **Sort** modes — Custom (manual order), A → Z, Count ↓, Count ↑ — chosen
     from the dropdown in the Folders header.
   - **Collapse/expand** of parents (click the caret), and a channel **count**

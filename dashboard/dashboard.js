@@ -234,22 +234,14 @@ function renderFolders() {
   }
 
   initFolderDrag();
-  initFolderEmojiSlots();
 }
 
 function folderEmojiSlotHtml(folderId, emoji) {
   if (folderId === "unsorted") return "";
-  return `<span class="folder-emoji" data-folder-id="${folderId}" title="Set emoji">${emoji || '<span class="folder-emoji-placeholder">+</span>'}</span>`;
-}
-
-function initFolderEmojiSlots() {
-  el.folderList.querySelectorAll(".folder-emoji").forEach((slot) => {
-    slot.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const folderId = slot.dataset.folderId;
-      openEmojiInput(slot, folderId);
-    });
-  });
+  // A plain, non-interactive slot: clicking it selects the folder like the name
+  // does (the click bubbles up). Emoji is set from the folder's right-click menu.
+  // The slot is always rendered (empty when unset) so folder names stay aligned.
+  return `<span class="folder-emoji">${escapeHtml(emoji || "")}</span>`;
 }
 
 function openEmojiInput(anchorEl, folderId) {
@@ -284,13 +276,7 @@ function openEmojiInput(anchorEl, folderId) {
   input.select();
 
   const save = async (value) => {
-    const emoji = [...value.trim()].slice(0, 2).join(""); // take first emoji (may be 2 codepoints)
-    if (state.folders[folderId]) {
-      if (emoji) state.folders[folderId].emoji = emoji;
-      else delete state.folders[folderId].emoji;
-      await chrome.storage.local.set({ folders: state.folders });
-      renderFolders();
-    }
+    await setFolderEmoji(folderId, value);
     picker.remove();
   };
 
@@ -316,6 +302,18 @@ function openEmojiInput(anchorEl, folderId) {
       }
     });
   }, 0);
+}
+
+// Set or clear a folder's emoji (empty string clears). Emoji may be up to two
+// codepoints. Persists and re-renders the sidebar.
+async function setFolderEmoji(folderId, value) {
+  const folder = state.folders[folderId];
+  if (!folder) return;
+  const emoji = [...value.trim()].slice(0, 2).join("");
+  if (emoji) folder.emoji = emoji;
+  else delete folder.emoji;
+  await chrome.storage.local.set({ folders: state.folders });
+  renderFolders();
 }
 
 // Whether a folder has any subfolders (i.e. is itself a parent).
@@ -1187,6 +1185,15 @@ function bindEvents() {
     const folder = state.folders[id];
     const isChild = !!folder?.parentId;
     const menuItems = [{ label: "Rename…", action: () => openFolderModal("rename-folder", id) }];
+    if (id !== "unsorted") {
+      menuItems.push({
+        label: folder?.emoji ? "Change emoji…" : "Set emoji…",
+        action: () => openEmojiInput(li, id),
+      });
+      if (folder?.emoji) {
+        menuItems.push({ label: "Remove emoji", action: () => setFolderEmoji(id, "") });
+      }
+    }
     // Only allow subfolders one level deep (top-level folders can have children)
     if (!isChild && id !== "unsorted") {
       menuItems.push({ label: "New subfolder…", action: () => openFolderModal("create-folder", null, id) });
