@@ -1032,7 +1032,7 @@ function bindEvents() {
   }
 
   function isInteractiveTarget(t) {
-    return t.closest(".tag-chip") || t.closest("select") || t.closest(".tag-input-popover");
+    return t.closest(".tag-chip") || t.closest("select") || t.closest(".tag-picker");
   }
 
   // Folder change / tag add-remove / row clicks
@@ -1052,7 +1052,7 @@ function bindEvents() {
     }
 
     if (e.target.dataset.role === "add-tag") {
-      openTagInput(channelCard, channelId);
+      openTagPicker(e.target, channelId);
       return;
     }
 
@@ -1586,41 +1586,147 @@ async function deleteChannel(channelId) {
   render();
 }
 
-function openTagInput(cardEl, channelId) {
-  if (cardEl.querySelector(".tag-input-popover")) return;
+let tagPickerEl = null;
 
-  const wrap = document.createElement("div");
-  wrap.className = "tag-input-popover";
-  wrap.style.marginTop = "4px";
+// Dropdown anchored to a channel's "+ tag" chip: pick an existing tag to add,
+// or fall through to "+ New tag" to create one inline.
+function openTagPicker(chipEl, channelId) {
+  closeTagPicker();
+
+  const ch = state.channels[channelId];
+  const current = new Set(ch.tags || []);
+  const available = Object.entries(state.tags)
+    .filter(([id]) => !current.has(id))
+    .sort((a, b) => a[1].name.localeCompare(b[1].name));
+
+  const menu = document.createElement("div");
+  menu.className = "tag-picker context-menu";
+
+  const listWrap = document.createElement("div");
+  listWrap.className = "tag-picker-list";
+  if (available.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "tag-picker-empty";
+    empty.textContent = current.size ? "All tags added" : "No tags yet";
+    listWrap.appendChild(empty);
+  } else {
+    for (const [id, tag] of available) {
+      const row = document.createElement("div");
+      row.className = "tag-picker-item";
+
+      const addBtn = document.createElement("button");
+      addBtn.className = "tag-picker-add";
+      const swatch = document.createElement("span");
+      swatch.className = "tag-picker-swatch";
+      swatch.style.background = tag.color;
+      addBtn.appendChild(swatch);
+      addBtn.appendChild(document.createTextNode(tag.name));
+      addBtn.addEventListener("click", async () => {
+        closeTagPicker();
+        await addTagIdToChannel(channelId, id);
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "tag-picker-del";
+      delBtn.textContent = "×";
+      delBtn.title = "Delete tag everywhere";
+      delBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        closeTagPicker();
+        await deleteTag(id);
+      });
+
+      row.appendChild(addBtn);
+      row.appendChild(delBtn);
+      listWrap.appendChild(row);
+    }
+  }
+  menu.appendChild(listWrap);
+
+  const sep = document.createElement("div");
+  sep.className = "context-menu-separator";
+  menu.appendChild(sep);
+
+  const newBtn = document.createElement("button");
+  newBtn.className = "tag-picker-item tag-picker-new";
+  newBtn.textContent = "+ New tag";
+  newBtn.addEventListener("click", () => showNewTagInput(menu, channelId));
+  menu.appendChild(newBtn);
+
+  document.body.appendChild(menu);
+  tagPickerEl = menu;
+  positionTagPicker(chipEl, menu);
+
+  // Defer so the click that opened the picker doesn't immediately close it.
+  setTimeout(() => document.addEventListener("click", onTagPickerOutside), 0);
+  document.addEventListener("scroll", closeTagPicker, true);
+  document.addEventListener("keydown", onTagPickerKeydown);
+}
+
+function positionTagPicker(chipEl, menu) {
+  const rect = chipEl.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  let left = rect.left;
+  let top = rect.bottom + 4;
+  if (left + menuRect.width > window.innerWidth - 8) {
+    left = window.innerWidth - menuRect.width - 8;
+  }
+  if (top + menuRect.height > window.innerHeight - 8) {
+    top = rect.top - menuRect.height - 4;
+  }
+  menu.style.left = Math.max(8, left) + "px";
+  menu.style.top = Math.max(8, top) + "px";
+}
+
+// Swap the "+ New tag" button for an inline text field to name a new tag.
+function showNewTagInput(menu, channelId) {
+  const newBtn = menu.querySelector(".tag-picker-new");
+  if (!newBtn) return;
 
   const input = document.createElement("input");
-  input.className = "field-input";
-  input.style.fontSize = "12px";
-  input.style.padding = "5px 8px";
+  input.className = "field-input tag-picker-input";
   input.placeholder = "tag name, press Enter";
-  input.setAttribute("list", "existing-tags-datalist");
-
-  const datalist = document.getElementById("existing-tags-datalist") || document.createElement("datalist");
-  datalist.id = "existing-tags-datalist";
-  datalist.innerHTML = Object.values(state.tags)
-    .map((t) => `<option value="${escapeHtml(t.name)}"></option>`)
-    .join("");
-  document.body.appendChild(datalist);
-
-  wrap.appendChild(input);
-  cardEl.appendChild(wrap);
+  newBtn.replaceWith(input);
   input.focus();
 
   input.addEventListener("keydown", async (e) => {
     if (e.key === "Enter") {
       const name = input.value.trim();
+      closeTagPicker();
       if (name) await addTagToChannel(channelId, name);
-      wrap.remove();
     } else if (e.key === "Escape") {
-      wrap.remove();
+      e.stopPropagation();
+      closeTagPicker();
     }
   });
-  input.addEventListener("blur", () => setTimeout(() => wrap.remove(), 150));
+}
+
+function onTagPickerOutside(e) {
+  if (tagPickerEl && tagPickerEl.contains(e.target)) return;
+  closeTagPicker();
+}
+
+function onTagPickerKeydown(e) {
+  if (e.key === "Escape") closeTagPicker();
+}
+
+function closeTagPicker() {
+  if (!tagPickerEl) return;
+  tagPickerEl.remove();
+  tagPickerEl = null;
+  document.removeEventListener("click", onTagPickerOutside);
+  document.removeEventListener("scroll", closeTagPicker, true);
+  document.removeEventListener("keydown", onTagPickerKeydown);
+}
+
+async function addTagIdToChannel(channelId, tagId) {
+  const ch = state.channels[channelId];
+  if (!ch || !state.tags[tagId]) return;
+  if (!ch.tags) ch.tags = [];
+  if (!ch.tags.includes(tagId)) {
+    ch.tags.push(tagId);
+    await chrome.storage.local.set({ channels: state.channels });
+  }
 }
 
 async function addTagToChannel(channelId, name) {

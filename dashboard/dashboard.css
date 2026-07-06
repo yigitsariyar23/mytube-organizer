@@ -603,6 +603,67 @@ html, body {
   border-style: dashed;
 }
 
+/* Tag picker dropdown (opened from the "+ tag" chip) */
+.tag-picker {
+  min-width: 150px;
+  max-width: 220px;
+}
+
+.tag-picker-list {
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.tag-picker-item {
+  display: flex;
+  align-items: center;
+}
+
+.tag-picker-add {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tag-picker .tag-picker-del {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 7px 9px;
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.tag-picker .tag-picker-del:hover {
+  color: var(--danger);
+  background: var(--panel);
+}
+
+.tag-picker-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tag-picker-new {
+  color: var(--text-muted);
+}
+
+.tag-picker-empty {
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.tag-picker-input {
+  width: 100%;
+  font-size: 12px;
+  padding: 6px 8px;
+}
+
 .channel-controls {
   display: flex;
   align-items: center;
