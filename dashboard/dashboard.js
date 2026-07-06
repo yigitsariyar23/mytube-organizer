@@ -37,6 +37,8 @@ const el = {
   searchInput: document.getElementById("searchInput"),
   scanBtn: document.getElementById("scanBtn"),
   refreshBtn: document.getElementById("refreshBtn"),
+  fillAvatarsBtn: document.getElementById("fillAvatarsBtn"),
+  fillAvatarsStatus: document.getElementById("fillAvatarsStatus"),
   addFolderBtn: document.getElementById("addFolderBtn"),
   settingsBtn: document.getElementById("settingsBtn"),
   settingsModal: document.getElementById("settingsModal"),
@@ -98,6 +100,10 @@ function populateYearDropdowns() {
 
 async function init() {
   await loadState();
+  // Fold every parent folder by default; expansions during the session persist.
+  for (const id of Object.keys(state.folders)) {
+    if (getChildFolderIds(id).length) collapsedFolders.add(id);
+  }
   populateYearDropdowns();
   render();
   bindEvents();
@@ -204,7 +210,8 @@ function renderFolders() {
     if (hasChildren) li.dataset.parentFolder = "1";
     li.draggable = draggable;
     const emoji = state.folders[f.id]?.emoji || "";
-    li.innerHTML = `${folderEmojiSlotHtml(f.id, emoji)}<span class="folder-name">${escapeHtml(f.name)}</span><span class="folder-count">${f.count}</span>`;
+    const caret = hasChildren ? `<span class="folder-caret" aria-hidden="true">▸</span>` : "";
+    li.innerHTML = `${caret}${folderEmojiSlotHtml(f.id, emoji)}<span class="folder-name">${escapeHtml(f.name)}</span><span class="folder-count">${f.count}</span>`;
     el.folderList.appendChild(li);
 
     // Render children under this parent
@@ -219,6 +226,7 @@ function renderFolders() {
         const childLi = document.createElement("li");
         childLi.className = "folder-item folder-item--child" + (child.id === currentFolderId ? " active" : "") + (isCollapsed ? " folder-item--hidden" : "");
         childLi.dataset.folderId = child.id;
+        childLi.draggable = folderSort === "custom";
         childLi.innerHTML = `${folderEmojiSlotHtml(child.id, child.emoji)}<span class="folder-name">${escapeHtml(child.name)}</span><span class="folder-count">${child.count}</span>`;
         el.folderList.appendChild(childLi);
       }
@@ -310,56 +318,141 @@ function openEmojiInput(anchorEl, folderId) {
   }, 0);
 }
 
-function initFolderDrag() {
-  let dragSrc = null;
+// Whether a folder has any subfolders (i.e. is itself a parent).
+function folderHasChildren(folderId) {
+  return Object.values(state.folders).some((f) => f.parentId === folderId);
+}
 
-  el.folderList.querySelectorAll(".folder-item[draggable]").forEach((li) => {
+// Ordered ids of folders sharing a parent. parentId null/undefined => top-level.
+// The pinned "unsorted" folder is excluded — it is never reordered or reparented.
+function getSiblingIdsOrdered(parentId) {
+  return Object.entries(state.folders)
+    .filter(([id, f]) => id !== "unsorted" && (parentId ? f.parentId === parentId : !f.parentId))
+    .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
+    .map(([id]) => id);
+}
+
+// Move `srcId` into `newParentId` (null = top-level), positioned just before
+// `beforeId` among the destination siblings (append when beforeId is null).
+// Renumbers the destination group's order values and persists.
+function applyFolderDrop(srcId, newParentId, beforeId) {
+  const src = state.folders[srcId];
+  if (!src) return;
+
+  if (newParentId) src.parentId = newParentId;
+  else delete src.parentId;
+
+  const siblings = getSiblingIdsOrdered(newParentId).filter((id) => id !== srcId);
+  const idx = beforeId ? siblings.indexOf(beforeId) : -1;
+  if (idx >= 0) siblings.splice(idx, 0, srcId);
+  else siblings.push(srcId);
+
+  siblings.forEach((id, i) => { state.folders[id].order = i; });
+  chrome.storage.local.set({ folders: state.folders });
+}
+
+// Decide what a drop of `srcId` onto `targetId` means from where the cursor
+// sits within the target row: nest inside (middle) vs. reorder as a sibling
+// (top/bottom edge). Returns null when the drop isn't allowed.
+function computeFolderDropIntent(srcId, targetId, clientY, targetEl) {
+  const src = state.folders[srcId];
+  const target = state.folders[targetId];
+  if (!src || !target || srcId === targetId) return null;
+  if (targetId === "unsorted") return null;   // pinned; never a drop target
+  if (target.parentId === srcId) return null; // can't drop a folder onto its own child
+
+  const srcHasChildren = folderHasChildren(srcId);
+  const targetIsTopLevel = !target.parentId;
+  // 2-level max: only nest into a top-level folder, and never nest a folder
+  // that already has children of its own.
+  const canNest = targetIsTopLevel && !srcHasChildren;
+
+  const rect = targetEl.getBoundingClientRect();
+  const y = clientY - rect.top;
+  const h = rect.height;
+
+  if (canNest) {
+    if (y < h * 0.25) return { type: "before" };
+    if (y > h * 0.75) return { type: "after" };
+    return { type: "inside" };
+  }
+
+  // No nesting here — the gesture can only reorder as a sibling of the target.
+  // A folder with children can't become a child, so reordering it next to a
+  // child folder (which would nest it one level down) is disallowed.
+  if (srcHasChildren && target.parentId) return null;
+  return { type: y < h * 0.5 ? "before" : "after" };
+}
+
+function performFolderDrop(srcId, targetId, intent) {
+  const target = state.folders[targetId];
+  if (intent.type === "inside") {
+    collapsedFolders.delete(targetId); // reveal the newly nested child
+    applyFolderDrop(srcId, targetId, null);
+  } else {
+    const newParentId = target.parentId || null;
+    if (intent.type === "before") {
+      applyFolderDrop(srcId, newParentId, targetId);
+    } else {
+      const siblings = getSiblingIdsOrdered(newParentId).filter((id) => id !== srcId);
+      const afterId = siblings[siblings.indexOf(targetId) + 1] || null;
+      applyFolderDrop(srcId, newParentId, afterId);
+    }
+  }
+  render();
+}
+
+function initFolderDrag() {
+  if (folderSort !== "custom") return; // manual drag is only meaningful in custom order
+
+  let dragSrcId = null;
+
+  const clearIndicators = () => {
+    el.folderList.querySelectorAll(".folder-item").forEach((x) =>
+      x.classList.remove("drag-over", "drag-before", "drag-after"));
+  };
+
+  el.folderList.querySelectorAll(".folder-item").forEach((li) => {
+    if (!li.draggable) return; // skip "All" and "Unsorted"
+    const fid = li.dataset.folderId;
+
     li.addEventListener("dragstart", (e) => {
-      dragSrc = li;
+      dragSrcId = fid;
       li.classList.add("dragging");
       e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", fid); // Firefox needs data to start a drag
     });
 
     li.addEventListener("dragend", () => {
       li.classList.remove("dragging");
-      el.folderList.querySelectorAll(".folder-item").forEach((x) => x.classList.remove("drag-over"));
-      dragSrc = null;
+      clearIndicators();
+      dragSrcId = null;
     });
 
     li.addEventListener("dragover", (e) => {
-      if (!dragSrc || dragSrc === li) return;
+      if (!dragSrcId) return;
+      const intent = computeFolderDropIntent(dragSrcId, fid, e.clientY, li);
+      if (!intent) return; // invalid target — no preventDefault, so the drop is refused
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
-      el.folderList.querySelectorAll(".folder-item").forEach((x) => x.classList.remove("drag-over"));
-      li.classList.add("drag-over");
+      clearIndicators();
+      li.classList.add(
+        intent.type === "inside" ? "drag-over" :
+        intent.type === "before" ? "drag-before" : "drag-after"
+      );
     });
 
     li.addEventListener("dragleave", () => {
-      li.classList.remove("drag-over");
+      li.classList.remove("drag-over", "drag-before", "drag-after");
     });
 
     li.addEventListener("drop", (e) => {
+      if (!dragSrcId) return;
+      const intent = computeFolderDropIntent(dragSrcId, fid, e.clientY, li);
+      clearIndicators();
+      if (!intent) return;
       e.preventDefault();
-      if (!dragSrc || dragSrc === li) return;
-      li.classList.remove("drag-over");
-
-      // Reorder DOM
-      const items = [...el.folderList.querySelectorAll(".folder-item[draggable]")];
-      const srcIdx = items.indexOf(dragSrc);
-      const dstIdx = items.indexOf(li);
-      if (srcIdx < dstIdx) {
-        li.after(dragSrc);
-      } else {
-        li.before(dragSrc);
-      }
-
-      // Persist new order (skip "all" which has no entry in state.folders)
-      const ordered = [...el.folderList.querySelectorAll(".folder-item[draggable]")];
-      ordered.forEach((item, i) => {
-        const id = item.dataset.folderId;
-        if (state.folders[id]) state.folders[id].order = i;
-      });
-      chrome.storage.local.set({ folders: state.folders });
+      performFolderDrop(dragSrcId, fid, intent);
     });
   });
 }
@@ -893,11 +986,60 @@ function bindEvents() {
 
   el.refreshBtn.addEventListener("click", async () => {
     el.statusText.textContent = "Refreshing…";
-    await chrome.runtime.sendMessage({ type: "REFRESH_STATS" });
+    const res = await chrome.runtime.sendMessage({ type: "REFRESH_STATS" });
     await loadState();
     render();
-    el.statusText.textContent = "Last updated: " + new Date().toLocaleTimeString();
+    el.statusText.textContent = summarizeRefresh(res);
   });
+
+  el.fillAvatarsBtn.addEventListener("click", async () => {
+    // Persist a just-typed key so the fill works without a separate Save first.
+    state.apiKey = el.apiKeyInput.value.trim();
+    await chrome.storage.local.set({ apiKey: state.apiKey });
+
+    el.fillAvatarsBtn.disabled = true;
+    el.fillAvatarsStatus.textContent = "Fetching missing avatars…";
+    const res = await chrome.runtime.sendMessage({ type: "FILL_MISSING_AVATARS" });
+    await loadState();
+    render();
+    el.fillAvatarsBtn.disabled = false;
+    el.fillAvatarsStatus.textContent = summarizeAvatarFill(res);
+  });
+
+  // Turn the background refresh summary into a status line that explains why
+  // avatars/counts may not have filled (missing key, API error, etc.).
+  function summarizeRefresh(res) {
+    const time = new Date().toLocaleTimeString();
+    if (!res || !res.ok) return "Refresh failed. " + (res?.error || "");
+    if (res.queried === 0) return "No channels to refresh.";
+    if (!res.hasApiKey) {
+      return `Updated ${time}. No API key set — avatars and video counts need a YouTube API key in Settings. (${res.missingThumbs ?? "?"} without avatars.)`;
+    }
+    let msg = `Updated ${time}: ${res.thumbsFilled ?? 0} avatars filled`;
+    if (res.missingThumbs) msg += `, ${res.missingThumbs} still missing`;
+    msg += ".";
+    if (res.apiFailures) {
+      msg += ` ⚠ ${res.apiFailures} API call${res.apiFailures === 1 ? "" : "s"} failed` +
+        (res.lastError ? ` (${res.lastError})` : "") + ".";
+    }
+    return msg;
+  }
+
+  // Status line for the targeted avatar-only backfill.
+  function summarizeAvatarFill(res) {
+    const time = new Date().toLocaleTimeString();
+    if (!res || !res.ok) return "Avatar fill failed. " + (res?.error || "");
+    if (!res.hasApiKey) return "No API key set — add a YouTube API key in Settings to fetch avatars.";
+    if (res.missingBefore === 0) return "All channels already have avatars.";
+    let msg = `Filled ${res.thumbsFilled} of ${res.missingBefore} missing avatar${res.missingBefore === 1 ? "" : "s"}`;
+    if (res.missingAfter) msg += `, ${res.missingAfter} still missing (the API has no avatar for those)`;
+    msg += ` — ${time}.`;
+    if (res.apiFailures) {
+      msg += ` ⚠ ${res.apiFailures} API call${res.apiFailures === 1 ? "" : "s"} failed` +
+        (res.lastError ? ` (${res.lastError})` : "") + ".";
+    }
+    return msg;
+  }
 
   function isInteractiveTarget(t) {
     return t.closest(".tag-chip") || t.closest("select") || t.closest(".tag-input-popover");
@@ -978,6 +1120,7 @@ function bindEvents() {
   el.settingsBtn.addEventListener("click", () => {
     el.apiKeyInput.value = state.apiKey || "";
     el.gistTokenInput.value = state.gistToken || "";
+    el.fillAvatarsStatus.textContent = "";
     renderSyncStatus();
     el.settingsModal.hidden = false;
   });

@@ -8,12 +8,39 @@
   --accent: #e8b355;
   --accent-dim: #6b5530;
   --danger: #e0705a;
+  --scroll-thumb: #3a3841;
+  --scroll-thumb-hover: #4c4a55;
   --radius: 10px;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 * { box-sizing: border-box; }
+
+/* ---------- Scrollbars ---------- */
+/* Minimal, theme-driven: transparent track, a slim rounded thumb that floats
+   via a transparent border, brightening on hover. Colors come from :root so
+   they follow the theme. */
+* {
+  scrollbar-width: thin;                              /* Firefox */
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 2px solid transparent;                      /* inset padding → slim thumb */
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: padding-box;
+}
 
 html, body {
   margin: 0;
@@ -39,7 +66,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 .brand {
@@ -95,7 +122,15 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  /* Only the folder list scrolls; everything else in the sidebar stays fixed.
+     min-height:0 lets it shrink inside the flex column so it can scroll. */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;            /* Firefox — hide the scrollbar */
 }
+
+.folder-list::-webkit-scrollbar { display: none; }  /* Chromium — hide the scrollbar */
 
 .folder-item {
   display: flex;
@@ -204,6 +239,10 @@ html, body {
   outline-offset: -2px;
 }
 
+/* Reorder-as-sibling indicators: a line at the top/bottom edge of the target. */
+.folder-item.drag-before { box-shadow: inset 0 2px 0 var(--accent); }
+.folder-item.drag-after { box-shadow: inset 0 -2px 0 var(--accent); }
+
 .folder-item:hover { background: var(--panel-2); color: var(--text); }
 
 .folder-item.active {
@@ -214,6 +253,25 @@ html, body {
 
 .folder-item--parent {
   cursor: pointer;
+}
+
+/* Caret marks folders that contain subfolders and reflects collapse state:
+   points right when collapsed, rotates down when expanded. */
+.folder-caret {
+  flex-shrink: 0;
+  width: 18px;
+  margin-right: 4px;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s;
+}
+
+.folder-item--parent:not(.folder-item--collapsed) .folder-caret {
+  transform: rotate(90deg);
 }
 
 
@@ -644,6 +702,28 @@ html, body {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 18px;
+}
+
+.settings-section-title {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+
+.settings-sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 18px 0;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 /* ---------- Context menu ---------- */

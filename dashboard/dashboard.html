@@ -88,26 +88,30 @@
   <div id="settingsModal" class="modal" hidden>
     <div class="modal-box">
       <h2>Settings</h2>
-      <label class="field-label" for="apiKeyInput">YouTube Data API v3 key</label>
+      <h3 class="settings-section-title">YouTube API</h3>
+      <label class="field-label" for="apiKeyInput">Data API v3 key</label>
       <input id="apiKeyInput" class="field-input" type="text" placeholder="AIza..." />
-      <p class="field-hint">
-        Needed for video count and subscriber count (optional — without it, only the last
-        video date is fetched via RSS). You can get one for free from Google Cloud Console →
-        APIs & Services → Credentials.
-      </p>
-      <label class="field-label" for="gistTokenInput">GitHub token — cross-device sync</label>
+      <p class="field-hint">Optional — enables video/subscriber counts and avatars. Free from Google Cloud Console.</p>
+      <div class="settings-row">
+        <button id="fillAvatarsBtn" class="btn btn-ghost">Fill Avatars</button>
+        <span id="fillAvatarsStatus" class="field-hint" style="margin: auto 0"></span>
+      </div>
+      <p class="field-hint">Fetches only missing avatars — skips counts and dates.</p>
+
+      <hr class="settings-sep" />
+
+      <h3 class="settings-section-title">Cross-device sync</h3>
+      <label class="field-label" for="gistTokenInput">GitHub token</label>
       <input id="gistTokenInput" class="field-input" type="text" placeholder="github_pat_… / ghp_…" />
-      <p class="field-hint">
-        Syncs your folders, tags and channels through a secret GitHub Gist. Create a token at
-        github.com → Settings → Developer settings → Personal access tokens, granting only the
-        <b>gist</b> scope, then paste the same token on each device and press Sync.
-        Syncing merges both sides; deletions don't propagate.
-      </p>
-      <div class="modal-actions" style="justify-content: flex-start; gap: 8px">
+      <p class="field-hint">Syncs via a secret Gist. Use a token with only the <b>gist</b> scope. Merges both sides.</p>
+      <div class="settings-row">
         <button id="syncUploadBtn" class="btn btn-ghost">&#8593; Upload</button>
         <button id="syncDownloadBtn" class="btn btn-ghost">&#8595; Download</button>
         <span id="syncStatus" class="field-hint" style="margin: auto 0"></span>
       </div>
+
+      <hr class="settings-sep" />
+
       <div class="modal-actions">
         <button id="clearDataBtn" class="btn btn-ghost" style="color: var(--danger); margin-right: auto;">Clear all data</button>
         <button id="settingsCancel" class="btn btn-ghost">Cancel</button>

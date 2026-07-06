@@ -76,11 +76,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === "REFRESH_STATS") {
-    refreshAllChannelStats().then(() => sendResponse({ ok: true }));
+    refreshAllChannelStats().then((r) => sendResponse(r || { ok: true }));
     return true;
   }
   if (msg.type === "REFRESH_SINGLE") {
     refreshChannelStats([msg.channelId]).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === "FILL_MISSING_AVATARS") {
+    fillMissingAvatars().then((r) => sendResponse(r || { ok: true }));
     return true;
   }
   if (msg.type === "SYNC_GIST") {
@@ -322,35 +326,104 @@ async function resolveHandleViaPage(handle) {
 
 async function refreshAllChannelStats() {
   const { channels } = await chrome.storage.local.get("channels");
-  await refreshChannelStats(Object.keys(channels));
+  return refreshChannelStats(Object.keys(channels));
 }
 
-async function refreshChannelStats(channelIds) {
-  if (!channelIds.length) return;
+// Cheap, targeted avatar backfill: query snippet only for channels that are
+// missing a thumbnail — no per-channel RSS date fetches, no statistics. Fewer
+// API calls than a full refresh (ceil(missing/50) vs ceil(total/50)) and far
+// less network, since it skips the one-request-per-channel RSS pass.
+async function fillMissingAvatars() {
   const { apiKey } = await chrome.storage.local.get("apiKey");
   const { channels = {} } = await chrome.storage.local.get("channels");
 
-  // 1) Video count / subscriber count: if an API key is set, in batches of 50 (1 unit/call)
+  const missing = Object.keys(channels).filter((id) => !channels[id].thumbnail);
+  const stats = { ok: true, hasApiKey: !!apiKey, missingBefore: missing.length, thumbsFilled: 0, apiCalls: 0, apiFailures: 0, lastError: null };
+  if (!apiKey || !missing.length) {
+    stats.missingAfter = missing.length;
+    return stats;
+  }
+
+  for (const group of chunk(missing, 50)) {
+    stats.apiCalls++;
+    try {
+      const url = `${API_BASE}/channels?part=snippet&id=${group.join(",")}&key=${apiKey}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const body = await res.text();
+        console.warn("channels.list (avatars) failed:", res.status, body);
+        stats.apiFailures++;
+        try { stats.lastError = JSON.parse(body)?.error?.message || `HTTP ${res.status}`; }
+        catch { stats.lastError = `HTTP ${res.status}`; }
+        continue;
+      }
+      const data = await res.json();
+      for (const item of data.items || []) {
+        const ch = channels[item.id];
+        if (!ch) continue;
+        const thumbs = item.snippet?.thumbnails || {};
+        const thumbUrl = thumbs.medium?.url || thumbs.high?.url || thumbs.default?.url;
+        if (thumbUrl) { ch.thumbnail = thumbUrl; stats.thumbsFilled++; }
+      }
+    } catch (e) {
+      console.warn("channels.list (avatars) error:", e);
+      stats.apiFailures++;
+      stats.lastError = String(e?.message || e);
+    }
+  }
+
+  await chrome.storage.local.set({ channels });
+  stats.missingAfter = Object.keys(channels).filter((id) => !channels[id].thumbnail).length;
+  return stats;
+}
+
+async function refreshChannelStats(channelIds) {
+  if (!channelIds.length) return { ok: true, queried: 0 };
+  const { apiKey } = await chrome.storage.local.get("apiKey");
+  const { channels = {} } = await chrome.storage.local.get("channels");
+
+  // Diagnostics so a refresh can explain itself (why avatars/counts didn't fill).
+  const stats = { ok: true, hasApiKey: !!apiKey, queried: channelIds.length, apiItems: 0, apiFailures: 0, thumbsFilled: 0, lastError: null };
+
+  // 1) Video count / subscriber count / avatar: with an API key, batches of 50 (1 unit/call)
   if (apiKey) {
     for (const group of chunk(channelIds, 50)) {
       try {
-        const url = `${API_BASE}/channels?part=statistics&id=${group.join(",")}&key=${apiKey}`;
+        const url = `${API_BASE}/channels?part=snippet,statistics&id=${group.join(",")}&key=${apiKey}`;
         const res = await fetch(url);
         if (!res.ok) {
-          console.warn("channels.list failed:", res.status, await res.text());
+          const body = await res.text();
+          console.warn("channels.list failed:", res.status, body);
+          stats.apiFailures++;
+          // Surface the API's own reason (e.g. quota exceeded, key not valid,
+          // referrer restriction) so it isn't swallowed silently.
+          try { stats.lastError = JSON.parse(body)?.error?.message || `HTTP ${res.status}`; }
+          catch { stats.lastError = `HTTP ${res.status}`; }
           continue;
         }
         const data = await res.json();
         for (const item of data.items || []) {
-          if (channels[item.id]) {
-            channels[item.id].videoCount = Number(item.statistics.videoCount ?? 0);
-            channels[item.id].subscriberCount = item.statistics.hiddenSubscriberCount
+          const ch = channels[item.id];
+          if (!ch) continue;
+          stats.apiItems++;
+          // A missing statistics/snippet on one channel must not abort the rest
+          // of the batch, so guard each field independently.
+          if (item.statistics) {
+            ch.videoCount = Number(item.statistics.videoCount ?? 0);
+            ch.subscriberCount = item.statistics.hiddenSubscriberCount
               ? null
               : Number(item.statistics.subscriberCount ?? 0);
           }
+          // Backfill the avatar the scrape may have missed (lazy-loaded images
+          // aren't captured). Prefer a mid-size, stable thumbnail URL.
+          const thumbs = item.snippet?.thumbnails || {};
+          const thumbUrl = thumbs.medium?.url || thumbs.high?.url || thumbs.default?.url;
+          if (thumbUrl) { ch.thumbnail = thumbUrl; stats.thumbsFilled++; }
         }
       } catch (e) {
         console.warn("channels.list error:", e);
+        stats.apiFailures++;
+        stats.lastError = String(e?.message || e);
       }
     }
   }
@@ -367,6 +440,9 @@ async function refreshChannelStats(channelIds) {
   );
 
   await chrome.storage.local.set({ channels });
+
+  stats.missingThumbs = channelIds.filter((id) => !channels[id]?.thumbnail).length;
+  return stats;
 }
 
 async function fetchLastVideoDate(channelId) {
