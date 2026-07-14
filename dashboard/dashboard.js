@@ -1210,7 +1210,7 @@ function bindEvents() {
     if (!li) return;
     e.preventDefault();
     const id = li.dataset.folderId;
-    if (id === "all") return; // virtual folder, nothing to manage
+    if (id === "all" || id === "unsorted") return; // virtual / pinned home — no folder actions
     const folder = state.folders[id];
     const isChild = !!folder?.parentId;
     const menuItems = [{ label: "Rename…", action: () => openFolderModal("rename-folder", id) }];

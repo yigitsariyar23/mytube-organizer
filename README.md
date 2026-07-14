@@ -33,9 +33,9 @@ Works in any Chromium browser — Chrome, Edge, Brave, Vivaldi.
    It's used for video counts, subscriber counts and channel avatars. The
    extension works without a key too — you just get the last-video date (via
    RSS) and whatever avatars the scan managed to capture.
-4. Click **"Refresh Stats"** → video counts, avatars and last-video dates are
-   fetched. This also runs automatically in the background every 3 hours
-   (`chrome.alarms`).
+4. Click **"Refresh Stats"** → video counts, subscriber counts, avatars and
+   last-video dates are fetched. This also runs automatically in the background
+   every 3 hours (`chrome.alarms`).
 
 ## How to get an API key
 
@@ -82,17 +82,20 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
     the emoji itself just opens the folder, like clicking its name.
   - **Sort** modes — Custom (manual order), A → Z, Count ↓, Count ↑ — chosen
     from the dropdown in the Folders header.
-  - **Collapse/expand** of parents (click the caret), and a channel **count**
-    that includes subfolders.
+  - **Collapse/expand** of parents (click anywhere on the parent row — the
+    caret shows the state), and a channel **count** that includes subfolders.
   - Rename / delete via right-click. Deleting a folder moves its channels to
     **Unsorted** and promotes any subfolders to top-level. "Unsorted" is pinned
     and can't be renamed, moved or deleted.
 - **Tags** are freeform and multiple per channel. Click the **"+ tag"** chip on
-  a row, then type a new name or pick an existing one (autocomplete). Tags get a
-  color automatically. A tag **filter bar** appears above the list showing only
-  the tags used by channels in the current folder; click chips to narrow the
-  view (they combine with the selected folder). Rename / delete a tag by
-  right-clicking its chip.
+  a row to open a dropdown of your existing tags (each with its color) — click
+  one to add it, or click **"+ New tag"** to type a new name (Enter to create).
+  Tags get a color automatically. A tag **filter bar** appears above the list
+  showing only the tags used by channels in the current folder; click chips to
+  narrow the view (they combine with the selected folder). Left-clicking a tag
+  chip on a channel row removes that tag from that channel. Rename or delete a
+  tag by right-clicking it in the **filter bar**, or delete one everywhere via
+  the **×** beside it in the "+ tag" dropdown.
 
 ## Browsing, filtering and sorting
 
@@ -100,8 +103,8 @@ The top bar filters the current view (all filters combine):
 
 - **Search** by channel name or handle.
 - **Min / Max videos** — bound the video count.
-- **Last video after / before** — bound the most recent upload date (day / month
-  / year, each part optional).
+- **Last video after / before** — bound the most recent upload date (inclusive).
+  The **year** is required; day and month are optional (default to the 1st).
 
 Click the **Last Video** or **Videos** column headers to sort; each click
 cycles none → descending → ascending, and the choice is remembered. The list
@@ -154,8 +157,9 @@ Open with **⚙ Settings** in the sidebar footer:
   fetches only missing avatars (skips counts and RSS dates, so it's cheaper than
   a full refresh).
 - **Cross-device sync** — the GitHub token and the Upload / Download buttons.
-- **Clear all data** — wipes channels, folders and tags (keeps your API key and
-  token). This cannot be undone.
+- **Clear all data** — wipes channels, folders and tags, and disconnects Gist
+  sync (clears the saved gist id and last-sync time). Keeps your API key, GitHub
+  token and UI preferences. This cannot be undone.
 
 ## What to do if the DOM breaks
 
