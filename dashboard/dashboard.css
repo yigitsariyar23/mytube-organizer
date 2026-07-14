@@ -242,10 +242,6 @@ html, body {
   font-weight: 600;
 }
 
-.folder-item--parent {
-  cursor: pointer;
-}
-
 /* Caret marks folders that contain subfolders and reflects collapse state:
    points right when collapsed, rotates down when expanded. */
 .folder-caret {
@@ -499,9 +495,6 @@ html, body {
 .channel-row:hover { border-color: var(--accent); }
 
 .channel-row .channel-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
   min-width: 0;
 }
 
@@ -522,10 +515,6 @@ html, body {
 
 .channel-row .channel-tags {
   justify-content: flex-end;
-}
-
-.channel-row .channel-controls {
-  margin-top: 0;
 }
 
 .channel-row .tag-chip,
@@ -669,7 +658,6 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-top: 2px;
 }
 
 .folder-select {
@@ -769,62 +757,17 @@ html, body {
   margin-top: 10px;
 }
 
+.settings-row .field-hint { margin: auto 0; }
+
+#clearDataBtn { color: var(--danger); margin-right: auto; }
+
+#scanDiffSummary, #syncDiffSummary { margin-top: 0; }
+
 /* ---------- Context menu ---------- */
 
-.context-menu {
-  position: fixed;
-  z-index: 2000;
-  min-width: 170px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 4px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-}
-
-.context-menu[hidden] { display: none; }
-
-.context-menu button {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: none;
-  border: none;
-  color: var(--text);
-  padding: 7px 10px;
-  border-radius: 6px;
-  font-size: 13px;
-  font-family: var(--sans);
-  cursor: pointer;
-}
-
-.context-menu button:hover { background: var(--panel); }
-
-.context-menu button.danger { color: var(--danger); }
-
-.context-menu button.has-submenu {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.context-menu button.has-submenu::after {
-  content: "▶";
-  font-size: 10px;
-  opacity: 0.6;
-  margin-left: 8px;
-}
-
-.context-menu-separator {
-  height: 1px;
-  background: var(--border);
-  margin: 4px 0;
-}
-
+.context-menu,
 .context-submenu {
   position: fixed;
-  z-index: 2001;
-  min-width: 160px;
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -832,8 +775,13 @@ html, body {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
+.context-menu { z-index: 2000; min-width: 170px; }
+.context-submenu { z-index: 2001; min-width: 160px; }
+
+.context-menu[hidden],
 .context-submenu[hidden] { display: none; }
 
+.context-menu button,
 .context-submenu button {
   display: block;
   width: 100%;
@@ -848,20 +796,31 @@ html, body {
   cursor: pointer;
 }
 
+.context-menu button:hover,
 .context-submenu button:hover { background: var(--panel); }
+
+.context-menu button.danger { color: var(--danger); }
 .context-submenu button.active-folder { font-weight: 600; }
 
+.context-menu button.has-submenu,
 .context-submenu button.has-submenu {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
 
+.context-menu button.has-submenu::after,
 .context-submenu button.has-submenu::after {
   content: "▶";
   font-size: 10px;
   opacity: 0.6;
   margin-left: 8px;
+}
+
+.context-menu-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
 }
 
 /* ---------- Scan review dialog ---------- */

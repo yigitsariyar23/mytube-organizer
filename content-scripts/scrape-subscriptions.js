@@ -25,6 +25,24 @@
     "[class*='title']",
   ];
 
+  // Name-candidate quality tiers (higher wins): dedicated title element beats
+  // img.alt / aria-label, which beat the whole-anchor text fallback.
+  const SCORE_TITLE = 3;
+  const SCORE_LABEL = 2;
+  const SCORE_ANCHOR = 1;
+
+  // Shared chrome for the fixed bottom-right overlays (scan button + banner);
+  // per-element colors/padding/font-size are applied on top of this.
+  const BASE_OVERLAY_STYLE = {
+    position: "fixed",
+    bottom: "24px",
+    right: "24px",
+    borderRadius: "8px",
+    fontFamily: "system-ui, sans-serif",
+    zIndex: 999999,
+    boxShadow: "0 4px 16px rgba(0,0,0,.4)",
+  };
+
   function runScan() {
     const channels = collectChannels();
     const scanned = channels.filter((c) => c.channelId || c.handle);
@@ -90,17 +108,17 @@
     const candidates = [];
     for (const sel of TITLE_SELECTORS) {
       const titleEl = anchor.querySelector(sel);
-      if (titleEl) candidates.push([3, elementText(titleEl)]);
+      if (titleEl) candidates.push([SCORE_TITLE, elementText(titleEl)]);
     }
-    if (img && img.alt) candidates.push([2, img.alt]);
-    if (anchor.getAttribute("aria-label")) candidates.push([2, anchor.getAttribute("aria-label")]);
-    candidates.push([1, elementText(anchor)]);
+    if (img && img.alt) candidates.push([SCORE_LABEL, img.alt]);
+    if (anchor.getAttribute("aria-label")) candidates.push([SCORE_LABEL, anchor.getAttribute("aria-label")]);
+    candidates.push([SCORE_ANCHOR, elementText(anchor)]);
 
     for (const [score, raw] of candidates) {
       const name = clean(raw);
       if (!name || name.startsWith("@")) continue;
       // Whole-card links concatenate name + handle + description; skip those.
-      if (score === 1 && name.length > 60) continue;
+      if (score === SCORE_ANCHOR && name.length > 60) continue;
       // ">" keeps the first (best-selector) hit among equal-score candidates.
       if (score > entry.nameScore) {
         entry.name = name;
@@ -156,20 +174,14 @@
     btn.id = "mytube-scan-btn";
     btn.textContent = "📋 Scan channels";
     Object.assign(btn.style, {
-      position: "fixed",
-      bottom: "24px",
-      right: "24px",
+      ...BASE_OVERLAY_STYLE,
       background: "#FF8C00",
       color: "#000",
       border: "none",
-      borderRadius: "8px",
       padding: "10px 18px",
-      fontFamily: "system-ui, sans-serif",
       fontSize: "14px",
       fontWeight: "600",
       cursor: "pointer",
-      zIndex: 999999,
-      boxShadow: "0 4px 16px rgba(0,0,0,.4)",
     });
     btn.addEventListener("click", () => {
       btn.textContent = "⏳ Scanning…";
@@ -187,17 +199,11 @@
       ? `MyTube Organizer: scanned ${total} channels — review the changes in the dashboard.`
       : "MyTube Organizer: no channels found — YouTube's page layout may have changed.";
     Object.assign(el.style, {
-      position: "fixed",
-      bottom: "24px",
-      right: "24px",
+      ...BASE_OVERLAY_STYLE,
       background: total ? "#17161A" : "#5A1E1E",
       color: "#EDEAE4",
       padding: "10px 16px",
-      borderRadius: "8px",
-      fontFamily: "system-ui, sans-serif",
       fontSize: "13px",
-      zIndex: 999999,
-      boxShadow: "0 4px 16px rgba(0,0,0,.4)",
     });
     document.body.appendChild(el);
     setTimeout(() => el.remove(), 8000);

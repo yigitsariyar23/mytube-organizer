@@ -2,7 +2,7 @@
 // Storage schema:
 //   channels: { [channelId]: { id, name, handle, thumbnail, folderId, tags:[tagId,...],
 //                               lastVideoDate, videoCount, subscriberCount, lastFetched } }
-//   folders:  { [folderId]: { name, order } }
+//   folders:  { [folderId]: { name, order, parentId?, emoji? } }
 //   tags:     { [tagId]: { name, color } }
 //   apiKey:   string (YouTube Data API v3 key, entered by the user in Settings)
 //   gistToken:    string (GitHub personal access token with the "gist" scope, for cross-device sync)
@@ -17,6 +17,8 @@ const GIST_API = "https://api.github.com/gists";
 const GIST_FILENAME = "mytube-organizer.json";
 const ALARM_NAME = "mytube-refresh";
 const REFRESH_PERIOD_MIN = 180; // auto-refresh every 3 hours
+const YT_CHANNELS_BATCH = 50; // YouTube channels.list max ids per call
+const HANDLE_RESOLVE_CONCURRENCY = 5; // parallel handle->id lookups per batch
 
 // ---------- Setup ----------
 
@@ -141,8 +143,7 @@ async function handleScanResult(scraped) {
 }
 
 async function computeScanDiff(scraped) {
-  const { apiKey } = await chrome.storage.local.get("apiKey");
-  const { channels = {} } = await chrome.storage.local.get("channels");
+  const { apiKey, channels = {} } = await chrome.storage.local.get(["apiKey", "channels"]);
 
   // Known handles resolve for free against the stored library.
   const idByHandle = new Map();
@@ -166,7 +167,7 @@ async function computeScanDiff(scraped) {
   // Any that fail are counted so the dashboard can warn that the "removed"
   // list may include still-subscribed channels this scan simply missed.
   let unresolved = 0;
-  for (const group of chunk(needResolve, 5)) {
+  for (const group of chunk(needResolve, HANDLE_RESOLVE_CONCURRENCY)) {
     const results = await Promise.allSettled(
       group.map(async (c) => {
         const id =
@@ -325,8 +326,8 @@ async function resolveHandleViaPage(handle) {
 // ---------- Stats refresh ----------
 
 async function refreshAllChannelStats() {
-  const { channels } = await chrome.storage.local.get("channels");
-  return refreshChannelStats(Object.keys(channels));
+  const { channels = {} } = await chrome.storage.local.get("channels");
+  return refreshChannelStats(Object.keys(channels), channels);
 }
 
 // Cheap, targeted avatar backfill: query snippet only for channels that are
@@ -334,8 +335,7 @@ async function refreshAllChannelStats() {
 // API calls than a full refresh (ceil(missing/50) vs ceil(total/50)) and far
 // less network, since it skips the one-request-per-channel RSS pass.
 async function fillMissingAvatars() {
-  const { apiKey } = await chrome.storage.local.get("apiKey");
-  const { channels = {} } = await chrome.storage.local.get("channels");
+  const { apiKey, channels = {} } = await chrome.storage.local.get(["apiKey", "channels"]);
 
   const missing = Object.keys(channels).filter((id) => !channels[id].thumbnail);
   const stats = { ok: true, hasApiKey: !!apiKey, missingBefore: missing.length, thumbsFilled: 0, apiCalls: 0, apiFailures: 0, lastError: null };
@@ -344,7 +344,7 @@ async function fillMissingAvatars() {
     return stats;
   }
 
-  for (const group of chunk(missing, 50)) {
+  for (const group of chunk(missing, YT_CHANNELS_BATCH)) {
     stats.apiCalls++;
     try {
       const url = `${API_BASE}/channels?part=snippet&id=${group.join(",")}&key=${apiKey}`;
@@ -353,16 +353,14 @@ async function fillMissingAvatars() {
         const body = await res.text();
         console.warn("channels.list (avatars) failed:", res.status, body);
         stats.apiFailures++;
-        try { stats.lastError = JSON.parse(body)?.error?.message || `HTTP ${res.status}`; }
-        catch { stats.lastError = `HTTP ${res.status}`; }
+        stats.lastError = describeApiError(res, body);
         continue;
       }
       const data = await res.json();
       for (const item of data.items || []) {
         const ch = channels[item.id];
         if (!ch) continue;
-        const thumbs = item.snippet?.thumbnails || {};
-        const thumbUrl = thumbs.medium?.url || thumbs.high?.url || thumbs.default?.url;
+        const thumbUrl = pickThumbnailUrl(item);
         if (thumbUrl) { ch.thumbnail = thumbUrl; stats.thumbsFilled++; }
       }
     } catch (e) {
@@ -377,17 +375,17 @@ async function fillMissingAvatars() {
   return stats;
 }
 
-async function refreshChannelStats(channelIds) {
+async function refreshChannelStats(channelIds, preloaded) {
   if (!channelIds.length) return { ok: true, queried: 0 };
   const { apiKey } = await chrome.storage.local.get("apiKey");
-  const { channels = {} } = await chrome.storage.local.get("channels");
+  const channels = preloaded ?? (await chrome.storage.local.get("channels")).channels ?? {};
 
   // Diagnostics so a refresh can explain itself (why avatars/counts didn't fill).
   const stats = { ok: true, hasApiKey: !!apiKey, queried: channelIds.length, apiItems: 0, apiFailures: 0, thumbsFilled: 0, lastError: null };
 
   // 1) Video count / subscriber count / avatar: with an API key, batches of 50 (1 unit/call)
   if (apiKey) {
-    for (const group of chunk(channelIds, 50)) {
+    for (const group of chunk(channelIds, YT_CHANNELS_BATCH)) {
       try {
         const url = `${API_BASE}/channels?part=snippet,statistics&id=${group.join(",")}&key=${apiKey}`;
         const res = await fetch(url);
@@ -395,10 +393,7 @@ async function refreshChannelStats(channelIds) {
           const body = await res.text();
           console.warn("channels.list failed:", res.status, body);
           stats.apiFailures++;
-          // Surface the API's own reason (e.g. quota exceeded, key not valid,
-          // referrer restriction) so it isn't swallowed silently.
-          try { stats.lastError = JSON.parse(body)?.error?.message || `HTTP ${res.status}`; }
-          catch { stats.lastError = `HTTP ${res.status}`; }
+          stats.lastError = describeApiError(res, body);
           continue;
         }
         const data = await res.json();
@@ -415,9 +410,8 @@ async function refreshChannelStats(channelIds) {
               : Number(item.statistics.subscriberCount ?? 0);
           }
           // Backfill the avatar the scrape may have missed (lazy-loaded images
-          // aren't captured). Prefer a mid-size, stable thumbnail URL.
-          const thumbs = item.snippet?.thumbnails || {};
-          const thumbUrl = thumbs.medium?.url || thumbs.high?.url || thumbs.default?.url;
+          // aren't captured).
+          const thumbUrl = pickThumbnailUrl(item);
           if (thumbUrl) { ch.thumbnail = thumbUrl; stats.thumbsFilled++; }
         }
       } catch (e) {
@@ -469,15 +463,36 @@ function chunk(arr, size) {
   return out;
 }
 
+// Prefer a mid-size, stable thumbnail URL from a channels.list snippet item.
+function pickThumbnailUrl(item) {
+  const t = item.snippet?.thumbnails || {};
+  return t.medium?.url || t.high?.url || t.default?.url;
+}
+
+// Surface the API's own reason (quota exceeded, key not valid, referrer
+// restriction) from an error body, falling back to the HTTP status.
+function describeApiError(res, body) {
+  try { return JSON.parse(body)?.error?.message || `HTTP ${res.status}`; }
+  catch { return `HTTP ${res.status}`; }
+}
+
 // ---------- Directional sync: compute diff, upload, download ----------
+
+// Resolve the gist id from storage, falling back to a filename lookup on the
+// account. Call inside each sync try block so a findExistingGist() throw stays
+// caught and reported as { ok: false, error }.
+async function resolveGistId(gistToken) {
+  let { gistId } = await chrome.storage.local.get("gistId");
+  if (!gistId) gistId = await findExistingGist(gistToken);
+  return gistId;
+}
 
 async function computeSyncDiff(direction) {
   const { gistToken } = await chrome.storage.local.get("gistToken");
   if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
 
   try {
-    let { gistId } = await chrome.storage.local.get("gistId");
-    if (!gistId) gistId = await findExistingGist(gistToken);
+    const gistId = await resolveGistId(gistToken);
 
     const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
     const localState = {
@@ -531,14 +546,13 @@ async function applyUpload(removeFromGistIds = []) {
   if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
 
   try {
-    let { gistId } = await chrome.storage.local.get("gistId");
-    if (!gistId) gistId = await findExistingGist(gistToken);
+    let gistId = await resolveGistId(gistToken);
 
     const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
     let uploadChannels = { ...(local.channels || {}) };
 
     // Re-include any Gist-only channels the user chose to keep
-    if (removeFromGistIds.length < Infinity && gistId) {
+    if (gistId) {
       const remoteState = await fetchGistState(gistToken, gistId);
       if (remoteState) {
         const removeSet = new Set(removeFromGistIds);
@@ -578,8 +592,7 @@ async function applyDownload(removeLocalIds = []) {
   if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
 
   try {
-    let { gistId } = await chrome.storage.local.get("gistId");
-    if (!gistId) gistId = await findExistingGist(gistToken);
+    const gistId = await resolveGistId(gistToken);
     if (!gistId) return { ok: false, error: "No Gist found to download from." };
 
     const remoteState = await fetchGistState(gistToken, gistId);
@@ -597,9 +610,8 @@ async function applyDownload(removeLocalIds = []) {
     // Gist folders win, but keep local folders referenced by preserved local-only channels
     const folders = { ...(local.folders || {}), ...remoteState.folders };
 
-    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {} });
     const lastSyncedAt = Date.now();
-    await chrome.storage.local.set({ gistId, lastSyncedAt });
+    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {}, gistId, lastSyncedAt });
     return { ok: true, gistId, lastSyncedAt };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
@@ -616,8 +628,7 @@ async function syncWithGist() {
   if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
 
   try {
-    let { gistId } = await chrome.storage.local.get("gistId");
-    if (!gistId) gistId = await findExistingGist(gistToken);
+    let gistId = await resolveGistId(gistToken);
 
     let remoteState = null;
     if (gistId) {

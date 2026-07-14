@@ -25,6 +25,7 @@ let filterBeforeDate = null; // ISO date string upper bound (inclusive)
 // Infinite scroll: render channels in batches as the user scrolls near the bottom.
 const PAGE_SIZE = 40;
 let pendingChannels = []; // filtered channels not yet appended to the grid
+let pendingFolderOptions = []; // precomputed move-folder <option> data, rebuilt each render
 let scrollObserver = null;
 
 const el = {
@@ -125,13 +126,17 @@ async function init() {
   });
 }
 
+// The seed library: a single pinned "Unsorted" folder. A factory (not a shared
+// constant) so each caller gets a fresh object — state.folders is mutated in place.
+const defaultFolders = () => ({ unsorted: { name: "Unsorted", order: 0 } });
+
 async function loadState() {
   const data = await chrome.storage.local.get([
     "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
     "sortDate", "sortCount", "folderSort",
   ]);
   state.channels = data.channels || {};
-  state.folders = data.folders || { unsorted: { name: "Unsorted", order: 0 } };
+  state.folders = data.folders || defaultFolders();
   state.tags = data.tags || {};
   state.apiKey = data.apiKey || "";
   state.gistToken = data.gistToken || "";
@@ -156,10 +161,14 @@ function getChildFolderIds(parentId) {
   return Object.keys(state.folders).filter((id) => state.folders[id].parentId === parentId);
 }
 
+// The id set of a folder plus all its child folders (for counting/filtering).
+function getFolderAndDescendantIds(folderId) {
+  return new Set([folderId, ...getChildFolderIds(folderId)]);
+}
+
 // Count channels in a folder and all its children
 function getFolderChannelCount(folderId) {
-  const childIds = getChildFolderIds(folderId);
-  const allIds = new Set([folderId, ...childIds]);
+  const allIds = getFolderAndDescendantIds(folderId);
   return Object.values(state.channels).filter((c) => allIds.has(c.folderId)).length;
 }
 
@@ -167,6 +176,17 @@ function renderFolders() {
   if (el.folderSortSelect) el.folderSortSelect.value = folderSort;
 
   el.folderList.innerHTML = "";
+
+  // Index channels by folder and folders by parent in single passes, so the
+  // per-folder counts below don't repeatedly re-scan every channel/folder.
+  const directCount = {};
+  for (const c of Object.values(state.channels)) {
+    directCount[c.folderId] = (directCount[c.folderId] || 0) + 1;
+  }
+  const childIndex = {};
+  for (const [id, f] of Object.entries(state.folders)) {
+    if (f.parentId) (childIndex[f.parentId] ||= []).push(id);
+  }
 
   // "All" virtual item
   const allLi = document.createElement("li");
@@ -181,7 +201,7 @@ function renderFolders() {
     .map(([id, folder]) => ({
       id,
       name: folder.name,
-      count: getFolderChannelCount(id),
+      count: (directCount[id] || 0) + (childIndex[id] || []).reduce((s, cid) => s + (directCount[cid] || 0), 0),
       order: folder.order ?? 0,
     }));
 
@@ -203,7 +223,8 @@ function renderFolders() {
   for (const f of topLevelSorted) {
     const draggable = f.id !== "unsorted" && folderSort === "custom";
     const li = document.createElement("li");
-    const hasChildren = f.id !== "unsorted" && Object.values(state.folders).some((cf) => cf.parentId === f.id);
+    const childIds = childIndex[f.id] || [];
+    const hasChildren = f.id !== "unsorted" && childIds.length > 0;
     const isCollapsed = hasChildren && collapsedFolders.has(f.id);
     li.className = "folder-item" + (f.id === currentFolderId ? " active" : "") + (hasChildren ? " folder-item--parent" : "") + (isCollapsed ? " folder-item--collapsed" : "");
     li.dataset.folderId = f.id;
@@ -216,10 +237,8 @@ function renderFolders() {
 
     // Render children under this parent
     if (f.id !== "unsorted") {
-      const children = Object.entries(state.folders)
-        .filter(([, cf]) => cf.parentId === f.id)
-        .map(([id, cf]) => ({ id, name: cf.name, order: cf.order ?? 0, emoji: cf.emoji || "",
-          count: Object.values(state.channels).filter((c) => c.folderId === id).length }))
+      const children = childIds
+        .map((id) => { const cf = state.folders[id]; return { id, name: cf.name, order: cf.order ?? 0, emoji: cf.emoji || "", count: directCount[id] || 0 }; })
         .sort((a, b) => a.order - b.order);
 
       for (const child of children) {
@@ -232,8 +251,6 @@ function renderFolders() {
       }
     }
   }
-
-  initFolderDrag();
 }
 
 function folderEmojiSlotHtml(folderId, emoji) {
@@ -400,61 +417,6 @@ function performFolderDrop(srcId, targetId, intent) {
   render();
 }
 
-function initFolderDrag() {
-  if (folderSort !== "custom") return; // manual drag is only meaningful in custom order
-
-  let dragSrcId = null;
-
-  const clearIndicators = () => {
-    el.folderList.querySelectorAll(".folder-item").forEach((x) =>
-      x.classList.remove("drag-over", "drag-before", "drag-after"));
-  };
-
-  el.folderList.querySelectorAll(".folder-item").forEach((li) => {
-    if (!li.draggable) return; // skip "All" and "Unsorted"
-    const fid = li.dataset.folderId;
-
-    li.addEventListener("dragstart", (e) => {
-      dragSrcId = fid;
-      li.classList.add("dragging");
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", fid); // Firefox needs data to start a drag
-    });
-
-    li.addEventListener("dragend", () => {
-      li.classList.remove("dragging");
-      clearIndicators();
-      dragSrcId = null;
-    });
-
-    li.addEventListener("dragover", (e) => {
-      if (!dragSrcId) return;
-      const intent = computeFolderDropIntent(dragSrcId, fid, e.clientY, li);
-      if (!intent) return; // invalid target — no preventDefault, so the drop is refused
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      clearIndicators();
-      li.classList.add(
-        intent.type === "inside" ? "drag-over" :
-        intent.type === "before" ? "drag-before" : "drag-after"
-      );
-    });
-
-    li.addEventListener("dragleave", () => {
-      li.classList.remove("drag-over", "drag-before", "drag-after");
-    });
-
-    li.addEventListener("drop", (e) => {
-      if (!dragSrcId) return;
-      const intent = computeFolderDropIntent(dragSrcId, fid, e.clientY, li);
-      clearIndicators();
-      if (!intent) return;
-      e.preventDefault();
-      performFolderDrop(dragSrcId, fid, intent);
-    });
-  });
-}
-
 function renderTagFilters() {
   const bar = el.tagFilterBar;
   bar.innerHTML = "";
@@ -488,6 +450,12 @@ function renderTagFilters() {
 
 function renderGrid() {
   pendingChannels = getFilteredChannels();
+  // Precompute the leaf-folder <option> data once per render; buildChannelRow
+  // (called lazily per scroll page) then only applies each row's `selected`.
+  // Parent folders with children are excluded — channels live only in leaf folders.
+  pendingFolderOptions = buildOrderedFolderList()
+    .filter(({ id }) => !folderHasChildren(id))
+    .map(({ id, f, isChild }) => ({ id, label: `${isChild ? "  " : ""}${escapeHtml(f.name)}` }));
   el.channelGrid.innerHTML = "";
   el.channelGrid.classList.add("list-view");
   el.listTableHeader.hidden = false;
@@ -531,15 +499,14 @@ function getFilteredChannels() {
   let list = Object.values(state.channels);
 
   if (currentFolderId !== "all") {
-    const childIds = getChildFolderIds(currentFolderId);
-    const allIds = new Set([currentFolderId, ...childIds]);
+    const allIds = getFolderAndDescendantIds(currentFolderId);
     list = list.filter((c) => allIds.has(c.folderId));
   }
   if (activeTagFilters.size) {
     list = list.filter((c) => c.tags?.some((t) => activeTagFilters.has(t)));
   }
-  if (searchQuery.trim()) {
-    const q = searchQuery.trim().toLowerCase();
+  const q = searchQuery.trim().toLowerCase();
+  if (q) {
     list = list.filter(
       (c) => c.name?.toLowerCase().includes(q) || c.handle?.toLowerCase().includes(q)
     );
@@ -565,7 +532,9 @@ function getFilteredChannels() {
 function compareChannels(a, b) {
   if (sortDate !== "none") {
     const dateDir = sortDate === "asc" ? 1 : -1;
-    const dateCmp = (a.lastVideoDate || "").localeCompare(b.lastVideoDate || "");
+    const da = a.lastVideoDate || "";
+    const db = b.lastVideoDate || "";
+    const dateCmp = da < db ? -1 : da > db ? 1 : 0;
     if (dateCmp !== 0) return dateDir * dateCmp;
   }
 
@@ -602,7 +571,7 @@ function buildChannelRow(ch) {
         <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
       </div>
     </div>
-    <div class="row-date" title="${escapeHtml(formatAbsoluteDate(ch.lastVideoDate))}">${formatRelativeDate(ch.lastVideoDate)}</div>
+    <div class="row-date" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}">${formatShortDate(ch.lastVideoDate)}</div>
     <div class="row-count">${ch.videoCount ?? "—"}</div>
     <div class="row-subs" title="${escapeHtml(subscriberTitle(ch.subscriberCount))}">${formatSubscribers(ch.subscriberCount)}</div>
     <div class="channel-tags">
@@ -623,26 +592,29 @@ function thumbHtml(ch) {
 }
 
 function folderOptionsHtml(ch) {
-  return buildOrderedFolderList()
-    .filter(({ id }) => {
-      // Exclude parent folders that have children — channels can only live in leaf folders
-      return !Object.values(state.folders).some((f) => f.parentId === id);
-    })
-    .map(({ id, f, isChild }) =>
-      `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${isChild ? "  " : ""}${escapeHtml(f.name)}</option>`
+  // pendingFolderOptions holds the {id, label} for each leaf folder, built once
+  // per render in renderGrid(); only the per-row `selected` choice differs here.
+  return pendingFolderOptions
+    .map(({ id, label }) =>
+      `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${label}</option>`
     )
     .join("");
 }
 
-// Returns folders in sidebar order: top-level (unsorted first, then rest), each followed by their children
-function buildOrderedFolderList() {
-  const topLevel = Object.entries(state.folders)
+// Top-level folders as [id, folder] entries, unsorted pinned first, then by order.
+function getTopLevelFoldersOrdered() {
+  return Object.entries(state.folders)
     .filter(([, f]) => !f.parentId)
     .sort((a, b) => {
       if (a[0] === "unsorted") return -1;
       if (b[0] === "unsorted") return 1;
       return (a[1].order ?? 0) - (b[1].order ?? 0);
     });
+}
+
+// Returns folders in sidebar order: top-level (unsorted first, then rest), each followed by their children
+function buildOrderedFolderList() {
+  const topLevel = getTopLevelFoldersOrdered();
 
   const result = [];
   for (const [id, f] of topLevel) {
@@ -670,7 +642,7 @@ function tagChipsHtml(ch) {
 
 // ---------- Helpers ----------
 
-function formatRelativeDate(iso) {
+function formatShortDate(iso) {
   if (!iso) return "—";
   const date = new Date(iso);
   if (isNaN(date)) return "—";
@@ -680,7 +652,7 @@ function formatRelativeDate(iso) {
 }
 
 // Full date + time for tooltips, e.g. "Jul 3, 2026, 2:15 PM"
-function formatAbsoluteDate(iso) {
+function formatDateTime(iso) {
   if (!iso) return "Unknown";
   const date = new Date(iso);
   if (isNaN(date)) return "Unknown";
@@ -805,16 +777,22 @@ function openSyncDiffModal(diff) {
   el.syncDiffModal.hidden = false;
 }
 
+// The section header shared by the scan/sync diff sections: a title span (with a
+// `scan-<kind>` modifier) and a count badge.
+function buildDiffSectionHeader(title, kind, count) {
+  const head = document.createElement("div");
+  head.className = "scan-diff-head";
+  head.innerHTML =
+    `<span class="scan-diff-title scan-${kind}">${escapeHtml(title)}</span>` +
+    `<span class="folder-count">${count}</span>`;
+  return head;
+}
+
 function buildSyncModSection(title, items) {
   const sec = document.createElement("div");
   sec.className = "scan-diff-section";
 
-  const head = document.createElement("div");
-  head.className = "scan-diff-head";
-  head.innerHTML =
-    `<span class="scan-diff-title scan-mod">${escapeHtml(title)}</span>` +
-    `<span class="folder-count">${items.length}</span>`;
-  sec.appendChild(head);
+  sec.appendChild(buildDiffSectionHeader(title, "mod", items.length));
 
   const list = document.createElement("div");
   list.className = "scan-diff-list";
@@ -836,12 +814,7 @@ function buildDiffSection(title, kind, items, checkable, defaultChecked = false)
   const sec = document.createElement("div");
   sec.className = "scan-diff-section";
 
-  const head = document.createElement("div");
-  head.className = "scan-diff-head";
-  head.innerHTML =
-    `<span class="scan-diff-title scan-${kind}">${escapeHtml(title)}</span>` +
-    `<span class="folder-count">${items.length}</span>`;
-  sec.appendChild(head);
+  sec.appendChild(buildDiffSectionHeader(title, kind, items.length));
 
   if (!items.length) {
     const empty = document.createElement("div");
@@ -897,6 +870,62 @@ function bindEvents() {
     currentFolderId = li.dataset.folderId;
     activeTagFilters.clear(); // filters are per-folder-view
     render();
+  });
+
+  // Folder drag-and-drop (custom sort only), delegated on the list so the
+  // per-render innerHTML rebuild doesn't re-attach listeners on every row.
+  let folderDragSrcId = null;
+  const clearFolderDragIndicators = () => {
+    el.folderList.querySelectorAll(".folder-item").forEach((x) =>
+      x.classList.remove("drag-over", "drag-before", "drag-after"));
+  };
+
+  el.folderList.addEventListener("dragstart", (e) => {
+    if (folderSort !== "custom") return; // manual drag is only meaningful in custom order
+    const li = e.target.closest(".folder-item");
+    if (!li || !li.draggable) return; // skip "All" and "Unsorted"
+    folderDragSrcId = li.dataset.folderId;
+    li.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", folderDragSrcId); // Firefox needs data to start a drag
+  });
+
+  el.folderList.addEventListener("dragend", (e) => {
+    const li = e.target.closest(".folder-item");
+    if (li) li.classList.remove("dragging");
+    clearFolderDragIndicators();
+    folderDragSrcId = null;
+  });
+
+  el.folderList.addEventListener("dragover", (e) => {
+    if (!folderDragSrcId) return;
+    const li = e.target.closest(".folder-item");
+    if (!li) return;
+    const intent = computeFolderDropIntent(folderDragSrcId, li.dataset.folderId, e.clientY, li);
+    if (!intent) return; // invalid target — no preventDefault, so the drop is refused
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    clearFolderDragIndicators();
+    li.classList.add(
+      intent.type === "inside" ? "drag-over" :
+      intent.type === "before" ? "drag-before" : "drag-after"
+    );
+  });
+
+  el.folderList.addEventListener("dragleave", (e) => {
+    const li = e.target.closest(".folder-item");
+    if (li) li.classList.remove("drag-over", "drag-before", "drag-after");
+  });
+
+  el.folderList.addEventListener("drop", (e) => {
+    if (!folderDragSrcId) return;
+    const li = e.target.closest(".folder-item");
+    if (!li) return;
+    const intent = computeFolderDropIntent(folderDragSrcId, li.dataset.folderId, e.clientY, li);
+    clearFolderDragIndicators();
+    if (!intent) return;
+    e.preventDefault();
+    performFolderDrop(folderDragSrcId, li.dataset.folderId, intent);
   });
 
   el.tagFilterBar.addEventListener("click", (e) => {
@@ -1242,7 +1271,7 @@ function bindEvents() {
   el.clearDataBtn.addEventListener("click", async () => {
     if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
     await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt"]);
-    state = { channels: {}, folders: { unsorted: { name: "Unsorted", order: 0 } }, tags: {}, apiKey: state.apiKey, gistToken: state.gistToken, gistId: "", lastSyncedAt: null };
+    state = { channels: {}, folders: defaultFolders(), tags: {}, apiKey: state.apiKey, gistToken: state.gistToken, gistId: "", lastSyncedAt: null };
     currentFolderId = "all";
     activeTagFilters.clear();
     searchQuery = "";
@@ -1259,7 +1288,7 @@ function bindEvents() {
     chrome.tabs.create({ url: `https://www.youtube.com/channel/${row.dataset.channelId}/videos` });
   }
   el.scanDiffBody.addEventListener("click", handleDiffRowClick);
-  document.getElementById("syncDiffBody").addEventListener("click", handleDiffRowClick);
+  el.syncDiffBody.addEventListener("click", handleDiffRowClick);
 
   el.scanDiffBody.addEventListener("change", (e) => {
     if (e.target.dataset.role !== "select-all-removals") return;
@@ -1468,6 +1497,17 @@ function showContextMenu(x, y, items) {
   menu.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
 }
 
+// Reveal `node` and clamp it into the viewport near (x, y). Shared by the two
+// submenu levels, which position identically.
+function positionSubmenu(node, x, y) {
+  node.hidden = false;
+  const rect = node.getBoundingClientRect();
+  const left = x + 4;
+  const adjustedLeft = left + rect.width + 8 > window.innerWidth ? x - rect.width - 4 : left;
+  node.style.left = Math.max(4, adjustedLeft) + "px";
+  node.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
+}
+
 function showSubmenu(x, y, items) {
   const sub = el.contextSubmenu;
   sub.innerHTML = "";
@@ -1495,12 +1535,7 @@ function showSubmenu(x, y, items) {
     sub.appendChild(btn);
   }
 
-  sub.hidden = false;
-  const rect = sub.getBoundingClientRect();
-  const left = x + 4;
-  const adjustedLeft = left + rect.width + 8 > window.innerWidth ? x - rect.width - 4 : left;
-  sub.style.left = Math.max(4, adjustedLeft) + "px";
-  sub.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
+  positionSubmenu(sub, x, y);
 }
 
 function showSubSubmenu(x, y, items) {
@@ -1516,12 +1551,7 @@ function showSubSubmenu(x, y, items) {
     });
     sub.appendChild(btn);
   }
-  sub.hidden = false;
-  const rect = sub.getBoundingClientRect();
-  const left = x + 4;
-  const adjustedLeft = left + rect.width + 8 > window.innerWidth ? x - rect.width - 4 : left;
-  sub.style.left = Math.max(4, adjustedLeft) + "px";
-  sub.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
+  positionSubmenu(sub, x, y);
 }
 
 function hideSubSubmenu() {
@@ -1546,13 +1576,7 @@ function buildFolderSubmenu(channelId, ch) {
     if (currentFolderId !== "all") renderGrid();
   };
 
-  const topLevel = Object.entries(state.folders)
-    .filter(([, f]) => !f.parentId)
-    .sort((a, b) => {
-      if (a[0] === "unsorted") return -1;
-      if (b[0] === "unsorted") return 1;
-      return (a[1].order ?? 0) - (b[1].order ?? 0);
-    });
+  const topLevel = getTopLevelFoldersOrdered();
 
   return topLevel.map(([id, f]) => {
     const children = Object.entries(state.folders)
