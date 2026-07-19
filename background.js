@@ -1,6 +1,7 @@
 // background.js — MV3 service worker (module)
 // Storage schema:
 //   channels: { [channelId]: { id, name, handle, thumbnail, folderId, tags:[tagId,...],
+//                               language, active, finished,
 //                               lastVideoDate, videoCount, subscriberCount, lastFetched } }
 //   folders:  { [folderId]: { name, order, parentId?, emoji? } }
 //   tags:     { [tagId]: { name, color } }
@@ -19,6 +20,64 @@ const ALARM_NAME = "mytube-refresh";
 const REFRESH_PERIOD_MIN = 180; // auto-refresh every 3 hours
 const YT_CHANNELS_BATCH = 50; // YouTube channels.list max ids per call
 const HANDLE_RESOLVE_CONCURRENCY = 5; // parallel handle->id lookups per batch
+
+// Settings mirrored into the gist alongside the library. gistToken/gistId/
+// lastSyncedAt are deliberately excluded: the token is the credential used to
+// reach the gist (never store it inside), and the ids are per-device bookkeeping.
+const SYNC_SETTING_KEYS = ["apiKey", "languages", "sortDate", "sortCount", "folderSort"];
+
+async function readLocalSettings() {
+  const data = await chrome.storage.local.get(SYNC_SETTING_KEYS);
+  const out = {};
+  for (const k of SYNC_SETTING_KEYS) if (data[k] !== undefined) out[k] = data[k];
+  return out;
+}
+
+// Non-empty local values win; otherwise adopt remote. Lets a fresh device pull
+// the apiKey and language set while an actively-edited device keeps its own.
+function mergeSettings(local = {}, remote = {}) {
+  const merged = {};
+  for (const k of SYNC_SETTING_KEYS) {
+    if (remote[k] !== undefined) merged[k] = remote[k];
+    const v = local[k];
+    const empty = v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
+    if (!empty) merged[k] = v;
+  }
+  return merged;
+}
+
+// Pull only the known setting keys out of a remote gist payload's settings blob.
+function pickRemoteSettings(remoteSettings = {}) {
+  const out = {};
+  for (const k of SYNC_SETTING_KEYS) if (remoteSettings[k] !== undefined) out[k] = remoteSettings[k];
+  return out;
+}
+
+// Notification icon — inlined so it works without packaged icon files (icons/ ships empty).
+const NOTIFY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmUlEQVR4nO3QMREAIBDAsLeFAfyrwAbIyECH7L3OWfv+bHSA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AHaA4QDQjvkAUiZAAAAAElFTkSuQmCC";
+
+// Fire an OS notification for channels flagged active/finished that gained a new
+// video in a refresh. `updated` is [{ name, active, finished }, ...].
+function notifyTrackedUpdates(updated) {
+  if (!updated.length) return;
+  const label = (u) => `${u.name}${u.finished ? " (finished)" : u.active ? " (active)" : ""}`;
+  const lines = updated.slice(0, 5).map(label);
+  if (updated.length > 5) lines.push(`…and ${updated.length - 5} more`);
+  try {
+    chrome.notifications.create(`mytube-tracked-${Date.now()}`, {
+      type: "basic",
+      iconUrl: NOTIFY_ICON,
+      title:
+        updated.length === 1
+          ? "A tracked channel has a new video"
+          : `${updated.length} tracked channels have new videos`,
+      message: lines.join("\n"),
+      priority: 1,
+    });
+  } catch (e) {
+    console.warn("notifications.create failed:", e);
+  }
+}
 
 // ---------- Setup ----------
 
@@ -258,6 +317,9 @@ async function applyScan(removeIds = []) {
         thumbnail: a.thumbnail || null,
         folderId: "unsorted",
         tags: [],
+        language: null,
+        active: false,
+        finished: false,
         lastVideoDate: null,
         videoCount: null,
         subscriberCount: null,
@@ -422,20 +484,29 @@ async function refreshChannelStats(channelIds, preloaded) {
     }
   }
 
-  // 2) Last video date: via RSS feed, without spending quota
+  // 2) Last video date: via RSS feed, without spending quota. Track which
+  // active/finished channels gained a newer video so we can notify about them.
+  const trackedUpdates = [];
   await Promise.allSettled(
     channelIds.map(async (id) => {
+      const ch = channels[id];
+      const prevDate = ch?.lastVideoDate || null;
       const date = await fetchLastVideoDate(id);
-      if (channels[id]) {
-        if (date) channels[id].lastVideoDate = date;
-        channels[id].lastFetched = Date.now();
+      if (ch) {
+        if (date) ch.lastVideoDate = date;
+        ch.lastFetched = Date.now();
+        if (date && date !== prevDate && (ch.active || ch.finished)) {
+          trackedUpdates.push({ name: ch.name, active: !!ch.active, finished: !!ch.finished });
+        }
       }
     })
   );
 
   await chrome.storage.local.set({ channels });
+  notifyTrackedUpdates(trackedUpdates);
 
   stats.missingThumbs = channelIds.filter((id) => !channels[id]?.thumbnail).length;
+  stats.trackedUpdates = trackedUpdates.length;
   return stats;
 }
 
@@ -509,6 +580,9 @@ async function computeSyncDiff(direction) {
     }
     if (!remoteState) remoteState = { channels: {}, folders: {}, tags: {} };
 
+    const localSettings = await readLocalSettings();
+    const remoteSettings = pickRemoteSettings(remoteState.settings);
+
     const src = direction === "upload" ? localState : remoteState;
     const tgt = direction === "upload" ? remoteState : localState;
     const srcCh = src.channels || {};
@@ -527,6 +601,9 @@ async function computeSyncDiff(direction) {
         const srcTags = [...(sc.tags || [])].sort().join(",");
         const tgtTags = [...(tc.tags || [])].sort().join(",");
         if (srcTags !== tgtTags) changes.push("tags");
+        if ((sc.language || "") !== (tc.language || "")) changes.push("language");
+        if (!!sc.active !== !!tc.active) changes.push("active");
+        if (!!sc.finished !== !!tc.finished) changes.push("finished");
         if (changes.length) modified.push({ id, name: sc.name, handle: sc.handle, changes });
       }
     }
@@ -535,7 +612,50 @@ async function computeSyncDiff(direction) {
       if (!srcCh[id]) removed.push({ id, name: tc.name, handle: tc.handle });
     }
 
-    return { ok: true, direction, channels: { added, removed, modified } };
+    // Folder diff: renames, reparents, emoji changes, and add/remove by id.
+    const srcFo = src.folders || {};
+    const tgtFo = tgt.folders || {};
+    const foAdded = [], foRemoved = [], foModified = [];
+    for (const [id, sf] of Object.entries(srcFo)) {
+      const tf = tgtFo[id];
+      if (!tf) {
+        foAdded.push({ id, name: sf.name });
+      } else {
+        const changes = [];
+        if ((sf.name || "") !== (tf.name || "")) changes.push("name");
+        if ((sf.parentId || "") !== (tf.parentId || "")) changes.push("parent");
+        if ((sf.emoji || "") !== (tf.emoji || "")) changes.push("emoji");
+        if ((sf.order ?? 0) !== (tf.order ?? 0)) changes.push("order");
+        if (changes.length) foModified.push({ id, name: sf.name, oldName: tf.name, changes });
+      }
+    }
+    for (const [id, tf] of Object.entries(tgtFo)) {
+      if (!srcFo[id]) foRemoved.push({ id, name: tf.name });
+    }
+
+    // Settings diff: compare the CURRENT target value against the value the apply
+    // would actually write, so the review matches the real outcome. Upload uses
+    // mergeSettings (non-empty local wins); download overlays picked remote keys.
+    const currentTarget = direction === "upload" ? remoteSettings : localSettings;
+    const resultTarget = direction === "upload"
+      ? mergeSettings(localSettings, remoteSettings)
+      : { ...localSettings, ...remoteSettings };
+    const settings = [];
+    for (const k of SYNC_SETTING_KEYS) {
+      const from = currentTarget[k];
+      const to = resultTarget[k];
+      if (JSON.stringify(from ?? null) !== JSON.stringify(to ?? null)) {
+        settings.push({ key: k, from: from ?? null, to: to ?? null });
+      }
+    }
+
+    return {
+      ok: true,
+      direction,
+      channels: { added, removed, modified },
+      folders: { added: foAdded, removed: foRemoved, modified: foModified },
+      settings,
+    };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
   }
@@ -552,9 +672,11 @@ async function applyUpload(removeFromGistIds = []) {
     let uploadChannels = { ...(local.channels || {}) };
 
     // Re-include any Gist-only channels the user chose to keep
+    let remoteSettings = {};
     if (gistId) {
       const remoteState = await fetchGistState(gistToken, gistId);
       if (remoteState) {
+        remoteSettings = remoteState.settings || {};
         const removeSet = new Set(removeFromGistIds);
         for (const [id, rc] of Object.entries(remoteState.channels || {})) {
           if (!uploadChannels[id] && !removeSet.has(id)) uploadChannels[id] = rc;
@@ -566,6 +688,7 @@ async function applyUpload(removeFromGistIds = []) {
       channels: uploadChannels,
       folders: local.folders || {},
       tags: local.tags || {},
+      settings: mergeSettings(await readLocalSettings(), remoteSettings),
     };
     const body = {
       description: "MyTube Organizer sync data",
@@ -611,7 +734,8 @@ async function applyDownload(removeLocalIds = []) {
     const folders = { ...(local.folders || {}), ...remoteState.folders };
 
     const lastSyncedAt = Date.now();
-    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {}, gistId, lastSyncedAt });
+    const settings = pickRemoteSettings(remoteState.settings);
+    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {}, gistId, lastSyncedAt, ...settings });
     return { ok: true, gistId, lastSyncedAt };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
@@ -643,11 +767,12 @@ async function syncWithGist() {
       tags: local.tags || {},
     };
     const merged = remoteState ? mergeStates(localState, remoteState) : localState;
-    await chrome.storage.local.set(merged);
+    const mergedSettings = mergeSettings(await readLocalSettings(), remoteState?.settings);
+    await chrome.storage.local.set({ ...merged, ...mergedSettings });
 
     const body = {
       description: "MyTube Organizer sync data",
-      files: { [GIST_FILENAME]: { content: JSON.stringify(merged, null, 2) } },
+      files: { [GIST_FILENAME]: { content: JSON.stringify({ ...merged, settings: mergedSettings }, null, 2) } },
     };
     if (gistId) {
       await ghApi(gistToken, `${GIST_API}/${gistId}`, "PATCH", body);
