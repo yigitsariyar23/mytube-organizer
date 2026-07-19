@@ -2,9 +2,10 @@
 
 A personal YouTube subscription organizer — an alternative to PocketTube,
 fully under your control, with no features locked behind a paywall. Sort your
-subscriptions into folders and tags, see when each channel last uploaded and
-how many videos it has, and (optionally) sync everything across devices through
-a private GitHub Gist.
+subscriptions into folders, tag them and set per-channel variables (language,
+active/finished flags), see when each channel last uploaded and how many videos
+it has, and (optionally) sync everything across devices through a private
+GitHub Gist.
 
 It's a Manifest V3 Chrome extension with no build step and no backend: a
 service worker, a single dashboard page, and one content script.
@@ -56,13 +57,13 @@ entry to a channel ID, diffs it against what you already have, and shows the
 result for review:
 
 - **New channels** — added on apply.
-- **Name / handle changes** — updated on apply; your folder, tags and stats are
-  preserved.
+- **Name / handle changes** — updated on apply; your folder, tags, variables
+  and stats are preserved.
 - **Not seen in this scan** — candidates for removal. These are **unchecked by
   default**, because an incomplete scan (you didn't scroll far enough, or a
   handle failed to resolve) can list channels you're still subscribed to. Tick
   only the ones you actually want gone — removing a channel also drops its
-  folder and tags.
+  folder, tags and variables.
 
 If a scan reports "no channels found", YouTube likely changed how channel links
 are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-breaks).
@@ -90,12 +91,35 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
 - **Tags** are freeform and multiple per channel. Click the **"+ tag"** chip on
   a row to open a dropdown of your existing tags (each with its color) — click
   one to add it, or click **"+ New tag"** to type a new name (Enter to create).
-  Tags get a color automatically. A tag **filter bar** appears above the list
-  showing only the tags used by channels in the current folder; click chips to
-  narrow the view (they combine with the selected folder). Left-clicking a tag
-  chip on a channel row removes that tag from that channel. Rename or delete a
-  tag by right-clicking it in the **filter bar**, or delete one everywhere via
-  the **×** beside it in the "+ tag" dropdown.
+  Tags get a color automatically. A **filter bar** appears above the list with a
+  chip per tag used by channels in the current folder (plus language and
+  active/finished filters — see [Variables](#variables)); click chips to narrow
+  the view (they combine with the selected folder). Left-clicking a tag chip on a
+  channel row removes that tag from that channel. Rename or delete a tag by
+  right-clicking it in the **filter bar**, or delete one everywhere via the
+  **×** beside it in the "+ tag" dropdown.
+
+## Variables
+
+Each row's **Variables** cell holds per-channel attributes alongside its tags:
+
+- **Language** — a dropdown of common languages. Pick **Other…** to type any
+  custom value; it's remembered and shown as its own option afterwards.
+- **Active** / **Finished** — two independent flags (a channel can be neither,
+  either, or both). Click a chip to toggle it; it lights up when on. Use them to
+  mark channels you're actively following versus ones you consider done.
+- **Tags** — the freeform labels described above.
+
+All of these are **filterable**. The filter bar above the list shows, for the
+current folder: each used tag, each used language, and **Active** / **Finished**
+toggles (when any channel carries them). Click to narrow the view — tags and
+languages each combine as OR within their group, and every group AND's together
+(and with the selected folder). Switching folders clears the filters.
+
+When you **Refresh Stats**, any channel flagged **Active** or **Finished** that
+has a **new video** since the last refresh triggers a desktop **notification**
+listing them — so updates to the channels you track surface even if the
+dashboard is closed. (This uses Chrome's `notifications` permission.)
 
 ## Browsing, filtering and sorting
 
@@ -109,6 +133,10 @@ The top bar filters the current view (all filters combine):
 Click the **Last Video** or **Videos** column headers to sort; each click
 cycles none → descending → ascending, and the choice is remembered. The list
 uses infinite scroll, rendering channels in batches of 40 as you scroll.
+
+When no channel matches the current folder and filters, a **"No matching
+channels"** panel appears with a **Clear filters** button (shown only when a
+filter is actually active — an empty folder just says so).
 
 Row interactions:
 
@@ -140,14 +168,15 @@ Two ways to sync:
   removals opt-out. Upload makes the Gist match this device; Download makes this
   device match the Gist.
 - The **3-hour background refresh** also runs an automatic **union merge** (no
-  review): new channels, folders, tags and tag assignments flow both ways, and
-  fresher stats win. Deletions do **not** propagate through the background merge
+  review): new channels, folders, tags and tag assignments flow both ways,
+  variables (language, active/finished) carry with each channel, and fresher
+  stats win. Deletions do **not** propagate through the background merge
   — remove an item on each device, or use a directional Upload/Download to make
   a deletion stick.
 
 Notes: the gist is "secret" (unlisted, but anyone with the URL can read it — it
-holds only channel names/IDs and your folder/tag structure, never the API key
-or token). The token is stored in `chrome.storage.local` on each device.
+holds only channel names/IDs and your folder/tag/variable structure, never the
+API key or token). The token is stored in `chrome.storage.local` on each device.
 
 ## Settings
 
@@ -187,6 +216,5 @@ See `CLAUDE.md` for the storage schema, message protocol and internal notes.
 
 ## Roadmap ideas (optional)
 
-- A "no results" state when filters exclude every channel.
 - Manual "add channel" (paste a channel ID/handle without waiting for a scan).
 - Per-folder / per-tag "unread" counter.
