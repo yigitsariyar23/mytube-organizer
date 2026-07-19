@@ -9,9 +9,6 @@
 // inside the main browse area.
 
 (async function () {
-  // Show a persistent "Scan now" button so the user can scroll manually first,
-  // then trigger the scrape whenever the full list is visible.
-  showScanButton();
   // Channel-name candidates inside a link, best first. Purely a quality
   // heuristic — if none match we still keep the channel with a fallback name.
   // Queried one by one (a single comma-list querySelector would return the
@@ -42,6 +39,11 @@
     zIndex: 999999,
     boxShadow: "0 4px 16px rgba(0,0,0,.4)",
   };
+
+  // Show a persistent "Scan now" button so the user can scroll manually first,
+  // then trigger the scrape whenever the full list is visible. Called after the
+  // consts above so BASE_OVERLAY_STYLE is initialized when showScanButton reads it.
+  showScanButton();
 
   function runScan() {
     const channels = collectChannels();
