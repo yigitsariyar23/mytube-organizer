@@ -68,7 +68,7 @@
         <div class="lth-sort-col" data-sort="date">Last Video <span class="lth-arrow"></span></div>
         <div class="lth-sort-col" data-sort="count">Videos <span class="lth-arrow"></span></div>
         <div class="lth-subs">Subs</div>
-        <div>Tags</div>
+        <div>Variables</div>
         <div>Folder</div>
       </div>
 
@@ -80,6 +80,12 @@
         </p>
       </div>
 
+      <div id="noResultsState" class="empty-state" hidden>
+        <p class="empty-title">No matching channels</p>
+        <p id="noResultsBody" class="empty-body"></p>
+        <button id="clearFiltersBtn" class="btn btn-ghost" hidden>Clear filters</button>
+      </div>
+
       <div id="channelGrid" class="channel-grid"></div>
       <div id="scrollSentinel" class="scroll-sentinel" aria-hidden="true"></div>
     </main>
@@ -87,28 +93,37 @@
 
   <!-- Settings panel -->
   <div id="settingsModal" class="modal" hidden>
-    <div class="modal-box">
+    <div class="modal-box modal-box-settings">
       <h2>Settings</h2>
-      <h3 class="settings-section-title">YouTube API</h3>
-      <label class="field-label" for="apiKeyInput">Data API v3 key</label>
-      <input id="apiKeyInput" class="field-input" type="text" placeholder="AIza..." />
-      <p class="field-hint">Optional — enables video/subscriber counts and avatars. Free from Google Cloud Console.</p>
-      <div class="settings-row">
-        <button id="fillAvatarsBtn" class="btn btn-ghost">Fill Avatars</button>
-        <span id="fillAvatarsStatus" class="field-hint"></span>
-      </div>
-      <p class="field-hint">Fetches only missing avatars — skips counts and dates.</p>
+      <div class="settings-grid">
+        <section class="settings-col">
+          <h3 class="settings-section-title">YouTube API</h3>
+          <label class="field-label" for="apiKeyInput">Data API v3 key</label>
+          <input id="apiKeyInput" class="field-input" type="text" placeholder="AIza..." />
+          <p class="field-hint">Optional — enables video/subscriber counts and avatars. Free from Google Cloud Console.</p>
+          <div class="settings-row">
+            <button id="fillAvatarsBtn" class="btn btn-ghost">Fill Avatars</button>
+            <span id="fillAvatarsStatus" class="field-hint"></span>
+          </div>
+          <p class="field-hint">Fetches only missing avatars — skips counts and dates.</p>
 
-      <hr class="settings-sep" />
+          <h3 class="settings-section-title">Cross-device sync</h3>
+          <label class="field-label" for="gistTokenInput">GitHub token</label>
+          <input id="gistTokenInput" class="field-input" type="text" placeholder="github_pat_… / ghp_…" />
+          <p class="field-hint">Syncs via a secret Gist. Use a token with only the <b>gist</b> scope. Merges both sides.</p>
+          <div class="settings-row">
+            <button id="syncUploadBtn" class="btn btn-ghost">&#8593; Upload</button>
+            <button id="syncDownloadBtn" class="btn btn-ghost">&#8595; Download</button>
+            <span id="syncStatus" class="field-hint"></span>
+          </div>
+        </section>
 
-      <h3 class="settings-section-title">Cross-device sync</h3>
-      <label class="field-label" for="gistTokenInput">GitHub token</label>
-      <input id="gistTokenInput" class="field-input" type="text" placeholder="github_pat_… / ghp_…" />
-      <p class="field-hint">Syncs via a secret Gist. Use a token with only the <b>gist</b> scope. Merges both sides.</p>
-      <div class="settings-row">
-        <button id="syncUploadBtn" class="btn btn-ghost">&#8593; Upload</button>
-        <button id="syncDownloadBtn" class="btn btn-ghost">&#8595; Download</button>
-        <span id="syncStatus" class="field-hint"></span>
+        <section class="settings-col">
+          <h3 class="settings-section-title">Languages</h3>
+          <label class="field-label" for="languagesInput">Dropdown options (one per line)</label>
+          <textarea id="languagesInput" class="field-input settings-langs" spellcheck="false"></textarea>
+          <p class="field-hint">The set shown in each channel's language picker. One per line; blank resets to defaults.</p>
+        </section>
       </div>
 
       <hr class="settings-sep" />

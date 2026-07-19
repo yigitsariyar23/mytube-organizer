@@ -5,9 +5,51 @@ const TAG_PALETTE = [
   "#F2777A", "#82D9C5", "#D9A86C", "#9FA8DA",
 ];
 
+// Per-language colors. Large enough that every language in the default set gets
+// a distinct color: colors are assigned by the language's position in LANGUAGES,
+// not by hash, so no two curated languages collide. Kept disjoint from
+// TAG_PALETTE (tags stay distinct from languages) and excludes the Active green
+// (#6FCF97) and Finished blue (#56B6E9) button colors.
+// Ordered so consecutive colors are far apart on the hue wheel: the first eight
+// are a full rainbow (red, indigo, orange, cyan, pink, lime, purple, yellow) and
+// each "second shade" of a family is pushed to the tail — so the languages a
+// user actually has never look like brighter copies of each other.
+const LANG_PALETTE = [
+  "#EF5350", "#5C6BC0", "#FFA726", "#26C6DA", "#EC407A",
+  "#9CCC65", "#AB47BC", "#FDD835", "#26A69A", "#FF7043",
+  "#7E57C2", "#C0CA33", "#8D6E63", "#78909C",
+];
+
+function langColor(lang) {
+  if (!lang) return null;
+  // Curated languages: color by list position — guarantees distinctness up to
+  // the palette size. Custom (off-list) languages fall back to a name hash.
+  const idx = LANGUAGES.indexOf(lang);
+  if (idx >= 0) return LANG_PALETTE[idx % LANG_PALETTE.length];
+  let h = 0;
+  for (let i = 0; i < lang.length; i++) h = (h * 31 + lang.charCodeAt(i)) >>> 0;
+  return LANG_PALETTE[h % LANG_PALETTE.length];
+}
+
+// Language variable: a curated dropdown list. A channel may also hold a custom
+// language (via the "Other…" prompt); such values are injected as an extra option.
+const DEFAULT_LANGUAGES = [
+  "English", "Türkçe", "Español", "Português", "Deutsch", "Français",
+  "Italiano", "Русский", "日本語", "한국어", "中文", "हिन्दी", "العربية",
+];
+// Mutable at runtime: the curated set is editable in Settings and persisted
+// to storage under "languages". Reassigned in loadState and on settings save.
+let LANGUAGES = [...DEFAULT_LANGUAGES];
+const LANG_OTHER = "__other__";
+
 let state = { channels: {}, folders: {}, tags: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null };
 let currentFolderId = "all";
 let activeTagFilters = new Set();
+let activeLangFilters = new Set(); // languages selected in the filter bar
+const selectedChannelIds = new Set(); // multi-select highlight (ctrl/shift click)
+let selectionAnchor = null;           // last clicked id, the shift-range pivot
+let filterActiveOnly = false;      // show only channels flagged "active"
+let filterFinishedOnly = false;    // show only channels flagged "finished"
 let searchQuery = "";
 let sortDate = "desc"; // "desc" (newest first) | "asc" (oldest first) | "none"
 let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
@@ -34,6 +76,9 @@ const el = {
   tagFilterBar: document.getElementById("tagFilterBar"),
   channelGrid: document.getElementById("channelGrid"),
   emptyState: document.getElementById("emptyState"),
+  noResultsState: document.getElementById("noResultsState"),
+  noResultsBody: document.getElementById("noResultsBody"),
+  clearFiltersBtn: document.getElementById("clearFiltersBtn"),
   statusText: document.getElementById("statusText"),
   searchInput: document.getElementById("searchInput"),
   scanBtn: document.getElementById("scanBtn"),
@@ -45,6 +90,7 @@ const el = {
   settingsModal: document.getElementById("settingsModal"),
   apiKeyInput: document.getElementById("apiKeyInput"),
   gistTokenInput: document.getElementById("gistTokenInput"),
+  languagesInput: document.getElementById("languagesInput"),
   syncUploadBtn: document.getElementById("syncUploadBtn"),
   syncDownloadBtn: document.getElementById("syncDownloadBtn"),
   syncStatus: document.getElementById("syncStatus"),
@@ -117,6 +163,9 @@ async function init() {
     if (changes.channels) state.channels = changes.channels.newValue || {};
     if (changes.folders) state.folders = changes.folders.newValue || {};
     if (changes.tags) state.tags = changes.tags.newValue || {};
+    // Settings synced from another device (background gist merge / download).
+    if (changes.apiKey) state.apiKey = changes.apiKey.newValue || "";
+    if (changes.languages) LANGUAGES = changes.languages.newValue?.length ? changes.languages.newValue : [...DEFAULT_LANGUAGES];
     if (changes.pendingScan) {
       state.pendingScan = changes.pendingScan.newValue || null;
       if (state.pendingScan) openScanDiffModal(state.pendingScan);
@@ -133,7 +182,7 @@ const defaultFolders = () => ({ unsorted: { name: "Unsorted", order: 0 } });
 async function loadState() {
   const data = await chrome.storage.local.get([
     "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
-    "sortDate", "sortCount", "folderSort",
+    "sortDate", "sortCount", "folderSort", "languages",
   ]);
   state.channels = data.channels || {};
   state.folders = data.folders || defaultFolders();
@@ -146,6 +195,7 @@ async function loadState() {
   sortDate = data.sortDate === "asc" || data.sortDate === "none" ? data.sortDate : "desc";
   sortCount = data.sortCount === "desc" || data.sortCount === "asc" ? data.sortCount : "none";
   folderSort = ["alpha", "count-desc", "count-asc"].includes(data.folderSort) ? data.folderSort : "custom";
+  LANGUAGES = Array.isArray(data.languages) && data.languages.length ? data.languages : [...DEFAULT_LANGUAGES];
 }
 
 // ---------- Render ----------
@@ -421,14 +471,17 @@ function renderTagFilters() {
   const bar = el.tagFilterBar;
   bar.innerHTML = "";
 
-  // only offer tags actually used by channels in the current folder
+  // Only offer variables actually present on channels in the current folder.
   const channelsInFolder = Object.values(state.channels).filter(
     (c) => currentFolderId === "all" || c.folderId === currentFolderId
   );
-  const available = new Set(channelsInFolder.flatMap((c) => c.tags || []));
-  const entries = Object.entries(state.tags).filter(([id]) => available.has(id));
+  const usedTagIds = new Set(channelsInFolder.flatMap((c) => c.tags || []));
+  const tagEntries = Object.entries(state.tags).filter(([id]) => usedTagIds.has(id));
+  const langs = [...new Set(channelsInFolder.map((c) => c.language).filter(Boolean))].sort();
+  const hasActive = channelsInFolder.some((c) => c.active);
+  const hasFinished = channelsInFolder.some((c) => c.finished);
 
-  bar.hidden = entries.length === 0;
+  bar.hidden = tagEntries.length === 0 && langs.length === 0 && !hasActive && !hasFinished;
   if (bar.hidden) return;
 
   const label = document.createElement("span");
@@ -436,7 +489,7 @@ function renderTagFilters() {
   label.textContent = "Filter";
   bar.appendChild(label);
 
-  for (const [id, tag] of entries) {
+  for (const [id, tag] of tagEntries) {
     const chip = document.createElement("span");
     chip.className = "tag-chip" + (activeTagFilters.has(id) ? " active" : "");
     chip.textContent = tag.name;
@@ -444,6 +497,36 @@ function renderTagFilters() {
     chip.style.borderColor = tag.color;
     chip.dataset.tagId = id;
     chip.dataset.role = "filter-tag";
+    bar.appendChild(chip);
+  }
+
+  // Language chips
+  for (const lang of langs) {
+    const chip = document.createElement("span");
+    const active = activeLangFilters.has(lang);
+    chip.className = "tag-chip filter-lang-chip" + (active ? " active" : "");
+    chip.textContent = lang;
+    const color = langColor(lang);
+    chip.style.background = active ? color : "";
+    chip.style.borderColor = color;
+    chip.dataset.lang = lang;
+    chip.dataset.role = "filter-lang";
+    bar.appendChild(chip);
+  }
+
+  // Active / Finished toggle chips
+  if (hasActive) {
+    const chip = document.createElement("span");
+    chip.className = "tag-chip var-toggle" + (filterActiveOnly ? " on-active" : "");
+    chip.textContent = "Active";
+    chip.dataset.role = "filter-active";
+    bar.appendChild(chip);
+  }
+  if (hasFinished) {
+    const chip = document.createElement("span");
+    chip.className = "tag-chip var-toggle" + (filterFinishedOnly ? " on-finished" : "");
+    chip.textContent = "Finished";
+    chip.dataset.role = "filter-finished";
     bar.appendChild(chip);
   }
 }
@@ -458,8 +541,22 @@ function renderGrid() {
     .map(({ id, f, isChild }) => ({ id, label: `${isChild ? "  " : ""}${escapeHtml(f.name)}` }));
   el.channelGrid.innerHTML = "";
   el.channelGrid.classList.add("list-view");
-  el.listTableHeader.hidden = false;
-  el.emptyState.hidden = Object.keys(state.channels).length > 0;
+
+  const totalChannels = Object.keys(state.channels).length;
+  const filteredCount = pendingChannels.length;
+  const libraryEmpty = totalChannels === 0;
+  const noMatches = !libraryEmpty && filteredCount === 0;
+
+  el.emptyState.hidden = !libraryEmpty;
+  el.noResultsState.hidden = !noMatches;
+  el.listTableHeader.hidden = libraryEmpty || noMatches;
+  if (noMatches) {
+    const filtered = anyFilterActive();
+    el.noResultsBody.textContent = filtered
+      ? "No channels match the current filters."
+      : "This folder has no channels yet.";
+    el.clearFiltersBtn.hidden = !filtered;
+  }
   updateSortHeaders();
 
   appendNextPage();
@@ -495,6 +592,52 @@ function setupScrollObserver() {
   if (pendingChannels.length) scrollObserver.observe(el.scrollSentinel);
 }
 
+// Reset every variable-based filter (tags, language, active/finished) — used
+// when switching folders and on "Clear all data", since they're per-folder-view.
+function resetVariableFilters() {
+  activeTagFilters.clear();
+  activeLangFilters.clear();
+  filterActiveOnly = false;
+  filterFinishedOnly = false;
+}
+
+// Any filter that can hide channels within the current folder view. Excludes
+// the folder selection itself (that's navigation, not a filter).
+function anyFilterActive() {
+  return (
+    !!searchQuery.trim() ||
+    activeTagFilters.size > 0 ||
+    activeLangFilters.size > 0 ||
+    filterActiveOnly ||
+    filterFinishedOnly ||
+    filterMinCount !== null ||
+    filterMaxCount !== null ||
+    !!filterAfterDate ||
+    !!filterBeforeDate
+  );
+}
+
+// Reset every filter — variable filters, search, and the advanced count/date
+// bounds — plus their input controls, then re-render. Folder stays put.
+function clearAllFilters() {
+  resetVariableFilters();
+  searchQuery = "";
+  filterMinCount = null;
+  filterMaxCount = null;
+  filterAfterDate = null;
+  filterBeforeDate = null;
+  el.searchInput.value = "";
+  el.filterMinCount.value = "";
+  el.filterMaxCount.value = "";
+  el.filterAfterDay.value = "";
+  el.filterAfterMonth.value = "";
+  el.filterAfterYear.value = "—";
+  el.filterBeforeDay.value = "";
+  el.filterBeforeMonth.value = "";
+  el.filterBeforeYear.value = "—";
+  render();
+}
+
 function getFilteredChannels() {
   let list = Object.values(state.channels);
 
@@ -504,6 +647,15 @@ function getFilteredChannels() {
   }
   if (activeTagFilters.size) {
     list = list.filter((c) => c.tags?.some((t) => activeTagFilters.has(t)));
+  }
+  if (activeLangFilters.size) {
+    list = list.filter((c) => activeLangFilters.has(c.language));
+  }
+  if (filterActiveOnly) {
+    list = list.filter((c) => c.active);
+  }
+  if (filterFinishedOnly) {
+    list = list.filter((c) => c.finished);
   }
   const q = searchQuery.trim().toLowerCase();
   if (q) {
@@ -561,6 +713,7 @@ function updateSortHeaders() {
 function buildChannelRow(ch) {
   const row = document.createElement("div");
   row.className = "channel-row";
+  if (selectedChannelIds.has(ch.id)) row.classList.add("selected");
   row.dataset.channelId = ch.id;
 
   row.innerHTML = `
@@ -574,7 +727,12 @@ function buildChannelRow(ch) {
     <div class="row-date" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}">${formatShortDate(ch.lastVideoDate)}</div>
     <div class="row-count">${ch.videoCount ?? "—"}</div>
     <div class="row-subs" title="${escapeHtml(subscriberTitle(ch.subscriberCount))}">${formatSubscribers(ch.subscriberCount)}</div>
-    <div class="channel-tags">
+    <div class="channel-tags channel-vars">
+      <select class="var-lang${ch.language ? " has-lang" : ""}" data-role="set-language" title="Language"${ch.language ? ` style="border-color:${langColor(ch.language)};color:${langColor(ch.language)}"` : ""}>
+        ${languageOptionsHtml(ch)}
+      </select>
+      <span class="tag-chip var-toggle${ch.active ? " on-active" : ""}" data-role="toggle-active" title="Active — flag channels you're following">Active</span>
+      <span class="tag-chip var-toggle${ch.finished ? " on-finished" : ""}" data-role="toggle-finished" title="Finished — flag channels you consider done">Finished</span>
       ${tagChipsHtml(ch)}
       <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
     </div>
@@ -627,6 +785,20 @@ function buildOrderedFolderList() {
     }
   }
   return result;
+}
+
+function languageOptionsHtml(ch) {
+  const current = ch.language || "";
+  // A custom language not in the curated list still needs its own option.
+  const list = current && !LANGUAGES.includes(current) ? [current, ...LANGUAGES] : LANGUAGES;
+  const opts = list
+    .map((l) => `<option value="${escapeHtml(l)}" ${l === current ? "selected" : ""}>${escapeHtml(l)}</option>`)
+    .join("");
+  return (
+    `<option value="" ${current ? "" : "selected"}>lang…</option>` +
+    opts +
+    `<option value="${LANG_OTHER}">Other…</option>`
+  );
 }
 
 function tagChipsHtml(ch) {
@@ -747,13 +919,22 @@ function openSyncDiffModal(diff) {
   pendingSyncDiff = diff;
   const { direction, channels: { added, removed, modified } } = diff;
   const isUpload = direction === "upload";
+  // Folders/settings diffs are new; guard for gists synced before they existed.
+  const fo = diff.folders || { added: [], removed: [], modified: [] };
+  const settings = diff.settings || [];
+  // Folder removals only truly apply on upload (download keeps local-only folders).
+  const foRemoved = isUpload ? fo.removed : [];
+  const folderCount = fo.added.length + fo.modified.length + foRemoved.length;
 
   el.syncDiffTitle.textContent = isUpload ? "Review upload" : "Review download";
 
-  const totalChanges = added.length + removed.length + modified.length;
+  const totalChanges = added.length + removed.length + modified.length + folderCount + settings.length;
+  const extra = [];
+  if (folderCount) extra.push(`${folderCount} folder change${folderCount === 1 ? "" : "s"}`);
+  if (settings.length) extra.push(`${settings.length} setting${settings.length === 1 ? "" : "s"}`);
   el.syncDiffSummary.textContent = totalChanges === 0
     ? "No differences — already in sync."
-    : `${added.length} to add, ${modified.length} to overwrite, ${removed.length} to remove.`;
+    : [`${added.length} to add, ${modified.length} to overwrite, ${removed.length} to remove`, ...extra].join(", ") + ".";
 
   if (removed.length) {
     el.syncDiffWarning.hidden = false;
@@ -772,9 +953,78 @@ function openSyncDiffModal(diff) {
   el.syncDiffBody.appendChild(buildDiffSection(delLabel, "del", removed, true, isUpload));
   if (modified.length) el.syncDiffBody.appendChild(buildSyncModSection(isUpload ? "Will overwrite in Gist" : "Will overwrite locally", modified));
 
+  const dest = isUpload ? "in Gist" : "locally";
+  if (settings.length) el.syncDiffBody.appendChild(buildSyncSettingsSection(`Settings — will overwrite ${dest}`, settings));
+  if (folderCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Folders — will overwrite ${dest}`, fo.added, fo.modified, foRemoved));
+
   el.syncDiffApply.textContent = isUpload ? "Apply upload" : "Apply download";
   el.syncDiffApply.disabled = totalChanges === 0;
   el.syncDiffModal.hidden = false;
+}
+
+const SETTING_LABELS = {
+  apiKey: "YouTube API key",
+  languages: "Language set",
+  sortDate: "Date sort",
+  sortCount: "Count sort",
+  folderSort: "Folder sort",
+};
+
+// The API key is the user's secret — show presence, not the value.
+function formatSettingValue(key, val) {
+  if (val === null || val === undefined || val === "") return "(none)";
+  if (key === "apiKey") return "(set)";
+  if (Array.isArray(val)) return val.join(", ") || "(none)";
+  return String(val);
+}
+
+// Read-only section: each changed setting as "label: from → to". Always applied
+// (no checkboxes) — settings ride along wholesale on upload/download.
+function buildSyncSettingsSection(title, settings) {
+  const sec = document.createElement("div");
+  sec.className = "scan-diff-section";
+  sec.appendChild(buildDiffSectionHeader(title, "mod", settings.length));
+  const list = document.createElement("div");
+  list.className = "scan-diff-list";
+  for (const s of settings) {
+    const row = document.createElement("div");
+    row.className = "scan-diff-row";
+    const label = escapeHtml(SETTING_LABELS[s.key] || s.key);
+    const from = escapeHtml(formatSettingValue(s.key, s.from));
+    const to = escapeHtml(formatSettingValue(s.key, s.to));
+    row.innerHTML = `<span class="scan-diff-text"><b>${label}</b><span class="scan-diff-sub">${from} <span class="scan-diff-arrow">→</span> ${to}</span></span>`;
+    list.appendChild(row);
+  }
+  sec.appendChild(list);
+  return sec;
+}
+
+// Read-only section listing folder adds, renames/reparents, and (upload-only) removals.
+function buildSyncFolderSection(title, added, modified, removed) {
+  const sec = document.createElement("div");
+  sec.className = "scan-diff-section";
+  const count = added.length + modified.length + removed.length;
+  sec.appendChild(buildDiffSectionHeader(title, "mod", count));
+  const list = document.createElement("div");
+  list.className = "scan-diff-list";
+  const addRow = (html) => {
+    const row = document.createElement("div");
+    row.className = "scan-diff-row";
+    row.innerHTML = html;
+    list.appendChild(row);
+  };
+  for (const f of modified) {
+    const changes = escapeHtml(f.changes.join(", "));
+    addRow(`<span class="scan-diff-text">${escapeHtml(f.oldName || "—")} <span class="scan-diff-arrow">→</span> <b>${escapeHtml(f.name)}</b><span class="scan-diff-sub">${changes}</span></span>`);
+  }
+  for (const f of added) {
+    addRow(`<span class="scan-diff-text"><b>${escapeHtml(f.name)}</b><span class="scan-diff-sub">new folder</span></span>`);
+  }
+  for (const f of removed) {
+    addRow(`<span class="scan-diff-text"><b>${escapeHtml(f.name)}</b><span class="scan-diff-sub">removed</span></span>`);
+  }
+  sec.appendChild(list);
+  return sec;
 }
 
 // The section header shared by the scan/sync diff sections: a title span (with a
@@ -868,7 +1118,7 @@ function bindEvents() {
       return;
     }
     currentFolderId = li.dataset.folderId;
-    activeTagFilters.clear(); // filters are per-folder-view
+    resetVariableFilters(); // filters are per-folder-view
     render();
   });
 
@@ -929,11 +1179,24 @@ function bindEvents() {
   });
 
   el.tagFilterBar.addEventListener("click", (e) => {
-    const chip = e.target.closest('[data-role="filter-tag"]');
+    const chip = e.target.closest("[data-role]");
     if (!chip) return;
-    const id = chip.dataset.tagId;
-    if (activeTagFilters.has(id)) activeTagFilters.delete(id);
-    else activeTagFilters.add(id);
+    const role = chip.dataset.role;
+    if (role === "filter-tag") {
+      const id = chip.dataset.tagId;
+      if (activeTagFilters.has(id)) activeTagFilters.delete(id);
+      else activeTagFilters.add(id);
+    } else if (role === "filter-lang") {
+      const lang = chip.dataset.lang;
+      if (activeLangFilters.has(lang)) activeLangFilters.delete(lang);
+      else activeLangFilters.add(lang);
+    } else if (role === "filter-active") {
+      filterActiveOnly = !filterActiveOnly;
+    } else if (role === "filter-finished") {
+      filterFinishedOnly = !filterFinishedOnly;
+    } else {
+      return;
+    }
     renderTagFilters();
     renderGrid();
   });
@@ -942,6 +1205,8 @@ function bindEvents() {
     searchQuery = e.target.value;
     renderGrid();
   });
+
+  el.clearFiltersBtn.addEventListener("click", clearAllFilters);
 
   el.filterMinCount.addEventListener("input", (e) => {
     filterMinCount = e.target.value !== "" ? parseInt(e.target.value, 10) : null;
@@ -1065,10 +1330,22 @@ function bindEvents() {
   }
 
   // Folder change / tag add-remove / row clicks
+  // Suppress the browser's text-selection smear when shift-clicking rows.
+  el.channelGrid.addEventListener("mousedown", (e) => {
+    if (e.shiftKey && e.target.closest("[data-channel-id]")) e.preventDefault();
+  });
+
   el.channelGrid.addEventListener("click", async (e) => {
     const channelCard = e.target.closest("[data-channel-id]");
     if (!channelCard) return;
     const channelId = channelCard.dataset.channelId;
+
+    // Modifier click drives multi-select instead of any row action.
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      e.preventDefault();
+      handleSelectionClick(channelId, e);
+      return;
+    }
 
     if (e.target.dataset.role === "remove-tag") {
       const tagName = e.target.dataset.tagName;
@@ -1085,8 +1362,19 @@ function bindEvents() {
       return;
     }
 
+    if (e.target.dataset.role === "toggle-active" || e.target.dataset.role === "toggle-finished") {
+      const key = e.target.dataset.role === "toggle-active" ? "active" : "finished";
+      const ch = state.channels[channelId];
+      if (ch) {
+        ch[key] = !ch[key];
+        await chrome.storage.local.set({ channels: state.channels });
+      }
+      return;
+    }
+
     // Left-click anywhere on the row that isn't a tag/select opens the channel
     if (!isInteractiveTarget(e.target)) {
+      if (selectedChannelIds.size) clearSelection();
       chrome.tabs.create({ url: `https://www.youtube.com/channel/${channelId}/videos` });
     }
   });
@@ -1111,6 +1399,12 @@ function bindEvents() {
     const ch = state.channels[channelId];
     if (!ch) return;
 
+    // Right-clicking inside a multi-selection acts on the whole set.
+    if (selectedChannelIds.size > 1 && selectedChannelIds.has(channelId)) {
+      showBulkContextMenu(e.clientX, e.clientY, [...selectedChannelIds]);
+      return;
+    }
+
     showContextMenu(e.clientX, e.clientY, [
       {
         label: "Move to folder",
@@ -1126,9 +1420,27 @@ function bindEvents() {
   });
 
   el.channelGrid.addEventListener("change", async (e) => {
-    if (e.target.dataset.role !== "move-folder") return;
     const channelCard = e.target.closest("[data-channel-id]");
+    if (!channelCard) return;
     const channelId = channelCard.dataset.channelId;
+
+    if (e.target.dataset.role === "set-language") {
+      const ch = state.channels[channelId];
+      if (!ch) return;
+      let value = e.target.value;
+      if (value === LANG_OTHER) {
+        const custom = prompt("Language:", ch.language || "")?.trim();
+        // Cancelled / empty prompt: revert the <select> to what was stored.
+        if (!custom) { e.target.value = ch.language || ""; return; }
+        value = custom;
+      }
+      ch.language = value || null;
+      await chrome.storage.local.set({ channels: state.channels });
+      renderGrid();
+      return;
+    }
+
+    if (e.target.dataset.role !== "move-folder") return;
     state.channels[channelId].folderId = e.target.value;
     await chrome.storage.local.set({ channels: state.channels });
     renderFolders();
@@ -1139,6 +1451,7 @@ function bindEvents() {
   el.settingsBtn.addEventListener("click", () => {
     el.apiKeyInput.value = state.apiKey || "";
     el.gistTokenInput.value = state.gistToken || "";
+    el.languagesInput.value = LANGUAGES.join("\n");
     el.fillAvatarsStatus.textContent = "";
     renderSyncStatus();
     el.settingsModal.hidden = false;
@@ -1147,8 +1460,13 @@ function bindEvents() {
   el.settingsSave.addEventListener("click", async () => {
     state.apiKey = el.apiKeyInput.value.trim();
     state.gistToken = el.gistTokenInput.value.trim();
-    await chrome.storage.local.set({ apiKey: state.apiKey, gistToken: state.gistToken });
+    // Parse the language set: trim lines, drop blanks, dedupe (keep order).
+    // Empty box falls back to the built-in defaults.
+    const parsed = [...new Set(el.languagesInput.value.split("\n").map((l) => l.trim()).filter(Boolean))];
+    LANGUAGES = parsed.length ? parsed : [...DEFAULT_LANGUAGES];
+    await chrome.storage.local.set({ apiKey: state.apiKey, gistToken: state.gistToken, languages: LANGUAGES });
     el.settingsModal.hidden = true;
+    render();
   });
 
   async function startSyncFlow(direction) {
@@ -1273,7 +1591,7 @@ function bindEvents() {
     await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt"]);
     state = { channels: {}, folders: defaultFolders(), tags: {}, apiKey: state.apiKey, gistToken: state.gistToken, gistId: "", lastSyncedAt: null };
     currentFolderId = "all";
-    activeTagFilters.clear();
+    resetVariableFilters();
     searchQuery = "";
     el.settingsModal.hidden = true;
     render();
@@ -1568,6 +1886,30 @@ function hideContextMenu() {
   hideSubmenu();
 }
 
+// Generic folder-picker submenu. `onPick(folderId)` fires on choice; `isActive`
+// (optional) marks the currently-selected destination. Only leaf folders are
+// valid targets — parents nest their children in a further submenu.
+function folderSubmenuItems(onPick, isActive = () => false) {
+  return getTopLevelFoldersOrdered().map(([id, f]) => {
+    const children = Object.entries(state.folders)
+      .filter(([, cf]) => cf.parentId === id)
+      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0));
+
+    if (children.length === 0) {
+      return { label: f.name, active: isActive(id), action: () => onPick(id) };
+    }
+    return {
+      label: f.name,
+      active: children.some(([cid]) => isActive(cid)),
+      submenu: () => children.map(([cid, cf]) => ({
+        label: cf.name,
+        active: isActive(cid),
+        action: () => onPick(cid),
+      })),
+    };
+  });
+}
+
 function buildFolderSubmenu(channelId, ch) {
   const moveTo = async (folderId) => {
     state.channels[channelId].folderId = folderId;
@@ -1575,29 +1917,126 @@ function buildFolderSubmenu(channelId, ch) {
     renderFolders();
     if (currentFolderId !== "all") renderGrid();
   };
+  return folderSubmenuItems(moveTo, (id) => ch.folderId === id);
+}
 
-  const topLevel = getTopLevelFoldersOrdered();
+// ---------- Multi-select ----------
 
-  return topLevel.map(([id, f]) => {
-    const children = Object.entries(state.folders)
-      .filter(([, cf]) => cf.parentId === id)
-      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0));
+// Ctrl/Cmd toggles one row; Shift add/removes the whole run from the anchor to
+// the clicked row (add vs remove is decided by the clicked row's current state).
+function handleSelectionClick(channelId, e) {
+  const ordered = getFilteredChannels().map((c) => c.id);
 
-    if (children.length === 0) {
-      return { label: f.name, active: ch.folderId === id, action: () => moveTo(id) };
+  if (e.shiftKey && selectionAnchor && ordered.includes(selectionAnchor)) {
+    const a = ordered.indexOf(selectionAnchor);
+    const b = ordered.indexOf(channelId);
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    const adding = !selectedChannelIds.has(channelId);
+    for (let i = lo; i <= hi; i++) {
+      if (adding) selectedChannelIds.add(ordered[i]);
+      else selectedChannelIds.delete(ordered[i]);
     }
+  } else {
+    if (selectedChannelIds.has(channelId)) selectedChannelIds.delete(channelId);
+    else selectedChannelIds.add(channelId);
+  }
+  selectionAnchor = channelId;
+  paintSelection();
+}
 
-    // Parent has subfolders — only subfolders are valid destinations
-    return {
-      label: f.name,
-      active: children.some(([cid]) => cid === ch.folderId),
-      submenu: () => children.map(([cid, cf]) => ({
-        label: cf.name,
-        active: ch.folderId === cid,
-        action: () => moveTo(cid),
-      })),
-    };
-  });
+// Toggle the .selected class on rows already in the DOM. Rows appended later by
+// the scroll pager pick up the class in buildChannelRow.
+function paintSelection() {
+  for (const row of el.channelGrid.querySelectorAll("[data-channel-id]")) {
+    row.classList.toggle("selected", selectedChannelIds.has(row.dataset.channelId));
+  }
+}
+
+function clearSelection() {
+  selectedChannelIds.clear();
+  selectionAnchor = null;
+  paintSelection();
+}
+
+// Apply `fn` to every selected channel, persist once, then clear + re-render.
+async function bulkMutate(ids, fn) {
+  for (const id of ids) {
+    const ch = state.channels[id];
+    if (ch) fn(ch);
+  }
+  await chrome.storage.local.set({ channels: state.channels });
+  clearSelection();
+  renderFolders();
+  renderGrid();
+}
+
+async function bulkDelete(ids) {
+  if (!confirm(`Delete ${ids.length} channels from MyTube? This cannot be undone.`)) return;
+  for (const id of ids) delete state.channels[id];
+  await chrome.storage.local.set({ channels: state.channels });
+  clearSelection();
+  render();
+}
+
+function showBulkContextMenu(x, y, ids) {
+  const n = ids.length;
+  const tags = Object.entries(state.tags).sort((a, b) => a[1].name.localeCompare(b[1].name));
+
+  showContextMenu(x, y, [
+    {
+      label: `Move ${n} to folder`,
+      submenu: () => folderSubmenuItems((fid) => bulkMutate(ids, (ch) => (ch.folderId = fid))),
+    },
+    {
+      label: "Set language",
+      submenu: () => [
+        { label: "— none —", action: () => bulkMutate(ids, (ch) => (ch.language = null)) },
+        ...LANGUAGES.map((l) => ({
+          label: l,
+          action: () => bulkMutate(ids, (ch) => (ch.language = l)),
+        })),
+      ],
+    },
+    {
+      label: "Add tag",
+      submenu: () =>
+        tags.length
+          ? tags.map(([tid, t]) => ({
+              label: t.name,
+              action: () =>
+                bulkMutate(ids, (ch) => {
+                  if (!ch.tags) ch.tags = [];
+                  if (!ch.tags.includes(tid)) ch.tags.push(tid);
+                }),
+            }))
+          : [{ label: "No tags yet", action: () => {} }],
+    },
+    {
+      label: "Remove tag",
+      submenu: () => {
+        // Only tags that at least one selected channel actually carries.
+        const present = new Set();
+        for (const id of ids) for (const tid of state.channels[id]?.tags || []) present.add(tid);
+        const removable = tags.filter(([tid]) => present.has(tid));
+        return removable.length
+          ? removable.map(([tid, t]) => ({
+              label: t.name,
+              action: () =>
+                bulkMutate(ids, (ch) => {
+                  if (ch.tags) ch.tags = ch.tags.filter((t) => t !== tid);
+                }),
+            }))
+          : [{ label: "No tags on selection", action: () => {} }];
+      },
+    },
+    { separator: true },
+    { label: "Mark active", action: () => bulkMutate(ids, (ch) => (ch.active = true)) },
+    { label: "Mark inactive", action: () => bulkMutate(ids, (ch) => (ch.active = false)) },
+    { label: "Mark finished", action: () => bulkMutate(ids, (ch) => (ch.finished = true)) },
+    { label: "Mark unfinished", action: () => bulkMutate(ids, (ch) => (ch.finished = false)) },
+    { separator: true },
+    { label: `Delete ${n} channels`, danger: true, action: () => bulkDelete(ids) },
+  ]);
 }
 
 async function deleteChannel(channelId) {
