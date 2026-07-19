@@ -3,10 +3,12 @@
 //
 // NOTE: YouTube's DOM changes from time to time (ytd-channel-renderer was
 // replaced by yt-lockup-view-model style components in some rollouts), so this
-// script does NOT depend on renderer tag names. It injects a "Scan channels"
-// button — scroll the page manually until all channels are loaded, then click
-// it to collect every link that points at a channel (/channel/UC... or /@handle)
-// inside the main browse area.
+// script does NOT depend on renderer tag names. It injects a bottom-right bar
+// with three controls: "⬇" jumps to the page bottom once (load the next lazy
+// batch, wait, click again), "⏬" auto-scrolls until the list stops growing, and
+// "📋 Scan channels" collects every link that points at a channel (/channel/UC...
+// or /@handle) inside the main browse area. Scanning is always a manual click —
+// the scroll helpers only load channels, they never trigger the scan.
 
 (async function () {
   // Channel-name candidates inside a link, best first. Purely a quality
@@ -158,7 +160,12 @@
   }
 
   function clean(str) {
-    return (str || "").replace(/\s+/g, " ").trim();
+    // NFC-normalize first so accented names (e.g. Vietnamese "Quỳnh", where "ỳ"
+    // can arrive precomposed U+1EF3 or decomposed y+U+0300) canonicalize to one
+    // form. Without this, YouTube's duplicated title copies can land in different
+    // forms — breaking halfIfDoubled's length/equality checks and the descendant
+    // guard below, which is what leaks a doubled "Quỳnh Quỳnh" through every scan.
+    return (str || "").normalize("NFC").replace(/\s+/g, " ").trim();
   }
 
   // Handles in an href may be percent-encoded (e.g. /@De%C4%9Fi%C5%9FikYollarda);
@@ -172,18 +179,65 @@
   }
 
   function showScanButton() {
+    // A fixed bottom-right bar holding the scroll-to-bottom arrow and the scan
+    // button side by side. YouTube lazy-loads channels as you near the page
+    // bottom, so the arrow lets the user jump down, wait for the next batch to
+    // load, and jump again — repeatedly — before triggering the manual scan.
+    const bar = document.createElement("div");
+    bar.id = "mytube-scan-bar";
+    Object.assign(bar.style, {
+      ...BASE_OVERLAY_STYLE,
+      display: "flex",
+      gap: "8px",
+      background: "transparent",
+      boxShadow: "none",
+    });
+
+    const secondaryStyle = {
+      background: "#17161A",
+      color: "#EDEAE4",
+      border: "none",
+      borderRadius: "8px",
+      padding: "10px 14px",
+      fontSize: "16px",
+      fontWeight: "600",
+      cursor: "pointer",
+      boxShadow: "0 4px 16px rgba(0,0,0,.4)",
+    };
+
+    const scrollBtn = document.createElement("button");
+    scrollBtn.id = "mytube-scroll-btn";
+    scrollBtn.textContent = "⬇";
+    Object.assign(scrollBtn.style, secondaryStyle);
+    scrollBtn.addEventListener("click", scrollToBottom);
+    const scrollWrap = withTooltip(
+      scrollBtn,
+      "Scroll to the bottom once — loads the next batch of channels."
+    );
+
+    const autoBtn = document.createElement("button");
+    autoBtn.id = "mytube-autoscroll-btn";
+    autoBtn.textContent = "⏬";
+    Object.assign(autoBtn.style, secondaryStyle);
+    autoBtn.addEventListener("click", () => toggleAutoScroll(autoBtn));
+    const autoWrap = withTooltip(
+      autoBtn,
+      "Keep scrolling until every channel loads. Doesn't scan — click 📋 when done."
+    );
+
     const btn = document.createElement("button");
     btn.id = "mytube-scan-btn";
     btn.textContent = "📋 Scan channels";
     Object.assign(btn.style, {
-      ...BASE_OVERLAY_STYLE,
       background: "#FF8C00",
       color: "#000",
       border: "none",
+      borderRadius: "8px",
       padding: "10px 18px",
       fontSize: "14px",
       fontWeight: "600",
       cursor: "pointer",
+      boxShadow: "0 4px 16px rgba(0,0,0,.4)",
     });
     btn.addEventListener("click", () => {
       btn.textContent = "⏳ Scanning…";
@@ -191,10 +245,111 @@
       btn.style.pointerEvents = "none";
       runScan();
     });
-    document.body.appendChild(btn);
+
+    bar.appendChild(scrollWrap);
+    bar.appendChild(autoWrap);
+    bar.appendChild(btn);
+    document.body.appendChild(bar);
+  }
+
+  // Wrap a button in a relative container carrying a styled tooltip that appears
+  // instantly above it on hover — clearer and faster than the native `title`
+  // delay. Returns the wrapper to append in the button's place.
+  function withTooltip(button, text) {
+    const wrap = document.createElement("div");
+    wrap.style.position = "relative";
+    wrap.style.display = "flex";
+
+    const tip = document.createElement("span");
+    tip.textContent = text;
+    Object.assign(tip.style, {
+      position: "absolute",
+      bottom: "calc(100% + 8px)",
+      right: "0",
+      width: "max-content",
+      maxWidth: "240px",
+      background: "#17161A",
+      color: "#EDEAE4",
+      padding: "8px 10px",
+      borderRadius: "8px",
+      fontSize: "12px",
+      fontWeight: "400",
+      lineHeight: "1.35",
+      fontFamily: "system-ui, sans-serif",
+      boxShadow: "0 4px 16px rgba(0,0,0,.4)",
+      pointerEvents: "none",
+      opacity: "0",
+      transition: "opacity .12s ease",
+      whiteSpace: "normal",
+    });
+
+    wrap.appendChild(button);
+    wrap.appendChild(tip);
+    wrap.addEventListener("mouseenter", () => (tip.style.opacity = "1"));
+    wrap.addEventListener("mouseleave", () => (tip.style.opacity = "0"));
+    return wrap;
+  }
+
+  // Jump to the bottom of the scrolling container so YouTube requests the next
+  // batch of channels. Kept as a single jump (not a loop) because full lists can
+  // take a while to load — the user watches the count settle, then clicks again.
+  function scrollToBottom() {
+    const target = Math.max(
+      document.documentElement.scrollHeight,
+      document.body.scrollHeight
+    );
+    window.scrollTo({ top: target, behavior: "smooth" });
+  }
+
+  // Auto-scroll loop: jump to the bottom on an interval and stop once the page
+  // height has stayed flat for several ticks (YouTube ran out of channels to
+  // lazy-load). Deliberately never triggers the scan — the user reviews the
+  // loaded list and clicks "Scan channels" manually.
+  let autoScrollTimer = null;
+  function toggleAutoScroll(autoBtn) {
+    if (autoScrollTimer) {
+      stopAutoScroll(autoBtn);
+      return;
+    }
+    autoBtn.textContent = "⏸";
+    autoBtn.title = "Stop auto-scrolling";
+    autoBtn.style.background = "#FF8C00";
+    autoBtn.style.color = "#000";
+
+    let lastHeight = 0;
+    let stableTicks = 0;
+    // ~6 flat ticks (≈6s) with no new content means the list is fully loaded.
+    const STABLE_LIMIT = 6;
+    autoScrollTimer = setInterval(() => {
+      scrollToBottom();
+      const height = Math.max(
+        document.documentElement.scrollHeight,
+        document.body.scrollHeight
+      );
+      if (height > lastHeight) {
+        lastHeight = height;
+        stableTicks = 0;
+      } else if (++stableTicks >= STABLE_LIMIT) {
+        stopAutoScroll(autoBtn);
+      }
+    }, 1000);
+  }
+
+  function stopAutoScroll(autoBtn) {
+    clearInterval(autoScrollTimer);
+    autoScrollTimer = null;
+    autoBtn.textContent = "⏬";
+    autoBtn.title = "Auto-scroll until all channels load (does not scan)";
+    autoBtn.style.background = "#17161A";
+    autoBtn.style.color = "#EDEAE4";
   }
 
   function showBanner(total) {
+    if (autoScrollTimer) {
+      clearInterval(autoScrollTimer);
+      autoScrollTimer = null;
+    }
+    document.getElementById("mytube-scan-bar")?.remove();
     document.getElementById("mytube-scan-btn")?.remove();
     const el = document.createElement("div");
     el.textContent = total

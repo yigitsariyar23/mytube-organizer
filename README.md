@@ -23,13 +23,18 @@ Works in any Chromium browser — Chrome, Edge, Brave, Vivaldi.
 ## First use
 
 1. In the dashboard, click **"Scan Channels"**. YouTube's
-   `youtube.com/feed/channels` page opens in a new tab with a floating
-   **"📋 Scan channels"** button in the bottom-right corner.
-2. Scroll the page down until every channel you're subscribed to has loaded,
-   then click that button. The extension reads the channels and opens the
-   dashboard on a **review screen** listing what's new, what changed, and what
-   wasn't seen this scan — nothing is imported until you click **Apply
-   changes**. (Removals are unchecked by default; see [Scanning](#scanning-and-the-review-screen).)
+   `youtube.com/feed/channels` page opens in a new tab with a floating bar in
+   the bottom-right corner: **⬇** (jump to the bottom once), **⏬** (auto-scroll
+   until the list stops growing), and **"📋 Scan channels"**.
+2. Load every channel you're subscribed to, then click **"📋 Scan channels"**.
+   YouTube lazy-loads channels as you near the bottom, so either tap **⬇**
+   repeatedly (wait for each new batch to load between taps) or press **⏬** to
+   auto-scroll to the end — the scroll helpers only load channels, they never
+   scan, so you always trigger the scan yourself once the list is complete. The
+   extension then reads the channels and opens the dashboard on a **review
+   screen** listing what's new, what changed, and what wasn't seen this scan —
+   nothing is imported until you click **Apply changes**. (Removals are
+   unchecked by default; see [Scanning](#scanning-and-the-review-screen).)
 3. (Optional but recommended) Enter a YouTube Data API v3 key in **⚙ Settings**.
    It's used for video counts, subscriber counts and channel avatars. The
    extension works without a key too — you just get the last-video date (via
