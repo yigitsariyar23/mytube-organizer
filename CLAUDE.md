@@ -115,6 +115,9 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 
 ## Conventions
 
+- **Never commit any AI usage including co-author etc.** No `Co-Authored-By`
+  trailers, no "Generated with" lines, no AI attribution of any kind in commit
+  messages or PR bodies.
 - Vanilla everything. New UI = a `render*()` function reading from `state` +
   event delegation in `bindEvents()`. `state` in `dashboard.js` mirrors storage.
 - Always `escapeHtml()` any channel/folder/tag text interpolated into
