@@ -42,11 +42,12 @@ const DEFAULT_LANGUAGES = [
 let LANGUAGES = [...DEFAULT_LANGUAGES];
 const LANG_OTHER = "__other__";
 
-let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null };
+let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null, pendingPlaylistImport: null };
 let currentFolderId = "all";       // selected channel folder (Channels/New views)
 let currentListId = "all";         // selected Watch Later list
 let currentView = "channels";      // "channels" | "new" | "watchlater"
-let videoUnwatchedOnly = false;    // New/Watch Later: hide already-watched
+let newUnwatchedOnly = true;         // New feed: hide already-watched (on by default)
+let watchLaterUnwatchedOnly = true;  // Watch Later: hide already-watched (on by default)
 let videoSortKey = "date";         // "date" | "length"
 let videoSortDir = "desc";         // "desc" | "asc"
 let videoDetailsRequested = false; // guards the one-shot auto length/view fetch
@@ -56,8 +57,8 @@ const selectedChannelIds = new Set(); // multi-select highlight (ctrl/shift clic
 let selectionAnchor = null;           // last clicked id, the shift-range pivot
 const selectedVideoIds = new Set();   // video multi-select (New / Watch Later)
 let videoSelectionAnchor = null;      // shift-range pivot for video cards
-let filterActiveOnly = false;      // show only channels flagged "active"
-let filterFinishedOnly = false;    // show only channels flagged "finished"
+let filterActive = "";             // "" = off, "only" = active, "not" = inactive (active:false)
+let filterFinished = "";           // "" = off, "only" = finished, "not" = unfinished
 let searchQuery = "";
 let sortDate = "desc"; // "desc" (newest first) | "asc" (oldest first) | "none"
 let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
@@ -152,6 +153,13 @@ const el = {
   scanDiffBody: document.getElementById("scanDiffBody"),
   scanDiffApply: document.getElementById("scanDiffApply"),
   scanDiffCancel: document.getElementById("scanDiffCancel"),
+  playlistImportModal: document.getElementById("playlistImportModal"),
+  playlistImportName: document.getElementById("playlistImportName"),
+  playlistImportSummary: document.getElementById("playlistImportSummary"),
+  playlistImportWarning: document.getElementById("playlistImportWarning"),
+  playlistImportBody: document.getElementById("playlistImportBody"),
+  playlistImportApply: document.getElementById("playlistImportApply"),
+  playlistImportCancel: document.getElementById("playlistImportCancel"),
   viewChannelsBtn: document.getElementById("viewChannelsBtn"),
   viewNewBtn: document.getElementById("viewNewBtn"),
   viewWatchLaterBtn: document.getElementById("viewWatchLaterBtn"),
@@ -193,8 +201,9 @@ async function init() {
   bindEvents();
   setupColumnResize();
 
-  // A scan finished while the dashboard was closed — review it on open.
+  // A scan / playlist import finished while the dashboard was closed — review it on open.
   if (state.pendingScan) openScanDiffModal(state.pendingScan);
+  if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
@@ -211,6 +220,11 @@ async function init() {
       if (state.pendingScan) openScanDiffModal(state.pendingScan);
       else el.scanDiffModal.hidden = true;
     }
+    if (changes.pendingPlaylistImport) {
+      state.pendingPlaylistImport = changes.pendingPlaylistImport.newValue || null;
+      if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
+      else el.playlistImportModal.hidden = true;
+    }
     render();
   });
 }
@@ -222,6 +236,7 @@ const defaultFolders = () => ({ unsorted: { name: "Unsorted", order: 0 } });
 async function loadState() {
   const data = await chrome.storage.local.get([
     "channels", "folders", "tags", "videos", "videoFolders", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
+    "pendingPlaylistImport",
     "sortDate", "sortCount", "folderSort", "languages", "currentView", "colWidths", "videoSort",
   ]);
   state.channels = data.channels || {};
@@ -237,6 +252,7 @@ async function loadState() {
   state.gistId = data.gistId || "";
   state.lastSyncedAt = data.lastSyncedAt || null;
   state.pendingScan = data.pendingScan || null;
+  state.pendingPlaylistImport = data.pendingPlaylistImport || null;
   sortDate = data.sortDate === "asc" || data.sortDate === "none" ? data.sortDate : "desc";
   sortCount = data.sortCount === "desc" || data.sortCount === "asc" ? data.sortCount : "none";
   folderSort = ["alpha", "count-desc", "count-asc"].includes(data.folderSort) ? data.folderSort : "custom";
@@ -367,7 +383,7 @@ function getFilteredVideos() {
     if (v.hidden) return false;              // user-dismissed from the feed
     if (isUpcomingOrLive(v)) return false;   // live streams / scheduled premieres
     if (inFolder && !inFolder.has(ch.folderId)) return false;
-    if (videoUnwatchedOnly && v.watched) return false;
+    if (newUnwatchedOnly && v.watched) return false;
     if (q && !`${v.title} ${ch.name || ""}`.toLowerCase().includes(q)) return false;
     return true;
   });
@@ -408,10 +424,12 @@ function sortVideos(list) {
 // shot per session; the storage write it triggers re-renders with the data.
 function maybeFetchVideoDetails() {
   if (videoDetailsRequested || !state.apiKey) return;
-  const needs = Object.values(state.videos).some(
-    (v) => (v.duration === undefined || v.live === "live" || v.live === "upcoming") &&
-      (v.saved || (v.channelId && state.channels[v.channelId]?.trackVideos))
-  );
+  const needs = Object.values(state.videos).some((v) => {
+    // A saved video missing its channel name/avatar/date also needs a details pass.
+    if (v.saved && (!v.channelId || !v.channelThumbnail || !v.published)) return true;
+    return (v.duration === undefined || v.live === "live" || v.live === "upcoming") &&
+      (v.saved || (v.channelId && state.channels[v.channelId]?.trackVideos));
+  });
   if (!needs) return;
   videoDetailsRequested = true;
   chrome.runtime.sendMessage({ type: "FILL_VIDEO_DETAILS" });
@@ -428,7 +446,7 @@ function updateVideoSortButtons() {
 }
 
 function renderVideoFeed() {
-  el.videoUnwatchedChip.classList.toggle("on", videoUnwatchedOnly);
+  el.videoUnwatchedChip.classList.toggle("on", newUnwatchedOnly);
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
@@ -444,7 +462,7 @@ function renderVideoFeed() {
   el.statusText.textContent = vids.length ? `${vids.length} video${vids.length === 1 ? "" : "s"}` : "";
 
   if (!vids.length) {
-    const filtered = !!searchQuery.trim() || videoUnwatchedOnly;
+    const filtered = !!searchQuery.trim() || newUnwatchedOnly;
     el.videoFeed.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No videos match the current filters." : "No videos fetched yet — click Refresh Stats to pull them."}</p></div>`;
     return;
   }
@@ -471,7 +489,7 @@ function renderVideoFeed() {
 function videoCardHtml(v, mode) {
   const ch = v.channelId ? state.channels[v.channelId] : null;
   const channelName = ch?.name || v.author || "";
-  const avatarSrc = ch?.thumbnail || null;
+  const avatarSrc = ch?.thumbnail || v.channelThumbnail || null;
   const avatar = avatarSrc
     ? `<img src="${escapeHtml(avatarSrc)}" alt="" onerror="this.outerHTML='<span class=&quot;vc-avatar-fallback&quot;></span>'" />`
     : `<span class="vc-avatar-fallback"></span>`;
@@ -528,7 +546,7 @@ function getWatchLaterVideos() {
     if (!v.saved) return false;
     const fid = v.folderId || "unsorted";
     if (inList && !inList.has(fid)) return false;
-    if (videoUnwatchedOnly && v.watched) return false;
+    if (watchLaterUnwatchedOnly && v.watched) return false;
     const author = v.channelId ? state.channels[v.channelId]?.name : v.author;
     if (q && !`${v.title} ${author || ""}`.toLowerCase().includes(q)) return false;
     return true;
@@ -537,7 +555,7 @@ function getWatchLaterVideos() {
 }
 
 function renderWatchLater() {
-  el.videoUnwatchedChip.classList.toggle("on", videoUnwatchedOnly);
+  el.videoUnwatchedChip.classList.toggle("on", watchLaterUnwatchedOnly);
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
@@ -553,7 +571,7 @@ function renderWatchLater() {
   el.statusText.textContent = vids.length ? `${vids.length} video${vids.length === 1 ? "" : "s"}` : "";
 
   if (!vids.length) {
-    const filtered = !!searchQuery.trim() || videoUnwatchedOnly;
+    const filtered = !!searchQuery.trim() || watchLaterUnwatchedOnly;
     el.watchLaterGrid.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No saved videos match the current filters." : "This list is empty."}</p></div>`;
     return;
   }
@@ -1023,18 +1041,20 @@ function renderTagFilters() {
     bar.appendChild(chip);
   }
 
-  // Active / Finished toggle chips
+  // Active / Finished tri-state toggle chips: click cycles off → only → excluded.
   if (hasActive) {
     const chip = document.createElement("span");
-    chip.className = "tag-chip var-toggle" + (filterActiveOnly ? " on-active" : "");
-    chip.textContent = "Active";
+    const cls = filterActive === "only" ? " on-active" : filterActive === "not" ? " off-active" : "";
+    chip.className = "tag-chip var-toggle" + cls;
+    chip.textContent = filterActive === "not" ? "Inactive" : "Active";
     chip.dataset.role = "filter-active";
     bar.appendChild(chip);
   }
   if (hasFinished) {
     const chip = document.createElement("span");
-    chip.className = "tag-chip var-toggle" + (filterFinishedOnly ? " on-finished" : "");
-    chip.textContent = "Finished";
+    const cls = filterFinished === "only" ? " on-finished" : filterFinished === "not" ? " off-finished" : "";
+    chip.className = "tag-chip var-toggle" + cls;
+    chip.textContent = filterFinished === "not" ? "Unfinished" : "Finished";
     chip.dataset.role = "filter-finished";
     bar.appendChild(chip);
   }
@@ -1106,8 +1126,8 @@ function setupScrollObserver() {
 function resetVariableFilters() {
   activeTagFilters.clear();
   activeLangFilters.clear();
-  filterActiveOnly = false;
-  filterFinishedOnly = false;
+  filterActive = "";
+  filterFinished = "";
 }
 
 // Any filter that can hide channels within the current folder view. Excludes
@@ -1117,8 +1137,8 @@ function anyFilterActive() {
     !!searchQuery.trim() ||
     activeTagFilters.size > 0 ||
     activeLangFilters.size > 0 ||
-    filterActiveOnly ||
-    filterFinishedOnly ||
+    filterActive !== "" ||
+    filterFinished !== "" ||
     filterMinCount !== null ||
     filterMaxCount !== null ||
     !!filterAfterDate ||
@@ -1160,11 +1180,15 @@ function getFilteredChannels() {
   if (activeLangFilters.size) {
     list = list.filter((c) => activeLangFilters.has(c.language));
   }
-  if (filterActiveOnly) {
+  if (filterActive === "only") {
     list = list.filter((c) => c.active);
+  } else if (filterActive === "not") {
+    list = list.filter((c) => !c.active);
   }
-  if (filterFinishedOnly) {
+  if (filterFinished === "only") {
     list = list.filter((c) => c.finished);
+  } else if (filterFinished === "not") {
+    list = list.filter((c) => !c.finished);
   }
   const q = searchQuery.trim().toLowerCase();
   if (q) {
@@ -1429,6 +1453,83 @@ function openScanDiffModal(scan) {
 
   el.scanDiffApply.disabled = added.length === 0 && modified.length === 0 && removed.length === 0;
   el.scanDiffModal.hidden = false;
+}
+
+// ---------- Playlist import review dialog ----------
+// Background stashed a fetched playlist as `pendingPlaylistImport`; here the user
+// names the list and decides, per video already in Watch Later, whether to move
+// it into the new list. New videos are always added.
+
+function openPlaylistImportModal(pending) {
+  const vids = pending.videos || [];
+  const fresh = vids.filter((v) => v.status !== "savedElsewhere");
+  const dupes = vids.filter((v) => v.status === "savedElsewhere");
+
+  el.playlistImportName.value = pending.title || "Imported playlist";
+  el.playlistImportSummary.textContent =
+    `${vids.length} video${vids.length === 1 ? "" : "s"} — ${fresh.length} new, ` +
+    `${dupes.length} already in Watch Later`;
+
+  // Correctness check: the scraper reports the playlist's own "N videos" count.
+  // If we captured fewer, the list wasn't fully scrolled — warn, don't block.
+  const stated = pending.statedCount;
+  const scraped = pending.scrapedCount ?? vids.length;
+  if (stated != null && scraped < stated) {
+    el.playlistImportWarning.hidden = false;
+    el.playlistImportWarning.textContent =
+      `Only ${scraped} of the playlist's ${stated} videos were captured. Re-run the import ` +
+      `and let the playlist page finish scrolling to the bottom to get them all.`;
+  } else {
+    el.playlistImportWarning.hidden = true;
+  }
+
+  el.playlistImportBody.innerHTML = "";
+  el.playlistImportBody.appendChild(buildPlaylistSection("New — will be added to this list", "add", fresh, false));
+  el.playlistImportBody.appendChild(buildPlaylistSection("Already in Watch Later — tick to move here", "mod", dupes, true));
+
+  el.playlistImportApply.disabled = vids.length === 0;
+  el.playlistImportModal.hidden = false;
+}
+
+// One section of the import review. `movable` rows carry a "move into this list"
+// checkbox (`data-move-id`); non-movable rows are informational.
+function buildPlaylistSection(title, kind, items, movable) {
+  const sec = document.createElement("div");
+  sec.className = "scan-diff-section";
+  sec.appendChild(buildDiffSectionHeader(title, kind, items.length));
+
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "scan-diff-empty";
+    empty.textContent = "None";
+    sec.appendChild(empty);
+    return sec;
+  }
+
+  const list = document.createElement("div");
+  list.className = "scan-diff-list";
+  for (const it of items) {
+    const sub = movable
+      ? `currently in “${escapeHtml(listName(it.currentFolderId))}”`
+      : escapeHtml(it.author || "");
+    const text =
+      `<span class="scan-diff-text"><b>${escapeHtml(it.title || it.id)}</b>` +
+      (sub ? `<span class="scan-diff-sub">${sub}</span>` : "") +
+      `</span>`;
+    const row = document.createElement(movable ? "label" : "div");
+    row.className = "scan-diff-row";
+    row.innerHTML = movable
+      ? `<input type="checkbox" data-move-id="${escapeHtml(it.id)}" />${text}`
+      : text;
+    list.appendChild(row);
+  }
+  sec.appendChild(list);
+  return sec;
+}
+
+// Resolve a Watch Later list id to its display name (falls back to the id).
+function listName(id) {
+  return state.videoFolders[id]?.name || id || "Unsorted";
 }
 
 // ---------- Sync review dialog ----------
@@ -1740,9 +1841,9 @@ function bindEvents() {
       if (activeLangFilters.has(lang)) activeLangFilters.delete(lang);
       else activeLangFilters.add(lang);
     } else if (role === "filter-active") {
-      filterActiveOnly = !filterActiveOnly;
+      filterActive = filterActive === "" ? "only" : filterActive === "only" ? "not" : "";
     } else if (role === "filter-finished") {
-      filterFinishedOnly = !filterFinishedOnly;
+      filterFinished = filterFinished === "" ? "only" : filterFinished === "only" ? "not" : "";
     } else {
       return;
     }
@@ -1770,7 +1871,8 @@ function bindEvents() {
 
   el.videoFilters.addEventListener("click", (e) => {
     if (e.target.dataset.role !== "filter-unwatched") return;
-    videoUnwatchedOnly = !videoUnwatchedOnly;
+    if (currentView === "watchlater") watchLaterUnwatchedOnly = !watchLaterUnwatchedOnly;
+    else newUnwatchedOnly = !newUnwatchedOnly;
     renderActiveVideoView();
   });
 
@@ -2364,6 +2466,37 @@ function bindEvents() {
   el.scanDiffCancel.addEventListener("click", async () => {
     el.scanDiffModal.hidden = true;
     await chrome.runtime.sendMessage({ type: "DISCARD_SCAN" });
+  });
+
+  // Playlist import dialog
+  el.playlistImportApply.addEventListener("click", async () => {
+    const moveIds = Array.from(
+      el.playlistImportBody.querySelectorAll("input[data-move-id]:checked")
+    ).map((box) => box.dataset.moveId);
+    const newListName = el.playlistImportName.value.trim();
+    el.playlistImportApply.disabled = true;
+    el.statusText.textContent = "Importing playlist…";
+    const res = await chrome.runtime.sendMessage({ type: "APPLY_PLAYLIST_IMPORT", listName: newListName, moveIds });
+    el.playlistImportApply.disabled = false;
+    el.playlistImportModal.hidden = true;
+    await loadState();
+    if (res?.ok) {
+      currentView = "watchlater";
+      currentListId = res.listId;
+      searchQuery = "";
+      el.searchInput.value = "";
+      clearVideoSelection();
+      await chrome.storage.local.set({ currentView });
+      el.statusText.textContent = `Imported ${res.added + res.moved} video${res.added + res.moved === 1 ? "" : "s"} into the list.`;
+    } else {
+      el.statusText.textContent = res?.error || "Could not import playlist.";
+    }
+    render();
+  });
+
+  el.playlistImportCancel.addEventListener("click", async () => {
+    el.playlistImportModal.hidden = true;
+    await chrome.runtime.sendMessage({ type: "DISCARD_PLAYLIST_IMPORT" });
   });
 
   // Sync diff dialog

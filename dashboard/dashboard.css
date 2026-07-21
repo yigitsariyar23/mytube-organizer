@@ -430,6 +430,14 @@ html, body {
   margin: -6px 0 16px;
 }
 
+/* The `display: flex` above outranks the `hidden` attribute's UA display:none,
+   so honor it explicitly — otherwise the channel filter chips (tags, languages,
+   Active/Finished) stay visible on the New/Watch Later views where they don't
+   belong. */
+.tag-filter-bar[hidden] {
+  display: none;
+}
+
 .tag-filter-label {
   font-size: 11px;
   text-transform: uppercase;
@@ -630,6 +638,20 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   color: #1a1220;
   background: #C792EA;
   border-color: transparent;
+}
+
+/* Excluded ("not") state of the tri-state Active/Finished filter chips:
+   muted fill so it reads as the inverse of the solid "only" state above. */
+.var-toggle.off-active {
+  color: #0f1a12;
+  background: color-mix(in srgb, var(--ok, #6FCF97) 45%, transparent);
+  border-color: var(--ok, #6FCF97);
+}
+
+.var-toggle.off-finished {
+  color: var(--text, #e6e6e6);
+  background: color-mix(in srgb, #56B6E9 40%, transparent);
+  border-color: #56B6E9;
 }
 
 .channel-row .tag-chip,

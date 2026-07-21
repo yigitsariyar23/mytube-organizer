@@ -51,9 +51,14 @@ folders: { [folderId]: { name, order, parentId?, emoji? } }   // channel folders
 tags:    { [tagId]: { name, color } }
 videoFolders: { [folderId]: { name, order, parentId?, emoji? } }  // Watch Later lists; same shape/rules as folders
 videos:  { [videoId]: {
-  id, channelId,            // channelId null for a manually-saved video (added via YouTube right-click)
-  title, author,            // author = channel name for manual saves (no channel record); else null
-  published,                // ISO | null (null for manual saves — oEmbed has no upload date)
+  id, channelId,            // null for a manual/imported save until backfilled (oEmbed author_url or the
+                            //   playlist byline scrape when a /channel/UC… id is present, else the API snippet)
+  title, author,            // author = channel name for saves with no channel record; else null
+  published,                // ISO | null (null for manual/imported saves — oEmbed & the scrape have no
+                            //   upload date; backfilled from the API snippet on the next details pass)
+  channelThumbnail,         // string | absent — channel avatar url for saved videos whose channel ISN'T a
+                            //   subscription (subscriptions read the avatar from `channels`); filled by
+                            //   fillChannelThumbnails (API snippet), so the Watch Later card shows a photo
   thumbnail, watched,
   viewCount,                // number | null — from RSS media:statistics (free), refreshed by the API
   duration,                 // seconds | null (API contentDetails); undefined = "not yet fetched"
@@ -72,6 +77,11 @@ sortDate, sortCount, folderSort, currentView                  // persisted UI pr
 colWidths                                                    // number[5] | absent — resized px widths of the 5 sized table columns
 pendingScan: { scannedAt, scannedCount, unresolved, added[], modified[], removed[] }
               // a scan awaiting review; never applied to `channels` until confirmed, never synced
+pendingPlaylistImport: { playlistId, title, fetchedAt, statedCount, scrapedCount, videos[] }
+              // a scraped playlist awaiting review; each video carries { id, title, published,
+              // thumbnail, channelId, author, status:"new"|"savedElsewhere", currentFolderId }.
+              // statedCount = the page's "N videos"; scrapedCount = how many we captured (a
+              // shortfall warns the user to re-scroll). Never applied until confirmed, never synced
 ```
 
 - **Folder nesting is one level deep.** A folder with children is a "parent";
@@ -95,6 +105,9 @@ and reply through `sendResponse` (async, so each returns `true`).
 | `FILL_MISSING_AVATARS` | — | `{ ok, hasApiKey, missingBefore, thumbsFilled, missingAfter, apiFailures, lastError }` |
 | `FILL_VIDEO_DETAILS` | — | `{ ok, hasApiKey, queried, filled, apiFailures, lastError }` (fills video length/views) |
 | `FETCH_ALL_VIDEOS` | `{ channelIds }` | `{ ok, hasApiKey, channels, total, added, apiFailures, lastError }` (deep-fetch full upload history) |
+| `PLAYLIST_SCAN_RESULT` | `{ playlistId, title, videos, statedCount, scrapedCount }` (from the injected scraper) | `{ ok, count }`; stashes `pendingPlaylistImport`, opens dashboard |
+| `APPLY_PLAYLIST_IMPORT` | `{ listName, moveIds }` | `{ ok, listId, added, moved }` (creates a Watch Later list, saves the reviewed playlist into it) |
+| `DISCARD_PLAYLIST_IMPORT` | — | `{ ok }` (clears `pendingPlaylistImport`) |
 | `SYNC_GIST` | — | `{ ok, gistId, lastSyncedAt }` (background union merge) |
 | `FETCH_SYNC_DIFF` | `{ direction }` | `{ ok, direction, channels: { added, removed, modified } }` |
 | `APPLY_UPLOAD` | `{ removeFromGistIds }` | `{ ok, gistId, lastSyncedAt }` |
@@ -133,9 +146,15 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     populated only via the context menu (below), by design.
   - **Length & views.** View count comes from the RSS feed (`media:statistics`,
     free). **Duration is not in RSS** — `fillVideoDetails` backfills it (and
-    fresher view counts) via `videos.list?part=contentDetails,statistics` when an
-    API key is set, only for videos whose `duration` is still `undefined` (cheap,
-    self-limiting). It runs during a full refresh *and* on demand: the dashboard
+    fresher view counts) via `videos.list?part=contentDetails,statistics,snippet`
+    when an API key is set, only for videos whose `duration` is still `undefined`
+    (cheap, self-limiting). The `snippet` part also backfills `channelId`/`author`/
+    `published` for manual/imported saves that lacked them, and `fillVideoDetails`
+    then calls `fillChannelThumbnails` (channels.list snippet) to stamp
+    `channelThumbnail` on any **saved** video whose channel isn't a subscription —
+    so Watch Later cards get a channel name, date, and avatar. `videoNeedsChannel`
+    keeps re-querying a saved video until all of those are set (not just until its
+    duration fills). It runs during a full refresh *and* on demand: the dashboard
     fires `FILL_VIDEO_DETAILS` (one shot per session) when a video view opens with
     missing lengths + a key, so lengths appear without a manual refresh. Both
     video views share a **sort** (date/length × asc/desc, persisted as
@@ -176,6 +195,29 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   **oEmbed** endpoint, stores it in `videos` with `saved:true, folderId:"unsorted"`,
   and fires a confirming notification. No URL pasting — the extension captures the
   video from the page.
+- **Importing a playlist into Watch Later (context menu, scrape-based).**
+  Right-click a YouTube playlist page or playlist link → "Import playlist to MyTube
+  Watch Later". The Data API can't read *private* playlists (and needs a key), so
+  instead of fetching, the background **scrapes the open, logged-in playlist page**
+  — mirroring the subscription `SCAN_RESULT` flow but on demand. `importPlaylistFromPage`
+  injects `scrapePlaylistInPage` (via `chrome.scripting.executeScript`, needs the
+  `scripting` permission) into the playlist tab — opening the playlist in a new tab
+  first if the click came from a link elsewhere. The injected function shows a
+  progress banner, **auto-scrolls to the bottom** until the (virtualized) video list
+  stops growing or reaches the page's stated "N videos" count, scrapes each video's
+  id + title + **channel byline** (id/name, read by climbing from the video anchor
+  to its row — not tied to renderer tag names, any `/watch?v=` anchor plus any
+  `/channel/`,`/@` link), grabs the
+  playlist title (page H1 → tab title fallback), and posts `PLAYLIST_SCAN_RESULT`.
+  `handlePlaylistScanResult` classifies each video vs the store (new vs
+  `savedElsewhere`), stashes `pendingPlaylistImport` (incl. `statedCount`/`scrapedCount`),
+  and opens the dashboard, which shows `openPlaylistImportModal` — the user edits
+  the list name (defaults to the playlist title), sees a **warning if fewer videos
+  were captured than the playlist claims**, and per already-saved video ticks
+  whether to move it into the new list; new videos are always added.
+  `APPLY_PLAYLIST_IMPORT` creates the `videoFolders` list and saves the videos
+  (`saved:true`, `folderId` = new list); lengths/views backfill via `fillVideoDetails`
+  only if an API key is set. **No API key required**; works for private/unlisted/public.
 - **Sync.** Directional (`FETCH_SYNC_DIFF` → review → `APPLY_UPLOAD`/
   `APPLY_DOWNLOAD`) surfaces every change for confirmation. The background
   `SYNC_GIST` is a silent **union merge**: local wins on names, tags combine,

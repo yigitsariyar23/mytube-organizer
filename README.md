@@ -174,8 +174,10 @@ too many channels to keep up with YouTube's own subscriptions feed.
   when you enable Track on a single channel).
 - **Organized your way.** Reuses your channel **folder sidebar** — select a
   folder to see only its tracked channels' videos, grouped by day. **Sort** by
-  date or length (each click toggles ascending/descending). Filter with the
-  **Unwatched** chip or **Mark all watched**.
+  date or length (each click toggles ascending/descending). The New feed shows
+  **only unwatched** videos by default — toggle the **Unwatched** chip off to see
+  everything, or **Mark all watched** to clear what you've seen. (Watch Later
+  shows all saved videos by default.)
 - **Length & views.** Each card shows the video's view count; with an API key set
   it also shows the **duration** (length isn't available from the free RSS feed).
   Lengths fetch automatically when you open a video view with a key set.
@@ -205,6 +207,15 @@ rename/delete). Independent of the New feed.
   right-click a video (or the watch page itself) → **“Save to MyTube Watch
   Later.”** The extension grabs the video and fetches its title automatically —
   no copy-pasting URLs, no API key. A notification confirms the save.
+- **Import a whole playlist.** Right-click a YouTube playlist page (or a playlist
+  link) → **“Import playlist to MyTube Watch Later.”** MyTube reads the playlist
+  straight from the page — auto-scrolling to the bottom to load every video — so it
+  works for your **private, unlisted, and public** playlists alike, with **no API
+  key needed**. It then opens a review dialog where you name the new list (prefilled
+  with the playlist’s name) and — for any video you’ve already saved elsewhere —
+  choose whether to move it in. If it captured fewer videos than the playlist lists
+  (a very long playlist that didn’t finish loading), it warns you to re-run.
+  Confirm, and every video lands in a fresh list named after the playlist.
 - **Organize into lists.** Saved videos start in **Unsorted**. Create lists with
   **+ New list**, nest them one level deep, and right-click a video → **Move to
   list**. Right-click a list to rename, set an emoji, add a sub-list, or delete.

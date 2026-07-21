@@ -216,6 +216,22 @@
     </div>
   </div>
 
+  <!-- Playlist import review panel -->
+  <div id="playlistImportModal" class="modal" hidden>
+    <div class="modal-box modal-box-wide">
+      <h2>Import playlist to Watch Later</h2>
+      <label class="field-label" for="playlistImportName">List name</label>
+      <input id="playlistImportName" class="field-input" type="text" />
+      <p id="playlistImportSummary" class="field-hint"></p>
+      <div id="playlistImportWarning" class="scan-warning" hidden></div>
+      <div id="playlistImportBody" class="scan-diff-body"></div>
+      <div class="modal-actions">
+        <button id="playlistImportCancel" class="btn btn-ghost">Cancel</button>
+        <button id="playlistImportApply" class="btn btn-primary">Import</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Right-click menu -->
   <div id="contextMenu" class="context-menu" hidden></div>
   <div id="contextSubmenu" class="context-submenu" hidden></div>

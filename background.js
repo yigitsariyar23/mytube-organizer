@@ -119,10 +119,15 @@ chrome.runtime.onStartup?.addListener(() => setupContextMenus());
 // ---------- "Save to Watch Later" context menu (YouTube pages) ----------
 
 const CTX_SAVE_ID = "mytube-save-watchlater";
+const CTX_IMPORT_ID = "mytube-import-playlist";
 const YT_VIDEO_TARGETS = [
   "*://*.youtube.com/watch*",
   "*://*.youtube.com/shorts/*",
   "*://youtu.be/*",
+];
+const YT_PLAYLIST_TARGETS = [
+  "*://*.youtube.com/playlist*",
+  "*://*.youtube.com/watch*list=*",
 ];
 
 // Recreate the right-click items idempotently (removeAll first avoids duplicate-id
@@ -144,10 +149,33 @@ function setupContextMenus() {
       contexts: ["page", "video"],
       documentUrlPatterns: YT_VIDEO_TARGETS,
     });
+    // Right-click a playlist link (sidebar, cards) anywhere on YouTube.
+    chrome.contextMenus.create({
+      id: CTX_IMPORT_ID + "-link",
+      title: "Import playlist to MyTube Watch Later",
+      contexts: ["link"],
+      targetUrlPatterns: YT_PLAYLIST_TARGETS,
+    });
+    // Right-click anywhere on a playlist page itself.
+    chrome.contextMenus.create({
+      id: CTX_IMPORT_ID + "-page",
+      title: "Import playlist to MyTube Watch Later",
+      contexts: ["page"],
+      documentUrlPatterns: ["*://*.youtube.com/playlist*"],
+    });
   });
 }
 
-chrome.contextMenus?.onClicked.addListener(async (info) => {
+chrome.contextMenus?.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId.startsWith(CTX_IMPORT_ID)) {
+    const playlistId = extractPlaylistId(info.linkUrl || info.pageUrl || "");
+    if (!playlistId) {
+      notify("mytube-import", "MyTube", "Couldn't find a playlist in that link.");
+      return;
+    }
+    await importPlaylistFromPage(tab, playlistId);
+    return;
+  }
   if (!info.menuItemId.startsWith(CTX_SAVE_ID)) return;
   const videoId = extractVideoId(info.linkUrl || info.pageUrl || "");
   if (!videoId) {
@@ -168,6 +196,13 @@ function extractVideoId(url) {
   return m ? m[1] : null;
 }
 
+// Pull a playlist id out of a playlist / watch?...&list= URL.
+function extractPlaylistId(url) {
+  if (!url) return null;
+  const m = url.match(/[?&]list=([0-9A-Za-z_-]+)/);
+  return m ? m[1] : null;
+}
+
 // Add a video to the Watch Later store. Title/author come from YouTube's public
 // oEmbed endpoint (no API key, no quota); the thumbnail is derived from the id.
 async function saveVideoToWatchLater(videoId) {
@@ -182,6 +217,7 @@ async function saveVideoToWatchLater(videoId) {
 
   let title = existing?.title || `Video ${videoId}`;
   let author = existing?.author || null;
+  let channelId = existing?.channelId || null;
   try {
     const res = await fetch(
       `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
@@ -190,6 +226,10 @@ async function saveVideoToWatchLater(videoId) {
       const meta = await res.json();
       if (meta.title) title = meta.title;
       if (meta.author_name) author = meta.author_name;
+      // author_url is sometimes the /channel/UC… form (else a /@handle we can't
+      // resolve without the API); grab the id when it's there.
+      const idm = (meta.author_url || "").match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
+      if (idm && !channelId) channelId = idm[1];
     }
   } catch (e) {
     // Keep the fallback title; the save still succeeds offline.
@@ -198,7 +238,7 @@ async function saveVideoToWatchLater(videoId) {
   videos[videoId] = {
     ...(existing || {}),
     id: videoId,
-    channelId: existing?.channelId || null,
+    channelId,
     title,
     author,
     published: existing?.published || null,
@@ -217,6 +257,272 @@ async function saveVideoToWatchLater(videoId) {
   }
   await chrome.storage.local.set({ videos, videoFolders });
   notify("mytube-save", "Saved to Watch Later", title);
+}
+
+// ---------- Import a whole playlist into Watch Later ----------
+// The Data API can't read *private* playlists (and needs a key), so instead of
+// fetching we scrape the open, logged-in playlist page: a content function is
+// injected into the tab, auto-scrolls to load every video (a playlist list is
+// virtualized), and posts the results back as `PLAYLIST_SCAN_RESULT` — mirroring
+// the subscription `SCAN_RESULT` flow. No API key; works for private/unlisted/
+// public. The background then stashes `pendingPlaylistImport` and opens the
+// dashboard, which shows the review dialog (per-video duplicate decisions).
+
+async function importPlaylistFromPage(tab, playlistId) {
+  // We can only scrape a tab that is actually showing this playlist. A right-click
+  // on the playlist page uses that tab; a right-click on a playlist *link*
+  // elsewhere opens the playlist in a new tab first.
+  let tabId = tab?.id;
+  const onPlaylistPage =
+    tab?.url && /\/playlist\b/.test(tab.url) && extractPlaylistId(tab.url) === playlistId;
+  if (!onPlaylistPage) {
+    try {
+      const created = await chrome.tabs.create({
+        url: `https://www.youtube.com/playlist?list=${playlistId}`,
+        active: true,
+      });
+      tabId = created.id;
+      await waitForTabComplete(tabId);
+    } catch (e) {
+      notify("mytube-import", "MyTube", "Couldn't open the playlist to read it.");
+      return;
+    }
+  }
+  if (tabId == null) {
+    notify("mytube-import", "MyTube", "Couldn't find the playlist tab to read.");
+    return;
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: scrapePlaylistInPage,
+      args: [playlistId],
+    });
+  } catch (e) {
+    notify("mytube-import", "MyTube", "Couldn't read the playlist page: " + (e?.message || e));
+  }
+}
+
+// Poll until a tab reports `status: "complete"` (or a timeout). No `tabs`
+// permission needed — host access to youtube.com covers reading its status.
+async function waitForTabComplete(tabId, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.status === "complete") return;
+    } catch (e) {
+      return; // tab gone
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+// Injected into the playlist page (runs in the page's isolated content world, so
+// it has `chrome.runtime`). Self-contained — executeScript serializes it, so it
+// can close over nothing but its `playlistId` arg. Auto-scrolls until the video
+// list stops growing (or reaches the page's stated "N videos" count), scrapes
+// each video's id + title, then posts them to the background.
+async function scrapePlaylistInPage(playlistId) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // A small fixed progress banner so the user understands why the page scrolls.
+  const banner = document.createElement("div");
+  Object.assign(banner.style, {
+    position: "fixed", bottom: "24px", right: "24px", zIndex: 2147483647,
+    background: "#17161A", color: "#EDEAE4", padding: "10px 16px", borderRadius: "8px",
+    font: "13px system-ui, sans-serif", boxShadow: "0 4px 16px rgba(0,0,0,.4)",
+  });
+  banner.textContent = "MyTube: reading playlist…";
+  document.body.appendChild(banner);
+
+  // Read the stated "N videos" count from a standalone stat element (language-
+  // tolerant: matches "51 videos" / "51 video"). Used as a scroll target + a
+  // correctness check surfaced in the review dialog.
+  function statedCount() {
+    for (const el of document.querySelectorAll("yt-formatted-string, span, div")) {
+      const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      const m = t.match(/^([\d][\d., ]*)\s+videos?$/i);
+      if (m) { const n = parseInt(m[1].replace(/[^\d]/g, ""), 10); if (n) return n; }
+    }
+    return null;
+  }
+
+  // Climb from a video anchor to its row and read the channel byline (name +
+  // id). The smallest ancestor that contains a channel anchor is the row, so
+  // walking up and returning at the first hit keeps us on this video's channel.
+  // Not tied to renderer tag names — matches any /channel/UC… or /@handle link.
+  function channelFromRow(anchor) {
+    for (let node = anchor.parentElement, depth = 0; node && depth < 10; node = node.parentElement, depth++) {
+      const ch = node.querySelector('a[href^="/channel/"], a[href^="/@"], a[href^="/c/"], a[href^="/user/"]');
+      if (!ch) continue;
+      const href = ch.getAttribute("href") || "";
+      const idm = href.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
+      const name = (ch.textContent || "").replace(/\s+/g, " ").trim();
+      return { channelId: idm ? idm[1] : null, author: name || null };
+    }
+    return { channelId: null, author: null };
+  }
+
+  const byId = new Map();
+  function collect() {
+    // Not tied to renderer tag names (YouTube changes them): any anchor whose
+    // href is a /watch?v=… video inside the playlist page.
+    for (const a of document.querySelectorAll('a[href*="watch?v="], a#video-title')) {
+      const href = a.getAttribute("href") || "";
+      const m = href.match(/[?&]v=([0-9A-Za-z_-]{11})/);
+      if (!m) continue;
+      const id = m[1];
+      const title = (a.getAttribute("title") || a.textContent || "").replace(/\s+/g, " ").trim();
+      const ch = channelFromRow(a);
+      const cur = byId.get(id);
+      if (!cur) byId.set(id, { videoId: id, title, channelId: ch.channelId, author: ch.author });
+      else {
+        if (title && title.length > (cur.title || "").length) cur.title = title;
+        if (!cur.channelId && ch.channelId) cur.channelId = ch.channelId;
+        if (!cur.author && ch.author) cur.author = ch.author;
+      }
+    }
+  }
+
+  // Wait for the first items to hydrate (SPA nav can lag behind "complete").
+  for (let i = 0; i < 20 && !document.querySelector('a[href*="watch?v="]'); i++) await sleep(400);
+
+  const target = statedCount();
+  collect();
+  let stable = 0;
+  // Scroll to the bottom repeatedly; stop when no new videos appear for several
+  // ticks, when we've reached the stated count, or at a hard safety cap.
+  for (let i = 0; i < 400; i++) {
+    if (target && byId.size >= target) break;
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    await sleep(650);
+    const before = byId.size;
+    collect();
+    if (byId.size > before) { stable = 0; }
+    else if (++stable >= 5) break;
+    banner.textContent = target
+      ? `MyTube: reading playlist… ${byId.size}/${target}`
+      : `MyTube: reading playlist… ${byId.size}`;
+  }
+  collect();
+
+  const videos = Array.from(byId.values());
+  banner.textContent = `MyTube: found ${videos.length}${target ? ` of ${target}` : ""} videos — opening review…`;
+  setTimeout(() => banner.remove(), 6000);
+
+  // Playlist title: prefer the page H1, fall back to the tab title ("Name - YouTube").
+  const h1 = document.querySelector("h1 yt-formatted-string, h1 #text, h1")?.textContent?.trim();
+  const title = h1 || (document.title || "").replace(/\s*-\s*YouTube\s*$/, "").trim() || "Imported playlist";
+
+  chrome.runtime.sendMessage({
+    type: "PLAYLIST_SCAN_RESULT",
+    playlistId,
+    title,
+    videos,
+    statedCount: target,
+    scrapedCount: videos.length,
+  });
+}
+
+// Turn a scraped playlist into a reviewable `pendingPlaylistImport` and open the
+// dashboard — the video analogue of `handleScanResult`.
+async function handlePlaylistScanResult(msg) {
+  const videos = msg.videos || [];
+  if (!videos.length) {
+    notify("mytube-import", "MyTube", "No videos found on that playlist page — try scrolling it, then re-run.");
+    return { ok: false, count: 0 };
+  }
+  const { videos: store = {} } = await chrome.storage.local.get("videos");
+  const pendingVideos = videos.map((v) => {
+    const existing = store[v.videoId];
+    const savedElsewhere = existing?.saved === true;
+    return {
+      id: v.videoId,
+      title: v.title,
+      published: null,
+      thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
+      channelId: existing?.channelId || v.channelId || null,
+      author: existing?.author || v.author || null,
+      status: savedElsewhere ? "savedElsewhere" : "new",
+      currentFolderId: savedElsewhere ? (existing.folderId || "unsorted") : null,
+    };
+  });
+
+  await chrome.storage.local.set({
+    pendingPlaylistImport: {
+      playlistId: msg.playlistId,
+      title: msg.title || "Imported playlist",
+      fetchedAt: Date.now(),
+      statedCount: msg.statedCount ?? null,
+      scrapedCount: msg.scrapedCount ?? pendingVideos.length,
+      videos: pendingVideos,
+    },
+  });
+  await openDashboard();
+  return { ok: true, count: pendingVideos.length };
+}
+
+// Commit a reviewed playlist import: create a new Watch Later list and save the
+// playlist's videos into it. New videos always land in the new list; a video
+// already in Watch Later moves only if the user ticked it (`moveIds`).
+async function applyPlaylistImport(listName, moveIds) {
+  const { pendingPlaylistImport, videos = {}, videoFolders = {}, apiKey } =
+    await chrome.storage.local.get(["pendingPlaylistImport", "videos", "videoFolders", "apiKey"]);
+  if (!pendingPlaylistImport) return { ok: false, error: "No pending playlist import." };
+  if (!videoFolders.unsorted) videoFolders.unsorted = { name: "Unsorted", order: 0 };
+
+  const name = (listName || pendingPlaylistImport.title || "Imported playlist").trim() || "Imported playlist";
+  const listId = slugify(name) + "-" + Date.now().toString(36).slice(-4);
+  const siblings = Object.values(videoFolders).filter((f) => !f.parentId);
+  videoFolders[listId] = { name, order: siblings.length };
+
+  const move = new Set(moveIds || []);
+  const now = Date.now();
+  const newIds = [];
+  let added = 0, moved = 0;
+  for (const v of pendingPlaylistImport.videos) {
+    const existing = videos[v.id];
+    let folderId;
+    if (v.status === "savedElsewhere") {
+      if (!move.has(v.id)) { continue; } // leave it in its current list untouched
+      folderId = listId;
+      moved++;
+    } else {
+      folderId = listId;
+      added++;
+    }
+    if (existing?.duration === undefined) newIds.push(v.id);
+    videos[v.id] = {
+      ...(existing || {}),
+      id: v.id,
+      channelId: existing?.channelId ?? v.channelId ?? null,
+      title: existing?.title || v.title || `Video ${v.id}`,
+      author: existing?.author ?? v.author ?? null,
+      published: existing?.published ?? v.published ?? null,
+      thumbnail: existing?.thumbnail || v.thumbnail || `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
+      viewCount: existing?.viewCount ?? null,
+      watched: existing?.watched || false,
+      saved: true,
+      folderId,
+      addedAt: existing?.addedAt || now,
+    };
+  }
+
+  await chrome.storage.local.set({ videos, videoFolders });
+  // Backfill lengths/views for the newly-saved videos if a key is set.
+  if (apiKey && newIds.length) {
+    await fillVideoDetails(videos, apiKey, newIds);
+    await chrome.storage.local.set({ videos });
+  }
+  await chrome.storage.local.remove("pendingPlaylistImport");
+  notify("mytube-import", "Playlist imported", `${added + moved} video${added + moved === 1 ? "" : "s"} → “${name}”`);
+  return { ok: true, listId, added, moved };
+}
+
+// Minimal slugify mirroring the dashboard's, for building list ids here.
+function slugify(name) {
+  return name.trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-çğıöşü]/g, "");
 }
 
 // Generic single-line OS notification.
@@ -290,6 +596,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "FETCH_ALL_VIDEOS") {
     fetchAllVideosForChannels(msg.channelIds || []).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "PLAYLIST_SCAN_RESULT") {
+    handlePlaylistScanResult(msg).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "APPLY_PLAYLIST_IMPORT") {
+    applyPlaylistImport(msg.listName, msg.moveIds || []).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "DISCARD_PLAYLIST_IMPORT") {
+    chrome.storage.local.remove("pendingPlaylistImport").then(() => sendResponse({ ok: true }));
     return true;
   }
   if (msg.type === "SYNC_GIST") {
@@ -751,12 +1069,21 @@ function videoNeedsDetails(v) {
   return v.duration === undefined || v.live === "live" || v.live === "upcoming";
 }
 
+// A saved (Watch Later) video still missing channel identity, avatar, or upload
+// date. These are re-queried even once their duration is filled, so a manual/
+// imported save gets a channel name + photo + date on the next details pass.
+// Self-limiting: once all are set the predicate goes false. Only saved videos
+// qualify (New-feed cards come from RSS with a date and a subscription avatar).
+function videoNeedsChannel(v) {
+  return v.saved === true && (!v.channelId || !v.channelThumbnail || !v.published);
+}
+
 // Fill video duration + view count + live status via the Data API — none of
 // these (duration especially) are in the RSS feed. Batches of 50 (1 quota unit
 // each). `snippet.liveBroadcastContent` tells us live/upcoming vs a real video.
 // Returns diagnostics so callers can explain why lengths did/didn't fill.
 async function fillVideoDetails(store, apiKey, ids) {
-  const pending = ids || Object.keys(store).filter((id) => videoNeedsDetails(store[id]));
+  const pending = ids || Object.keys(store).filter((id) => videoNeedsDetails(store[id]) || videoNeedsChannel(store[id]));
   const out = { queried: pending.length, filled: 0, apiFailures: 0, lastError: null, changed: false };
   for (const group of chunk(pending, YT_CHANNELS_BATCH)) {
     try {
@@ -782,6 +1109,12 @@ async function fillVideoDetails(store, apiKey, ids) {
         v.duration = duration;
         v.live = live;
         v.viewCount = views;
+        // Backfill channel identity + upload date for manual/imported saves
+        // (oEmbed and the playlist scrape give neither) so their cards can group,
+        // show a date, and show an avatar.
+        if (item.snippet?.channelId && !v.channelId) { v.channelId = item.snippet.channelId; out.changed = true; }
+        if (item.snippet?.channelTitle && !v.author) { v.author = item.snippet.channelTitle; out.changed = true; }
+        if (item.snippet?.publishedAt && !v.published) { v.published = item.snippet.publishedAt; out.changed = true; }
         out.filled++;
       }
       // Private/deleted ids never come back — mark them so they aren't re-queried.
@@ -792,7 +1125,47 @@ async function fillVideoDetails(store, apiKey, ids) {
       out.lastError = String(e?.message || e);
     }
   }
+  // Now that channel ids are resolved, fill channel avatars for the touched
+  // videos so Watch Later cards show the channel photo.
+  await fillChannelThumbnails(store, apiKey, pending, out);
   return out;
+}
+
+// Store a channel avatar url on saved videos whose channel isn't a subscription
+// (subscriptions already carry a thumbnail in the `channels` store). Bounded to
+// Watch Later videos and cached per-video (`channelThumbnail`), so it's cheap
+// and self-limiting. channels.list snippet, 1 unit / 50 channels.
+async function fillChannelThumbnails(store, apiKey, videoIds, out) {
+  const need = new Map(); // channelId -> [videoId, ...]
+  for (const vid of videoIds) {
+    const v = store[vid];
+    if (!v || !v.saved || !v.channelId || v.channelThumbnail) continue;
+    if (!need.has(v.channelId)) need.set(v.channelId, []);
+    need.get(v.channelId).push(vid);
+  }
+  if (!need.size) return;
+  for (const group of chunk([...need.keys()], YT_CHANNELS_BATCH)) {
+    try {
+      const res = await fetch(`${API_BASE}/channels?part=snippet&id=${group.join(",")}&key=${apiKey}`);
+      if (!res.ok) {
+        const body = await res.text();
+        console.warn("channels.list (video avatars) failed:", res.status, body);
+        out.apiFailures++;
+        out.lastError = describeApiError(res, body);
+        continue;
+      }
+      const data = await res.json();
+      for (const item of data.items || []) {
+        const thumb = pickThumbnailUrl(item);
+        if (!thumb) continue;
+        for (const vid of need.get(item.id) || []) { store[vid].channelThumbnail = thumb; out.changed = true; }
+      }
+    } catch (e) {
+      console.warn("channels.list (video avatars) error:", e);
+      out.apiFailures++;
+      out.lastError = String(e?.message || e);
+    }
+  }
 }
 
 // Fill lengths/views for any videos still missing them (dashboard-triggered when
@@ -1346,6 +1719,7 @@ function mergeVideo(a, b) {
     thumbnail: firstSet(a.thumbnail, b.thumbnail) ?? a.thumbnail,
     author: firstSet(a.author, b.author) ?? null,
     channelId: firstSet(a.channelId, b.channelId) ?? null,
+    channelThumbnail: firstSet(a.channelThumbnail, b.channelThumbnail) ?? null,
     published: firstSet(a.published, b.published) ?? null,
     addedAt: seenTimes.length ? Math.min(...seenTimes) : Date.now(),
   };
