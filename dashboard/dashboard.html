@@ -13,11 +13,17 @@
         <span class="brand-name">MyTube</span>
       </div>
 
+      <div class="view-tabs">
+        <button id="viewChannelsBtn" class="view-tab active" data-view="channels">Channels</button>
+        <button id="viewNewBtn" class="view-tab" data-view="new">New</button>
+        <button id="viewWatchLaterBtn" class="view-tab" data-view="watchlater">Watch&nbsp;Later</button>
+      </div>
+
       <button id="scanBtn" class="btn btn-primary btn-block">Scan Channels</button>
       <button id="refreshBtn" class="btn btn-ghost btn-block">Refresh Stats</button>
 
       <div class="section-label-row">
-        <span class="section-label">Folders</span>
+        <span id="folderSectionLabel" class="section-label">Folders</span>
         <select id="folderSortSelect" class="folder-sort-select">
           <option value="custom">Custom</option>
           <option value="alpha">A → Z</option>
@@ -36,6 +42,15 @@
     <main class="main">
       <div class="topbar">
         <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
+        <div id="videoFilters" class="filter-group video-filters">
+          <span class="filter-label">Sort</span>
+          <button id="videoSortDate" class="video-sort-btn" data-sort="date">Date <span class="vs-arrow"></span></button>
+          <button id="videoSortLength" class="video-sort-btn" data-sort="length">Length <span class="vs-arrow"></span></button>
+          <span class="video-filter-sep"></span>
+          <span id="videoUnwatchedChip" class="tag-chip var-toggle" data-role="filter-unwatched">Unwatched</span>
+          <button id="videoMarkAllBtn" class="btn btn-text">Mark all watched</button>
+          <button id="videoFetchAllBtn" class="btn btn-text" title="Fetch the full upload history of every tracked channel (needs an API key)">Fetch full history</button>
+        </div>
         <div class="filter-group">
           <label class="filter-label">Min videos</label>
           <input id="filterMinCount" class="filter-input filter-input-num" type="number" min="0" placeholder="—" />
@@ -88,6 +103,26 @@
 
       <div id="channelGrid" class="channel-grid"></div>
       <div id="scrollSentinel" class="scroll-sentinel" aria-hidden="true"></div>
+
+      <div id="videoEmptyState" class="empty-state" hidden>
+        <p class="empty-title">No tracked videos yet</p>
+        <p class="empty-body">
+          Turn on the <b>Track</b> toggle on any channel (in its Variables cell, or
+          via right-click) to pull that channel's latest uploads into this feed.
+          Then click <b>Refresh Stats</b> to fetch them. Videos open on YouTube.
+        </p>
+      </div>
+      <div id="videoFeed" class="video-feed" hidden></div>
+
+      <div id="watchLaterEmptyState" class="empty-state" hidden>
+        <p class="empty-title">Nothing saved yet</p>
+        <p class="empty-body">
+          On any YouTube page, <b>right-click a video</b> (or the watch page itself) and
+          choose <b>“Save to MyTube Watch Later.”</b> Saved videos land here, where you can
+          organize them into nested lists just like channels.
+        </p>
+      </div>
+      <div id="watchLaterGrid" class="video-feed" hidden></div>
     </main>
   </div>
 

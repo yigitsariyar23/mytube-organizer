@@ -42,19 +42,28 @@ const DEFAULT_LANGUAGES = [
 let LANGUAGES = [...DEFAULT_LANGUAGES];
 const LANG_OTHER = "__other__";
 
-let state = { channels: {}, folders: {}, tags: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null };
-let currentFolderId = "all";
+let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null };
+let currentFolderId = "all";       // selected channel folder (Channels/New views)
+let currentListId = "all";         // selected Watch Later list
+let currentView = "channels";      // "channels" | "new" | "watchlater"
+let videoUnwatchedOnly = false;    // New/Watch Later: hide already-watched
+let videoSortKey = "date";         // "date" | "length"
+let videoSortDir = "desc";         // "desc" | "asc"
+let videoDetailsRequested = false; // guards the one-shot auto length/view fetch
 let activeTagFilters = new Set();
 let activeLangFilters = new Set(); // languages selected in the filter bar
 const selectedChannelIds = new Set(); // multi-select highlight (ctrl/shift click)
 let selectionAnchor = null;           // last clicked id, the shift-range pivot
+const selectedVideoIds = new Set();   // video multi-select (New / Watch Later)
+let videoSelectionAnchor = null;      // shift-range pivot for video cards
 let filterActiveOnly = false;      // show only channels flagged "active"
 let filterFinishedOnly = false;    // show only channels flagged "finished"
 let searchQuery = "";
 let sortDate = "desc"; // "desc" (newest first) | "asc" (oldest first) | "none"
 let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
 let folderSort = "custom"; // "custom" | "alpha" | "count"
-const collapsedFolders = new Set(); // parent folder ids that are collapsed
+const collapsedFolders = new Set();    // collapsed parent channel folders
+const collapsedVideoLists = new Set(); // collapsed parent Watch Later lists
 // what the folder modal is currently doing: create-folder | rename-folder | rename-tag
 let folderModalMode = { type: "create-folder", id: null };
 
@@ -70,9 +79,20 @@ let pendingChannels = []; // filtered channels not yet appended to the grid
 let pendingFolderOptions = []; // precomputed move-folder <option> data, rebuilt each render
 let scrollObserver = null;
 
+// Resizable table columns. The first five columns carry explicit px widths; the
+// sixth (Folder) is a flexible `1fr` that absorbs remaining space, so there is
+// no horizontal scroll. Widths persist as `colWidths`; null means "use the
+// default fluid template" until the user first drags a divider.
+let colWidths = null;                         // [c1..c5] px, or null
+const COL_MINS = [160, 84, 52, 52, 180];      // min px for the five sized columns
+const COL_FLEX_MIN = 110;                     // min px for the flexible Folder column
+const COL_GAP = 16;                           // must match the grid `gap`
+const COL_PAD_X = 28;                         // .list-table-header horizontal padding (14*2)
+
 const el = {
   folderList: document.getElementById("folderList"),
   folderSortSelect: document.getElementById("folderSortSelect"),
+  folderSectionLabel: document.getElementById("folderSectionLabel"),
   tagFilterBar: document.getElementById("tagFilterBar"),
   channelGrid: document.getElementById("channelGrid"),
   emptyState: document.getElementById("emptyState"),
@@ -132,6 +152,19 @@ const el = {
   scanDiffBody: document.getElementById("scanDiffBody"),
   scanDiffApply: document.getElementById("scanDiffApply"),
   scanDiffCancel: document.getElementById("scanDiffCancel"),
+  viewChannelsBtn: document.getElementById("viewChannelsBtn"),
+  viewNewBtn: document.getElementById("viewNewBtn"),
+  viewWatchLaterBtn: document.getElementById("viewWatchLaterBtn"),
+  videoFilters: document.getElementById("videoFilters"),
+  videoUnwatchedChip: document.getElementById("videoUnwatchedChip"),
+  videoSortDate: document.getElementById("videoSortDate"),
+  videoSortLength: document.getElementById("videoSortLength"),
+  videoMarkAllBtn: document.getElementById("videoMarkAllBtn"),
+  videoFetchAllBtn: document.getElementById("videoFetchAllBtn"),
+  videoFeed: document.getElementById("videoFeed"),
+  videoEmptyState: document.getElementById("videoEmptyState"),
+  watchLaterGrid: document.getElementById("watchLaterGrid"),
+  watchLaterEmptyState: document.getElementById("watchLaterEmptyState"),
 };
 
 init();
@@ -151,9 +184,14 @@ async function init() {
   for (const id of Object.keys(state.folders)) {
     if (getChildFolderIds(id).length) collapsedFolders.add(id);
   }
+  for (const id of Object.keys(state.videoFolders)) {
+    if (getChildFolderIds(id, state.videoFolders).length) collapsedVideoLists.add(id);
+  }
   populateYearDropdowns();
+  if (colWidths) applyColTemplate(colWidths);
   render();
   bindEvents();
+  setupColumnResize();
 
   // A scan finished while the dashboard was closed — review it on open.
   if (state.pendingScan) openScanDiffModal(state.pendingScan);
@@ -163,6 +201,8 @@ async function init() {
     if (changes.channels) state.channels = changes.channels.newValue || {};
     if (changes.folders) state.folders = changes.folders.newValue || {};
     if (changes.tags) state.tags = changes.tags.newValue || {};
+    if (changes.videos) state.videos = changes.videos.newValue || {};
+    if (changes.videoFolders) state.videoFolders = changes.videoFolders.newValue || defaultFolders();
     // Settings synced from another device (background gist merge / download).
     if (changes.apiKey) state.apiKey = changes.apiKey.newValue || "";
     if (changes.languages) LANGUAGES = changes.languages.newValue?.length ? changes.languages.newValue : [...DEFAULT_LANGUAGES];
@@ -181,12 +221,17 @@ const defaultFolders = () => ({ unsorted: { name: "Unsorted", order: 0 } });
 
 async function loadState() {
   const data = await chrome.storage.local.get([
-    "channels", "folders", "tags", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
-    "sortDate", "sortCount", "folderSort", "languages",
+    "channels", "folders", "tags", "videos", "videoFolders", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
+    "sortDate", "sortCount", "folderSort", "languages", "currentView", "colWidths", "videoSort",
   ]);
   state.channels = data.channels || {};
   state.folders = data.folders || defaultFolders();
   state.tags = data.tags || {};
+  state.videos = data.videos || {};
+  state.videoFolders = data.videoFolders && Object.keys(data.videoFolders).length ? data.videoFolders : defaultFolders();
+  // "videos" was the old single video tab; it split into "new" + "watchlater".
+  const v = data.currentView === "videos" ? "new" : data.currentView;
+  currentView = ["channels", "new", "watchlater"].includes(v) ? v : "channels";
   state.apiKey = data.apiKey || "";
   state.gistToken = data.gistToken || "";
   state.gistId = data.gistId || "";
@@ -196,24 +241,484 @@ async function loadState() {
   sortCount = data.sortCount === "desc" || data.sortCount === "asc" ? data.sortCount : "none";
   folderSort = ["alpha", "count-desc", "count-asc"].includes(data.folderSort) ? data.folderSort : "custom";
   LANGUAGES = Array.isArray(data.languages) && data.languages.length ? data.languages : [...DEFAULT_LANGUAGES];
+  colWidths = Array.isArray(data.colWidths) && data.colWidths.length === COL_MINS.length
+    ? data.colWidths.map((w, i) => Math.max(COL_MINS[i], Number(w) || COL_MINS[i]))
+    : null;
+  videoSortKey = data.videoSort?.key === "length" ? "length" : "date";
+  videoSortDir = data.videoSort?.dir === "asc" ? "asc" : "desc";
+}
+
+// ---------- Folder domain (channel folders vs Watch Later lists) ----------
+
+// The one sidebar (#folderList) and its operations act on whichever folder set
+// matches the current view. This accessor returns that set plus how to count
+// items, read/set the selected id, and persist — so the folder code stays one
+// implementation. Channels/New share the channel folders; Watch Later uses its
+// own `videoFolders`.
+function fdom() {
+  if (currentView === "watchlater") {
+    return {
+      folders: state.videoFolders,
+      persist: () => chrome.storage.local.set({ videoFolders: state.videoFolders }),
+      counts: () => {
+        const m = {};
+        for (const v of Object.values(state.videos)) {
+          if (v.saved) { const f = v.folderId || "unsorted"; m[f] = (m[f] || 0) + 1; }
+        }
+        return m;
+      },
+      total: () => Object.values(state.videos).filter((v) => v.saved).length,
+      get selected() { return currentListId; },
+      select: (id) => { currentListId = id; },
+      collapsed: collapsedVideoLists,
+    };
+  }
+  return {
+    folders: state.folders,
+    persist: () => chrome.storage.local.set({ folders: state.folders }),
+    counts: () => {
+      const m = {};
+      for (const c of Object.values(state.channels)) m[c.folderId] = (m[c.folderId] || 0) + 1;
+      return m;
+    },
+    total: () => Object.values(state.channels).length,
+    get selected() { return currentFolderId; },
+    select: (id) => { currentFolderId = id; },
+    collapsed: collapsedFolders,
+  };
 }
 
 // ---------- Render ----------
 
 function render() {
+  document.body.dataset.view = currentView;
+  el.viewChannelsBtn.classList.toggle("active", currentView === "channels");
+  el.viewNewBtn.classList.toggle("active", currentView === "new");
+  el.viewWatchLaterBtn.classList.toggle("active", currentView === "watchlater");
+  const channels = currentView === "channels";
+
+  const listMode = currentView === "watchlater";
+  el.addFolderBtn.textContent = listMode ? "+ New list" : "+ New folder";
+  if (el.folderSectionLabel) el.folderSectionLabel.textContent = listMode ? "Lists" : "Folders";
   renderFolders();
-  renderTagFilters();
-  renderGrid();
+
+  // Channel-grid surfaces
+  el.channelGrid.hidden = !channels;
+  el.scrollSentinel.hidden = !channels;
+  if (!channels) el.tagFilterBar.hidden = true;
+  // Video surfaces
+  el.videoFeed.hidden = currentView !== "new";
+  el.watchLaterGrid.hidden = currentView !== "watchlater";
+
+  if (channels) {
+    el.searchInput.placeholder = "Search channels…";
+    el.videoEmptyState.hidden = true;
+    el.watchLaterEmptyState.hidden = true;
+    renderTagFilters();
+    renderGrid();
+    return;
+  }
+
+  // Both video views hide the channel table + its empty states.
+  el.emptyState.hidden = true;
+  el.noResultsState.hidden = true;
+  el.listTableHeader.hidden = true;
+
+  if (currentView === "new") {
+    el.searchInput.placeholder = "Search new videos…";
+    el.watchLaterEmptyState.hidden = true;
+    renderVideoFeed();
+  } else {
+    el.searchInput.placeholder = "Search Watch Later…";
+    el.videoEmptyState.hidden = true;
+    renderWatchLater();
+  }
 }
 
-// Returns child folder ids for a given parent
-function getChildFolderIds(parentId) {
-  return Object.keys(state.folders).filter((id) => state.folders[id].parentId === parentId);
+// Switch between the Channels and Videos surfaces; the choice persists so the
+// dashboard reopens where you left it. Search carries between views but the
+// text field is view-scoped in meaning, so it's cleared on switch.
+async function setView(view) {
+  if (view === currentView) return;
+  currentView = view;
+  searchQuery = "";
+  el.searchInput.value = "";
+  el.statusText.textContent = "";
+  clearVideoSelection(); // selection is per-view
+  await chrome.storage.local.set({ currentView: view });
+  render();
+}
+
+// ---------- New videos view (tracked channels' uploads) ----------
+
+// True once any channel opts into the feed via its "Track" toggle.
+function anyTrackedChannel() {
+  return Object.values(state.channels).some((c) => c.trackVideos);
+}
+
+// New uploads from tracked channels, honoring the channel-folder selection,
+// search, the unwatched chip, and the active video sort.
+function getFilteredVideos() {
+  const inFolder = currentFolderId === "all" ? null : getFolderAndDescendantIds(currentFolderId);
+  const q = searchQuery.trim().toLowerCase();
+  const list = Object.values(state.videos).filter((v) => {
+    const ch = state.channels[v.channelId];
+    if (!ch || !ch.trackVideos) return false;
+    if (v.hidden) return false;              // user-dismissed from the feed
+    if (isUpcomingOrLive(v)) return false;   // live streams / scheduled premieres
+    if (inFolder && !inFolder.has(ch.folderId)) return false;
+    if (videoUnwatchedOnly && v.watched) return false;
+    if (q && !`${v.title} ${ch.name || ""}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  return sortVideos(list);
+}
+
+// A live stream or a scheduled/upcoming premiere — not a real uploaded video.
+// `live` is set by the API detail fetch; the future-date check also catches
+// upcoming premieres before the details are fetched (and without an API key).
+function isUpcomingOrLive(v) {
+  if (v.live === "live" || v.live === "upcoming") return true;
+  if (v.published && Date.parse(v.published) > Date.now() + 60_000) return true;
+  return false;
+}
+
+// A comparable timestamp for a video: its upload date, or the save time for
+// manually-added Watch Later videos that have no published date.
+function videoTime(v) {
+  return v.published ? Date.parse(v.published) : (v.addedAt || 0);
+}
+
+// Sort by the active key/direction. Views nulls sort as lowest; date is the
+// tiebreaker so equal-view items stay chronologically sensible.
+function sortVideos(list) {
+  const dir = videoSortDir === "asc" ? 1 : -1;
+  list.sort((a, b) => {
+    let cmp = videoSortKey === "length"
+      ? (a.duration ?? -1) - (b.duration ?? -1)
+      : videoTime(a) - videoTime(b);
+    if (cmp === 0) cmp = videoTime(a) - videoTime(b);
+    return dir * cmp;
+  });
+  return list;
+}
+
+// Lengths (and API view counts) aren't in RSS — when a video view opens with an
+// API key set and some are still missing, ask the background to fetch them. One
+// shot per session; the storage write it triggers re-renders with the data.
+function maybeFetchVideoDetails() {
+  if (videoDetailsRequested || !state.apiKey) return;
+  const needs = Object.values(state.videos).some(
+    (v) => (v.duration === undefined || v.live === "live" || v.live === "upcoming") &&
+      (v.saved || (v.channelId && state.channels[v.channelId]?.trackVideos))
+  );
+  if (!needs) return;
+  videoDetailsRequested = true;
+  chrome.runtime.sendMessage({ type: "FILL_VIDEO_DETAILS" });
+}
+
+// Reflect the active sort on the two sort buttons (highlight + ↑/↓ arrow).
+function updateVideoSortButtons() {
+  const arrow = videoSortDir === "asc" ? "↑" : "↓";
+  for (const [key, btn] of [["date", el.videoSortDate], ["length", el.videoSortLength]]) {
+    const active = videoSortKey === key;
+    btn.classList.toggle("active", active);
+    btn.querySelector(".vs-arrow").textContent = active ? arrow : "";
+  }
+}
+
+function renderVideoFeed() {
+  el.videoUnwatchedChip.classList.toggle("on", videoUnwatchedOnly);
+  updateVideoSortButtons();
+  maybeFetchVideoDetails();
+
+  const noneTracked = !anyTrackedChannel();
+  el.videoEmptyState.hidden = !noneTracked;
+  if (noneTracked) {
+    el.videoFeed.innerHTML = "";
+    el.statusText.textContent = "";
+    return;
+  }
+
+  const vids = getFilteredVideos();
+  el.statusText.textContent = vids.length ? `${vids.length} video${vids.length === 1 ? "" : "s"}` : "";
+
+  if (!vids.length) {
+    const filtered = !!searchQuery.trim() || videoUnwatchedOnly;
+    el.videoFeed.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No videos match the current filters." : "No videos fetched yet — click Refresh Stats to pull them."}</p></div>`;
+    return;
+  }
+
+  // Day headers only make sense when the feed is in date order.
+  const groupByDay = videoSortKey === "date";
+  let html = "";
+  let lastLabel = null;
+  for (const v of vids) {
+    if (groupByDay) {
+      const label = dayLabel(v.published);
+      if (label !== lastLabel) {
+        html += `<div class="video-day">${escapeHtml(label)}</div>`;
+        lastLabel = label;
+      }
+    }
+    html += videoCardHtml(v, "new");
+  }
+  el.videoFeed.innerHTML = html;
+}
+
+// A video card for either video view. `mode` picks the action buttons:
+// "new" → mark watched; "watchlater" → remove from Watch Later.
+function videoCardHtml(v, mode) {
+  const ch = v.channelId ? state.channels[v.channelId] : null;
+  const channelName = ch?.name || v.author || "";
+  const avatarSrc = ch?.thumbnail || null;
+  const avatar = avatarSrc
+    ? `<img src="${escapeHtml(avatarSrc)}" alt="" onerror="this.outerHTML='<span class=&quot;vc-avatar-fallback&quot;></span>'" />`
+    : `<span class="vc-avatar-fallback"></span>`;
+  const when = v.published ? relativeTime(v.published) : "";
+  const views = v.viewCount != null ? formatViews(v.viewCount) : "";
+  const meta = [when, views].filter(Boolean).join(" · ");
+  const durationBadge = v.duration != null ? `<span class="video-duration">${escapeHtml(formatDuration(v.duration))}</span>` : "";
+  const actions = mode === "watchlater"
+    ? `<button class="video-act" data-action="toggle-watched">${v.watched ? "Mark unwatched" : "Mark watched"}</button>
+       <button class="video-act" data-action="remove" title="Remove from Watch Later">Remove</button>`
+    : `<button class="video-act" data-action="toggle-watched">${v.watched ? "Mark unwatched" : "Mark watched"}</button>
+       <button class="video-act" data-action="hide" title="Remove from the New feed (won't come back)">Remove</button>`;
+  return `
+    <div class="video-card${v.watched ? " watched" : ""}${selectedVideoIds.has(v.id) ? " selected" : ""}" data-video-id="${escapeHtml(v.id)}">
+      <div class="video-thumb">
+        <img src="${escapeHtml(v.thumbnail)}" alt="" loading="lazy" />
+        ${durationBadge}
+        <span class="video-watched-badge">✓ watched</span>
+      </div>
+      <div class="video-meta">
+        <div class="video-title" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</div>
+        <div class="video-channel">${avatar}<span>${escapeHtml(channelName)}</span></div>
+        <div class="video-date">${escapeHtml(meta)}</div>
+      </div>
+      <div class="video-actions">${actions}</div>
+    </div>`;
+}
+
+// Seconds → "4:13" or "1:02:10".
+function formatDuration(sec) {
+  if (sec == null) return "";
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  const p2 = (n) => String(n).padStart(2, "0");
+  return h ? `${h}:${p2(m)}:${p2(s)}` : `${m}:${p2(s)}`;
+}
+
+// Compact view count, e.g. "1.2M views" / "45K views" / "812 views".
+function formatViews(n) {
+  if (n == null) return "";
+  const c = n >= 1_000_000 ? trimZero(n / 1_000_000) + "M"
+    : n >= 1_000 ? trimZero(n / 1_000) + "K"
+    : String(n);
+  return `${c} view${n === 1 ? "" : "s"}`;
+}
+
+// ---------- Watch Later view (saved videos, organized into lists) ----------
+
+// Saved videos in the selected list (+ its sub-lists), matching search, newest
+// saved first.
+function getWatchLaterVideos() {
+  const inList = currentListId === "all" ? null : getFolderAndDescendantIds(currentListId, state.videoFolders);
+  const q = searchQuery.trim().toLowerCase();
+  const list = Object.values(state.videos).filter((v) => {
+    if (!v.saved) return false;
+    const fid = v.folderId || "unsorted";
+    if (inList && !inList.has(fid)) return false;
+    if (videoUnwatchedOnly && v.watched) return false;
+    const author = v.channelId ? state.channels[v.channelId]?.name : v.author;
+    if (q && !`${v.title} ${author || ""}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  return sortVideos(list);
+}
+
+function renderWatchLater() {
+  el.videoUnwatchedChip.classList.toggle("on", videoUnwatchedOnly);
+  updateVideoSortButtons();
+  maybeFetchVideoDetails();
+
+  const anySaved = Object.values(state.videos).some((v) => v.saved);
+  el.watchLaterEmptyState.hidden = anySaved;
+  if (!anySaved) {
+    el.watchLaterGrid.innerHTML = "";
+    el.statusText.textContent = "";
+    return;
+  }
+
+  const vids = getWatchLaterVideos();
+  el.statusText.textContent = vids.length ? `${vids.length} video${vids.length === 1 ? "" : "s"}` : "";
+
+  if (!vids.length) {
+    const filtered = !!searchQuery.trim() || videoUnwatchedOnly;
+    el.watchLaterGrid.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No saved videos match the current filters." : "This list is empty."}</p></div>`;
+    return;
+  }
+
+  el.watchLaterGrid.innerHTML = vids.map((v) => videoCardHtml(v, "watchlater")).join("");
+}
+
+// "Today" / "Yesterday" / "Jul 3, 2026" for the day-group headers (local time).
+function dayLabel(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "Unknown date";
+  const startOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((startOf(new Date()) - startOf(d)) / 86400000);
+  if (days === 0) return "Today";
+  if (days === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+// "5m ago" / "3h ago" / "2d ago", falling back to a short date past a week.
+function relativeTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const secs = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (secs < 3600) return `${Math.max(1, Math.floor(secs / 60))}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  if (secs < 604800) return `${Math.floor(secs / 86400)}d ago`;
+  return formatShortDate(iso);
+}
+
+async function saveVideos() {
+  await chrome.storage.local.set({ videos: state.videos });
+}
+
+// Open a video on YouTube (where its own algorithm drives autoplay / up-next)
+// and mark it watched. The storage write re-renders the feed via onChanged.
+function openVideo(videoId, background) {
+  const v = state.videos[videoId];
+  if (!v) return;
+  chrome.tabs.create({ url: `https://www.youtube.com/watch?v=${videoId}`, active: !background });
+  if (!v.watched) {
+    v.watched = true;
+    saveVideos();
+  }
+}
+
+// Remove a video from Watch Later. A manually-saved video (no tracked channel)
+// is dropped entirely; a tracked-channel video just loses its saved flag so it
+// stays available in the New feed.
+async function removeFromWatchLater(videoId) {
+  const v = state.videos[videoId];
+  if (!v) return;
+  if (!v.channelId || !state.channels[v.channelId]?.trackVideos) {
+    delete state.videos[videoId];
+  } else {
+    v.saved = false;
+    delete v.folderId;
+  }
+  await saveVideos();
+}
+
+async function moveVideoToList(videoId, listId) {
+  const v = state.videos[videoId];
+  if (!v || !v.saved) return;
+  v.folderId = listId;
+  await saveVideos();
+}
+
+// Deep-fetch the entire upload history of the given channels via the API (the
+// RSS refresh only sees the latest ~15). Needs a key; can take a while for big
+// catalogs, so it reports progress/outcome in the status line.
+async function fetchAllVideos(channelIds) {
+  if (!channelIds.length) return;
+  if (!state.apiKey) {
+    alert("Fetching all videos needs a YouTube API key — set one in Settings.");
+    return;
+  }
+  const label = channelIds.length === 1
+    ? `“${state.channels[channelIds[0]]?.name || "channel"}”`
+    : `${channelIds.length} channels`;
+  el.statusText.textContent = `Fetching all videos from ${label}… (this can take a while)`;
+  videoDetailsRequested = true; // the background fills lengths itself; suppress the auto-fetch
+  const res = await chrome.runtime.sendMessage({ type: "FETCH_ALL_VIDEOS", channelIds });
+  await loadState();
+  render();
+  if (res?.ok) {
+    el.statusText.textContent =
+      `Fetched ${res.total} video${res.total === 1 ? "" : "s"} from ${res.channels} channel${res.channels === 1 ? "" : "s"}` +
+      (res.lastError ? ` — some requests failed: ${res.lastError}` : ".");
+  } else if (res && res.hasApiKey === false) {
+    el.statusText.textContent = "Fetching all videos needs an API key (set one in Settings).";
+  } else {
+    el.statusText.textContent = "Fetch failed.";
+  }
+}
+
+// ---------- Resizable table columns ----------
+
+// Write the five sized widths (plus the flexible Folder column) into the shared
+// CSS custom property both the header and every row read for their grid template.
+function applyColTemplate(widths) {
+  const template = widths.map((w) => `${w}px`).join(" ") + ` minmax(${COL_FLEX_MIN}px, 1fr)`;
+  el.main.style.setProperty("--col-template", template);
+}
+
+// Freeze the header's currently rendered column widths into px, so a first drag
+// starts from exactly what the fluid default template was showing.
+function measureColumnWidths() {
+  return Array.from(el.listTableHeader.children)
+    .slice(0, COL_MINS.length)
+    .map((c) => Math.round(c.getBoundingClientRect().width));
+}
+
+// Attach a drag handle to the right edge of each sized column header, once.
+function setupColumnResize() {
+  const cells = Array.from(el.listTableHeader.children);
+  for (let i = 0; i < COL_MINS.length; i++) {
+    const handle = document.createElement("div");
+    handle.className = "col-resizer";
+    handle.dataset.col = String(i);
+    cells[i].appendChild(handle);
+  }
+  el.listTableHeader.addEventListener("mousedown", startColumnResize);
+}
+
+function startColumnResize(e) {
+  const handle = e.target.closest(".col-resizer");
+  if (!handle) return;
+  e.preventDefault();
+  const i = Number(handle.dataset.col);
+  const widths = colWidths ? [...colWidths] : measureColumnWidths();
+  const startX = e.clientX;
+  const startW = widths[i];
+  // Space the tracks can occupy: header content-box minus the five inter-column gaps.
+  const availTracks = el.listTableHeader.clientWidth - COL_PAD_X - COL_GAP * (COL_MINS.length);
+  document.body.classList.add("col-resizing");
+  handle.classList.add("dragging");
+
+  const onMove = (ev) => {
+    const otherFixed = widths.reduce((sum, w, idx) => (idx === i ? sum : sum + w), 0);
+    // Cap so the flexible Folder column never dips below its minimum (no overflow).
+    const maxW = Math.max(COL_MINS[i], availTracks - otherFixed - COL_FLEX_MIN);
+    widths[i] = Math.max(COL_MINS[i], Math.min(Math.round(startW + (ev.clientX - startX)), maxW));
+    applyColTemplate(widths);
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    document.body.classList.remove("col-resizing");
+    handle.classList.remove("dragging");
+    colWidths = widths;
+    chrome.storage.local.set({ colWidths });
+  };
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+
+// Returns child folder ids for a given parent (defaults to channel folders;
+// pass state.videoFolders to operate on Watch Later lists).
+function getChildFolderIds(parentId, folders = state.folders) {
+  return Object.keys(folders).filter((id) => folders[id].parentId === parentId);
 }
 
 // The id set of a folder plus all its child folders (for counting/filtering).
-function getFolderAndDescendantIds(folderId) {
-  return new Set([folderId, ...getChildFolderIds(folderId)]);
+function getFolderAndDescendantIds(folderId, folders = state.folders) {
+  return new Set([folderId, ...getChildFolderIds(folderId, folders)]);
 }
 
 // Count channels in a folder and all its children
@@ -225,28 +730,28 @@ function getFolderChannelCount(folderId) {
 function renderFolders() {
   if (el.folderSortSelect) el.folderSortSelect.value = folderSort;
 
+  const d = fdom();
+  const folders = d.folders;
+  const selected = d.selected;
+  const collapsed = d.collapsed;
   el.folderList.innerHTML = "";
 
-  // Index channels by folder and folders by parent in single passes, so the
-  // per-folder counts below don't repeatedly re-scan every channel/folder.
-  const directCount = {};
-  for (const c of Object.values(state.channels)) {
-    directCount[c.folderId] = (directCount[c.folderId] || 0) + 1;
-  }
+  // Direct item counts per folder + a parent→children index, in single passes.
+  const directCount = d.counts();
   const childIndex = {};
-  for (const [id, f] of Object.entries(state.folders)) {
+  for (const [id, f] of Object.entries(folders)) {
     if (f.parentId) (childIndex[f.parentId] ||= []).push(id);
   }
 
   // "All" virtual item
   const allLi = document.createElement("li");
-  allLi.className = "folder-item" + (currentFolderId === "all" ? " active" : "");
+  allLi.className = "folder-item" + (selected === "all" ? " active" : "");
   allLi.dataset.folderId = "all";
-  allLi.innerHTML = `<span class="folder-name">All</span><span class="folder-count">${Object.values(state.channels).length}</span>`;
+  allLi.innerHTML = `<span class="folder-name">All</span><span class="folder-count">${d.total()}</span>`;
   el.folderList.appendChild(allLi);
 
   // Separate top-level and child folders
-  const topLevelEntries = Object.entries(state.folders)
+  const topLevelEntries = Object.entries(folders)
     .filter(([, f]) => !f.parentId)
     .map(([id, folder]) => ({
       id,
@@ -275,12 +780,12 @@ function renderFolders() {
     const li = document.createElement("li");
     const childIds = childIndex[f.id] || [];
     const hasChildren = f.id !== "unsorted" && childIds.length > 0;
-    const isCollapsed = hasChildren && collapsedFolders.has(f.id);
-    li.className = "folder-item" + (f.id === currentFolderId ? " active" : "") + (hasChildren ? " folder-item--parent" : "") + (isCollapsed ? " folder-item--collapsed" : "");
+    const isCollapsed = hasChildren && collapsed.has(f.id);
+    li.className = "folder-item" + (f.id === selected ? " active" : "") + (hasChildren ? " folder-item--parent" : "") + (isCollapsed ? " folder-item--collapsed" : "");
     li.dataset.folderId = f.id;
     if (hasChildren) li.dataset.parentFolder = "1";
     li.draggable = draggable;
-    const emoji = state.folders[f.id]?.emoji || "";
+    const emoji = folders[f.id]?.emoji || "";
     const caret = hasChildren ? `<span class="folder-caret" aria-hidden="true">▸</span>` : "";
     li.innerHTML = `${caret}${folderEmojiSlotHtml(f.id, emoji)}<span class="folder-name">${escapeHtml(f.name)}</span><span class="folder-count">${f.count}</span>`;
     el.folderList.appendChild(li);
@@ -288,12 +793,12 @@ function renderFolders() {
     // Render children under this parent
     if (f.id !== "unsorted") {
       const children = childIds
-        .map((id) => { const cf = state.folders[id]; return { id, name: cf.name, order: cf.order ?? 0, emoji: cf.emoji || "", count: directCount[id] || 0 }; })
+        .map((id) => { const cf = folders[id]; return { id, name: cf.name, order: cf.order ?? 0, emoji: cf.emoji || "", count: directCount[id] || 0 }; })
         .sort((a, b) => a.order - b.order);
 
       for (const child of children) {
         const childLi = document.createElement("li");
-        childLi.className = "folder-item folder-item--child" + (child.id === currentFolderId ? " active" : "") + (isCollapsed ? " folder-item--hidden" : "");
+        childLi.className = "folder-item folder-item--child" + (child.id === selected ? " active" : "") + (isCollapsed ? " folder-item--hidden" : "");
         childLi.dataset.folderId = child.id;
         childLi.draggable = folderSort === "custom";
         childLi.innerHTML = `${folderEmojiSlotHtml(child.id, child.emoji)}<span class="folder-name">${escapeHtml(child.name)}</span><span class="folder-count">${child.count}</span>`;
@@ -322,7 +827,7 @@ function openEmojiInput(anchorEl, folderId) {
   input.type = "text";
   input.className = "folder-emoji-input";
   input.placeholder = "😀";
-  input.value = state.folders[folderId]?.emoji || "";
+  input.value = fdom().folders[folderId]?.emoji || "";
   input.maxLength = 4; // room for one emoji (some are multi-codepoint)
 
   const clearBtn = document.createElement("button");
@@ -372,26 +877,27 @@ function openEmojiInput(anchorEl, folderId) {
 }
 
 // Set or clear a folder's emoji (empty string clears). Emoji may be up to two
-// codepoints. Persists and re-renders the sidebar.
+// codepoints. Persists and re-renders the sidebar. Operates on the active domain.
 async function setFolderEmoji(folderId, value) {
-  const folder = state.folders[folderId];
+  const d = fdom();
+  const folder = d.folders[folderId];
   if (!folder) return;
   const emoji = [...value.trim()].slice(0, 2).join("");
   if (emoji) folder.emoji = emoji;
   else delete folder.emoji;
-  await chrome.storage.local.set({ folders: state.folders });
+  await d.persist();
   renderFolders();
 }
 
 // Whether a folder has any subfolders (i.e. is itself a parent).
-function folderHasChildren(folderId) {
-  return Object.values(state.folders).some((f) => f.parentId === folderId);
+function folderHasChildren(folderId, folders = fdom().folders) {
+  return Object.values(folders).some((f) => f.parentId === folderId);
 }
 
 // Ordered ids of folders sharing a parent. parentId null/undefined => top-level.
 // The pinned "unsorted" folder is excluded — it is never reordered or reparented.
-function getSiblingIdsOrdered(parentId) {
-  return Object.entries(state.folders)
+function getSiblingIdsOrdered(parentId, folders = fdom().folders) {
+  return Object.entries(folders)
     .filter(([id, f]) => id !== "unsorted" && (parentId ? f.parentId === parentId : !f.parentId))
     .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
     .map(([id]) => id);
@@ -401,32 +907,34 @@ function getSiblingIdsOrdered(parentId) {
 // `beforeId` among the destination siblings (append when beforeId is null).
 // Renumbers the destination group's order values and persists.
 function applyFolderDrop(srcId, newParentId, beforeId) {
-  const src = state.folders[srcId];
+  const d = fdom();
+  const src = d.folders[srcId];
   if (!src) return;
 
   if (newParentId) src.parentId = newParentId;
   else delete src.parentId;
 
-  const siblings = getSiblingIdsOrdered(newParentId).filter((id) => id !== srcId);
+  const siblings = getSiblingIdsOrdered(newParentId, d.folders).filter((id) => id !== srcId);
   const idx = beforeId ? siblings.indexOf(beforeId) : -1;
   if (idx >= 0) siblings.splice(idx, 0, srcId);
   else siblings.push(srcId);
 
-  siblings.forEach((id, i) => { state.folders[id].order = i; });
-  chrome.storage.local.set({ folders: state.folders });
+  siblings.forEach((id, i) => { d.folders[id].order = i; });
+  d.persist();
 }
 
 // Decide what a drop of `srcId` onto `targetId` means from where the cursor
 // sits within the target row: nest inside (middle) vs. reorder as a sibling
 // (top/bottom edge). Returns null when the drop isn't allowed.
 function computeFolderDropIntent(srcId, targetId, clientY, targetEl) {
-  const src = state.folders[srcId];
-  const target = state.folders[targetId];
+  const folders = fdom().folders;
+  const src = folders[srcId];
+  const target = folders[targetId];
   if (!src || !target || srcId === targetId) return null;
   if (targetId === "unsorted") return null;   // pinned; never a drop target
   if (target.parentId === srcId) return null; // can't drop a folder onto its own child
 
-  const srcHasChildren = folderHasChildren(srcId);
+  const srcHasChildren = folderHasChildren(srcId, folders);
   const targetIsTopLevel = !target.parentId;
   // 2-level max: only nest into a top-level folder, and never nest a folder
   // that already has children of its own.
@@ -450,16 +958,17 @@ function computeFolderDropIntent(srcId, targetId, clientY, targetEl) {
 }
 
 function performFolderDrop(srcId, targetId, intent) {
-  const target = state.folders[targetId];
+  const d = fdom();
+  const target = d.folders[targetId];
   if (intent.type === "inside") {
-    collapsedFolders.delete(targetId); // reveal the newly nested child
+    d.collapsed.delete(targetId); // reveal the newly nested child
     applyFolderDrop(srcId, targetId, null);
   } else {
     const newParentId = target.parentId || null;
     if (intent.type === "before") {
       applyFolderDrop(srcId, newParentId, targetId);
     } else {
-      const siblings = getSiblingIdsOrdered(newParentId).filter((id) => id !== srcId);
+      const siblings = getSiblingIdsOrdered(newParentId, d.folders).filter((id) => id !== srcId);
       const afterId = siblings[siblings.indexOf(targetId) + 1] || null;
       applyFolderDrop(srcId, newParentId, afterId);
     }
@@ -724,7 +1233,7 @@ function buildChannelRow(ch) {
         <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
       </div>
     </div>
-    <div class="row-date" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}">${formatShortDate(ch.lastVideoDate)}</div>
+    <div class="row-date" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}"><span class="date-long">${formatShortDate(ch.lastVideoDate)}</span><span class="date-short">${formatNumericDate(ch.lastVideoDate)}</span></div>
     <div class="row-count">${ch.videoCount ?? "—"}</div>
     <div class="row-subs" title="${escapeHtml(subscriberTitle(ch.subscriberCount))}">${formatSubscribers(ch.subscriberCount)}</div>
     <div class="channel-tags channel-vars">
@@ -733,6 +1242,7 @@ function buildChannelRow(ch) {
       </select>
       <span class="tag-chip var-toggle${ch.active ? " on-active" : ""}" data-role="toggle-active" title="Active — flag channels you're following">Active</span>
       <span class="tag-chip var-toggle${ch.finished ? " on-finished" : ""}" data-role="toggle-finished" title="Finished — flag channels you consider done">Finished</span>
+      <span class="tag-chip var-toggle${ch.trackVideos ? " on-track" : ""}" data-role="toggle-track" title="Track — pull this channel's new uploads into the Videos feed">Track</span>
       ${tagChipsHtml(ch)}
       <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
     </div>
@@ -760,8 +1270,8 @@ function folderOptionsHtml(ch) {
 }
 
 // Top-level folders as [id, folder] entries, unsorted pinned first, then by order.
-function getTopLevelFoldersOrdered() {
-  return Object.entries(state.folders)
+function getTopLevelFoldersOrdered(folders = state.folders) {
+  return Object.entries(folders)
     .filter(([, f]) => !f.parentId)
     .sort((a, b) => {
       if (a[0] === "unsorted") return -1;
@@ -821,6 +1331,16 @@ function formatShortDate(iso) {
   return date.toLocaleDateString(undefined, {
     year: "numeric", month: "short", day: "numeric",
   });
+}
+
+// Compact all-numeric date for a narrow date column, e.g. "06/07/07"
+// (day/month/year, two digits each). Mirrors formatShortDate's "—" for empty.
+function formatNumericDate(iso) {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (isNaN(date)) return "—";
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${p2(date.getDate())}/${p2(date.getMonth() + 1)}/${p2(date.getFullYear() % 100)}`;
 }
 
 // Full date + time for tooltips, e.g. "Jul 3, 2026, 2:15 PM"
@@ -919,18 +1439,27 @@ function openSyncDiffModal(diff) {
   pendingSyncDiff = diff;
   const { direction, channels: { added, removed, modified } } = diff;
   const isUpload = direction === "upload";
-  // Folders/settings diffs are new; guard for gists synced before they existed.
+  // Folders/settings/video diffs are all optional; guard for gists synced before
+  // they existed.
   const fo = diff.folders || { added: [], removed: [], modified: [] };
   const settings = diff.settings || [];
   // Folder removals only truly apply on upload (download keeps local-only folders).
   const foRemoved = isUpload ? fo.removed : [];
   const folderCount = fo.added.length + fo.modified.length + foRemoved.length;
 
+  const vf = diff.videoFolders || { added: [], removed: [], modified: [] };
+  const vfRemoved = isUpload ? vf.removed : [];
+  const vfCount = vf.added.length + vf.modified.length + vfRemoved.length;
+  const vids = diff.videos || { added: 0, modified: 0 };
+  const vidsCount = vids.added + vids.modified;
+
   el.syncDiffTitle.textContent = isUpload ? "Review upload" : "Review download";
 
-  const totalChanges = added.length + removed.length + modified.length + folderCount + settings.length;
+  const totalChanges = added.length + removed.length + modified.length + folderCount + settings.length + vfCount + vidsCount;
   const extra = [];
   if (folderCount) extra.push(`${folderCount} folder change${folderCount === 1 ? "" : "s"}`);
+  if (vfCount) extra.push(`${vfCount} list change${vfCount === 1 ? "" : "s"}`);
+  if (vidsCount) extra.push(`${vidsCount} video${vidsCount === 1 ? "" : "s"}`);
   if (settings.length) extra.push(`${settings.length} setting${settings.length === 1 ? "" : "s"}`);
   el.syncDiffSummary.textContent = totalChanges === 0
     ? "No differences — already in sync."
@@ -956,6 +1485,9 @@ function openSyncDiffModal(diff) {
   const dest = isUpload ? "in Gist" : "locally";
   if (settings.length) el.syncDiffBody.appendChild(buildSyncSettingsSection(`Settings — will overwrite ${dest}`, settings));
   if (folderCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Folders — will overwrite ${dest}`, fo.added, fo.modified, foRemoved));
+  if (vfCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Watch Later lists — will overwrite ${dest}`, vf.added, vf.modified, vfRemoved));
+  if (vidsCount) el.syncDiffBody.appendChild(buildSyncNoteSection(`Videos — merged ${dest}`, vidsCount,
+    `${vids.added} new, ${vids.modified} with changed watched/saved/list state. Videos merge both ways; none are removed.`));
 
   el.syncDiffApply.textContent = isUpload ? "Apply upload" : "Apply download";
   el.syncDiffApply.disabled = totalChanges === 0;
@@ -1023,6 +1555,22 @@ function buildSyncFolderSection(title, added, modified, removed) {
   for (const f of removed) {
     addRow(`<span class="scan-diff-text"><b>${escapeHtml(f.name)}</b><span class="scan-diff-sub">removed</span></span>`);
   }
+  sec.appendChild(list);
+  return sec;
+}
+
+// A read-only one-line section (used for the video-store summary, which is too
+// large to review per item).
+function buildSyncNoteSection(title, count, note) {
+  const sec = document.createElement("div");
+  sec.className = "scan-diff-section";
+  sec.appendChild(buildDiffSectionHeader(title, "mod", count));
+  const list = document.createElement("div");
+  list.className = "scan-diff-list";
+  const row = document.createElement("div");
+  row.className = "scan-diff-row";
+  row.innerHTML = `<span class="scan-diff-text">${escapeHtml(note)}</span>`;
+  list.appendChild(row);
   sec.appendChild(list);
   return sec;
 }
@@ -1110,15 +1658,16 @@ function bindEvents() {
   el.folderList.addEventListener("click", (e) => {
     const li = e.target.closest(".folder-item");
     if (!li) return;
+    const d = fdom();
     if (li.dataset.parentFolder) {
       const fid = li.dataset.folderId;
-      if (collapsedFolders.has(fid)) collapsedFolders.delete(fid);
-      else collapsedFolders.add(fid);
+      if (d.collapsed.has(fid)) d.collapsed.delete(fid);
+      else d.collapsed.add(fid);
       renderFolders();
       return;
     }
-    currentFolderId = li.dataset.folderId;
-    resetVariableFilters(); // filters are per-folder-view
+    d.select(li.dataset.folderId);
+    if (currentView !== "watchlater") resetVariableFilters(); // channel filters are per-folder-view
     render();
   });
 
@@ -1203,7 +1752,170 @@ function bindEvents() {
 
   el.searchInput.addEventListener("input", (e) => {
     searchQuery = e.target.value;
-    renderGrid();
+    if (currentView === "new") renderVideoFeed();
+    else if (currentView === "watchlater") renderWatchLater();
+    else renderGrid();
+  });
+
+  // View switch + shared video toolbar
+  el.viewChannelsBtn.addEventListener("click", () => setView("channels"));
+  el.viewNewBtn.addEventListener("click", () => setView("new"));
+  el.viewWatchLaterBtn.addEventListener("click", () => setView("watchlater"));
+
+  // Re-render whichever video view is active (for ephemeral filter toggles).
+  const renderActiveVideoView = () => {
+    if (currentView === "watchlater") renderWatchLater();
+    else renderVideoFeed();
+  };
+
+  el.videoFilters.addEventListener("click", (e) => {
+    if (e.target.dataset.role !== "filter-unwatched") return;
+    videoUnwatchedOnly = !videoUnwatchedOnly;
+    renderActiveVideoView();
+  });
+
+  // Video sort buttons: click an inactive key to switch to it (defaulting to
+  // descending); click the active key to flip direction.
+  const onSortClick = (key) => {
+    if (videoSortKey === key) videoSortDir = videoSortDir === "desc" ? "asc" : "desc";
+    else { videoSortKey = key; videoSortDir = "desc"; }
+    chrome.storage.local.set({ videoSort: { key: videoSortKey, dir: videoSortDir } });
+    renderActiveVideoView();
+  };
+  el.videoSortDate.addEventListener("click", () => onSortClick("date"));
+  el.videoSortLength.addEventListener("click", () => onSortClick("length"));
+
+  el.videoMarkAllBtn.addEventListener("click", async () => {
+    const vids = currentView === "watchlater" ? getWatchLaterVideos() : getFilteredVideos();
+    if (!vids.length) return;
+    if (!confirm(`Mark all ${vids.length} shown video${vids.length === 1 ? "" : "s"} as watched?`)) return;
+    for (const v of vids) v.watched = true;
+    await saveVideos();
+  });
+
+  el.videoFetchAllBtn.addEventListener("click", () => {
+    const tracked = Object.values(state.channels).filter((c) => c.trackVideos).map((c) => c.id);
+    if (!tracked.length) {
+      el.statusText.textContent = "No tracked channels — turn on Track first.";
+      return;
+    }
+    if (!confirm(`Fetch the full upload history of all ${tracked.length} tracked channel${tracked.length === 1 ? "" : "s"}? This can use significant API quota for large catalogs.`)) return;
+    fetchAllVideos(tracked);
+  });
+
+  // Suppress the browser's text-selection smear when shift-clicking cards.
+  const suppressShiftSmear = (e) => {
+    if (e.shiftKey && e.target.closest(".video-card")) e.preventDefault();
+  };
+  el.videoFeed.addEventListener("mousedown", suppressShiftSmear);
+  el.watchLaterGrid.addEventListener("mousedown", suppressShiftSmear);
+
+  // New feed card: modifier-click selects; action buttons act; plain click opens.
+  el.videoFeed.addEventListener("click", async (e) => {
+    const card = e.target.closest(".video-card");
+    if (!card) return;
+    const id = card.dataset.videoId;
+    const v = state.videos[id];
+    if (!v) return;
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      e.preventDefault();
+      handleVideoSelectionClick(id, e);
+      return;
+    }
+    if (e.target.closest('[data-action="toggle-watched"]')) {
+      v.watched = !v.watched;
+      await saveVideos();
+      return;
+    }
+    if (e.target.closest('[data-action="hide"]')) {
+      v.hidden = true; // dismissed — filtered out and never re-shown by a refresh
+      await saveVideos();
+      return;
+    }
+    if (e.target.closest("[data-action]")) return;
+    if (selectedVideoIds.size) clearVideoSelection();
+    openVideo(id, false);
+  });
+  el.videoFeed.addEventListener("auxclick", (e) => {
+    if (e.button !== 1) return;
+    const card = e.target.closest(".video-card");
+    if (!card || e.target.closest("[data-action]")) return;
+    e.preventDefault();
+    openVideo(card.dataset.videoId, true);
+  });
+  // Right-click a New-feed card → bulk menu if inside a 2+ selection, else single.
+  el.videoFeed.addEventListener("contextmenu", (e) => {
+    const card = e.target.closest(".video-card");
+    if (!card) return;
+    e.preventDefault();
+    const id = card.dataset.videoId;
+    const v = state.videos[id];
+    if (!v) return;
+    if (selectedVideoIds.size > 1 && selectedVideoIds.has(id)) {
+      showVideoBulkContextMenu(e.clientX, e.clientY, [...selectedVideoIds]);
+      return;
+    }
+    showContextMenu(e.clientX, e.clientY, [
+      {
+        label: v.watched ? "Mark unwatched" : "Mark watched",
+        action: async () => { v.watched = !v.watched; await saveVideos(); },
+      },
+      { separator: true },
+      {
+        label: "Remove",
+        danger: true,
+        action: async () => { v.hidden = true; await saveVideos(); },
+      },
+    ]);
+  });
+
+  // Watch Later card: modifier-click selects; action buttons act; plain opens.
+  el.watchLaterGrid.addEventListener("click", async (e) => {
+    const card = e.target.closest(".video-card");
+    if (!card) return;
+    const id = card.dataset.videoId;
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      e.preventDefault();
+      handleVideoSelectionClick(id, e);
+      return;
+    }
+    if (e.target.closest('[data-action="toggle-watched"]')) {
+      const v = state.videos[id];
+      if (v) { v.watched = !v.watched; await saveVideos(); }
+      return;
+    }
+    if (e.target.closest('[data-action="remove"]')) {
+      await removeFromWatchLater(id);
+      return;
+    }
+    if (e.target.closest("[data-action]")) return;
+    if (selectedVideoIds.size) clearVideoSelection();
+    openVideo(id, false);
+  });
+  el.watchLaterGrid.addEventListener("auxclick", (e) => {
+    if (e.button !== 1) return;
+    const card = e.target.closest(".video-card");
+    if (!card || e.target.closest("[data-action]")) return;
+    e.preventDefault();
+    openVideo(card.dataset.videoId, true);
+  });
+  // Right-click a saved video → bulk menu if inside a 2+ selection, else single.
+  el.watchLaterGrid.addEventListener("contextmenu", (e) => {
+    const card = e.target.closest(".video-card");
+    if (!card) return;
+    e.preventDefault();
+    const id = card.dataset.videoId;
+    const v = state.videos[id];
+    if (!v) return;
+    if (selectedVideoIds.size > 1 && selectedVideoIds.has(id)) {
+      showVideoBulkContextMenu(e.clientX, e.clientY, [...selectedVideoIds]);
+      return;
+    }
+    showContextMenu(e.clientX, e.clientY, [
+      { label: "Move to list", submenu: () => buildListSubmenu(id, v) },
+      { separator: true },
+      { label: "Remove from Watch Later", danger: true, action: () => removeFromWatchLater(id) },
+    ]);
   });
 
   el.clearFiltersBtn.addEventListener("click", clearAllFilters);
@@ -1244,6 +1956,7 @@ function bindEvents() {
   el.filterBeforeYear.addEventListener("change", onBeforeChange);
 
   el.listTableHeader.addEventListener("click", (e) => {
+    if (e.target.closest(".col-resizer")) return; // a resize drag, not a sort
     const col = e.target.closest(".lth-sort-col");
     if (!col) return;
     const key = col.dataset.sort;
@@ -1270,6 +1983,7 @@ function bindEvents() {
 
   el.refreshBtn.addEventListener("click", async () => {
     el.statusText.textContent = "Refreshing…";
+    videoDetailsRequested = false; // re-enable the auto length/view fetch
     const res = await chrome.runtime.sendMessage({ type: "REFRESH_STATS" });
     await loadState();
     render();
@@ -1362,12 +2076,17 @@ function bindEvents() {
       return;
     }
 
-    if (e.target.dataset.role === "toggle-active" || e.target.dataset.role === "toggle-finished") {
-      const key = e.target.dataset.role === "toggle-active" ? "active" : "finished";
+    const toggleKey = { "toggle-active": "active", "toggle-finished": "finished", "toggle-track": "trackVideos" }[e.target.dataset.role];
+    if (toggleKey) {
       const ch = state.channels[channelId];
       if (ch) {
-        ch[key] = !ch[key];
+        ch[toggleKey] = !ch[toggleKey];
         await chrome.storage.local.set({ channels: state.channels });
+        // Enabling tracking: fetch this channel's uploads now so the feed fills
+        // immediately instead of waiting for the next scheduled refresh.
+        if (toggleKey === "trackVideos" && ch.trackVideos) {
+          chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
+        }
       }
       return;
     }
@@ -1409,6 +2128,18 @@ function bindEvents() {
       {
         label: "Move to folder",
         submenu: () => buildFolderSubmenu(channelId, ch),
+      },
+      {
+        label: ch.trackVideos ? "Stop tracking videos" : "Track videos",
+        action: async () => {
+          ch.trackVideos = !ch.trackVideos;
+          await chrome.storage.local.set({ channels: state.channels });
+          if (ch.trackVideos) chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
+        },
+      },
+      {
+        label: ch.fetchedAll ? "Re-fetch all videos" : "Fetch all videos",
+        action: () => fetchAllVideos([channelId]),
       },
       { separator: true },
       {
@@ -1500,54 +2231,52 @@ function bindEvents() {
     const name = el.folderNameInput.value.trim();
     if (!name) return;
     const { type, id } = folderModalMode;
-    if (type === "rename-folder" && state.folders[id]) {
-      state.folders[id].name = name;
-      await chrome.storage.local.set({ folders: state.folders });
-    } else if (type === "rename-tag" && state.tags[id]) {
+    if (type === "rename-tag" && state.tags[id]) {
       state.tags[id].name = name;
       await chrome.storage.local.set({ tags: state.tags });
+    } else if (type === "rename-folder") {
+      const d = fdom();
+      if (d.folders[id]) { d.folders[id].name = name; await d.persist(); }
     } else if (type === "create-folder") {
+      const d = fdom();
       const newId = slugify(name) + "-" + Date.now().toString(36).slice(-4);
       const parentId = el.folderParentSelect.value || null;
-      const siblings = Object.values(state.folders).filter((f) =>
+      const siblings = Object.values(d.folders).filter((f) =>
         parentId ? f.parentId === parentId : !f.parentId
       );
-      const order = siblings.length;
-      const folderData = { name, order };
+      const folderData = { name, order: siblings.length };
       if (parentId) folderData.parentId = parentId;
-      state.folders[newId] = folderData;
-      await chrome.storage.local.set({ folders: state.folders });
+      d.folders[newId] = folderData;
+      await d.persist();
     }
     el.folderModal.hidden = true;
     render();
   });
 
-  // Right-click menu on folders
+  // Right-click menu on folders (channel folders or Watch Later lists per view)
   el.folderList.addEventListener("contextmenu", (e) => {
     const li = e.target.closest(".folder-item");
     if (!li) return;
     e.preventDefault();
     const id = li.dataset.folderId;
-    if (id === "all" || id === "unsorted") return; // virtual / pinned home — no folder actions
-    const folder = state.folders[id];
+    if (id === "all" || id === "unsorted") return; // virtual / pinned home — no actions
+    const folder = fdom().folders[id];
     const isChild = !!folder?.parentId;
-    const menuItems = [{ label: "Rename…", action: () => openFolderModal("rename-folder", id) }];
-    if (id !== "unsorted") {
-      menuItems.push({
+    const menuItems = [
+      { label: "Rename…", action: () => openFolderModal("rename-folder", id) },
+      {
         label: folder?.emoji ? "Change emoji…" : "Set emoji…",
         action: () => openEmojiInput(li, id),
-      });
-      if (folder?.emoji) {
-        menuItems.push({ label: "Remove emoji", action: () => setFolderEmoji(id, "") });
-      }
+      },
+    ];
+    if (folder?.emoji) {
+      menuItems.push({ label: "Remove emoji", action: () => setFolderEmoji(id, "") });
     }
     // Only allow subfolders one level deep (top-level folders can have children)
-    if (!isChild && id !== "unsorted") {
+    if (!isChild) {
       menuItems.push({ label: "New subfolder…", action: () => openFolderModal("create-folder", null, id) });
     }
-    if (id !== "unsorted") {
-      menuItems.push({ label: "Delete", danger: true, action: () => deleteFolder(id) });
-    }
+    menuItems.push({ label: "Delete", danger: true, action: () => deleteFolder(id) });
     showContextMenu(e.clientX, e.clientY, menuItems);
   });
 
@@ -1696,9 +2425,13 @@ function bindEvents() {
 
 function openFolderModal(type, id = null, defaultParentId = null) {
   folderModalMode = { type, id };
+  const d = fdom();
+  const isList = currentView === "watchlater";
+  const noun = isList ? "list" : "folder";
+  const Noun = isList ? "List" : "Folder";
   const texts = {
-    "create-folder": { title: "New folder", label: "Folder name", save: "Create", value: "" },
-    "rename-folder": { title: "Rename folder", label: "Folder name", save: "Save", value: state.folders[id]?.name || "" },
+    "create-folder": { title: `New ${noun}`, label: `${Noun} name`, save: "Create", value: "" },
+    "rename-folder": { title: `Rename ${noun}`, label: `${Noun} name`, save: "Save", value: d.folders[id]?.name || "" },
     "rename-tag": { title: "Rename tag", label: "Tag name", save: "Save", value: state.tags[id]?.name || "" },
   };
   const t = texts[type];
@@ -1712,7 +2445,7 @@ function openFolderModal(type, id = null, defaultParentId = null) {
   el.folderParentRow.hidden = !isCreate;
   if (isCreate) {
     // Populate with top-level folders (excluding unsorted, which can't be a parent)
-    const parentOptions = Object.entries(state.folders)
+    const parentOptions = Object.entries(d.folders)
       .filter(([fid, f]) => !f.parentId && fid !== "unsorted")
       .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
       .map(([fid, f]) => `<option value="${fid}"${defaultParentId === fid ? " selected" : ""}>${escapeHtml(f.name)}</option>`)
@@ -1726,35 +2459,44 @@ function openFolderModal(type, id = null, defaultParentId = null) {
   el.folderNameInput.select();
 }
 
+// Delete a folder/list from the active domain: its items move to Unsorted and
+// its subfolders are promoted to top-level.
 async function deleteFolder(id) {
-  const folder = state.folders[id];
+  const d = fdom();
+  const isList = currentView === "watchlater";
+  const folder = d.folders[id];
   if (!folder || id === "unsorted") return;
 
-  const childIds = getChildFolderIds(id);
-  const directCount = Object.values(state.channels).filter((c) => c.folderId === id).length;
-  const childCount = Object.values(state.channels).filter((c) => childIds.includes(c.folderId)).length;
-  const totalCount = directCount + childCount;
+  const childIds = getChildFolderIds(id, d.folders);
+  const gone = new Set([id, ...childIds]);
+  const itemFolderId = (it) => (isList ? it.folderId || "unsorted" : it.folderId);
+  const items = isList ? Object.values(state.videos).filter((v) => v.saved) : Object.values(state.channels);
+  const totalCount = items.filter((it) => gone.has(itemFolderId(it))).length;
 
-  let msg = `Delete folder "${folder.name}"?`;
+  let msg = `Delete ${isList ? "list" : "folder"} "${folder.name}"?`;
   if (childIds.length) {
-    msg += ` Its ${childIds.length} subfolder${childIds.length === 1 ? "" : "s"} will become top-level.`;
+    msg += ` Its ${childIds.length} sub${isList ? "list" : "folder"}${childIds.length === 1 ? "" : "s"} will become top-level.`;
   }
   if (totalCount) {
-    msg += ` ${totalCount} channel${totalCount === 1 ? "" : "s"} will move to Unsorted.`;
+    const itemNoun = isList ? "video" : "channel";
+    msg += ` ${totalCount} ${itemNoun}${totalCount === 1 ? "" : "s"} will move to Unsorted.`;
   }
   if (!confirm(msg)) return;
 
-  // Move channels to unsorted
-  for (const ch of Object.values(state.channels)) {
-    if (ch.folderId === id || childIds.includes(ch.folderId)) ch.folderId = "unsorted";
+  // Move items to unsorted
+  for (const it of items) {
+    if (gone.has(itemFolderId(it))) it.folderId = "unsorted";
   }
   // Promote children to top-level
-  for (const childId of childIds) {
-    delete state.folders[childId].parentId;
+  for (const childId of childIds) delete d.folders[childId].parentId;
+  delete d.folders[id];
+  if (d.selected === id || childIds.includes(d.selected)) d.select("all");
+
+  if (isList) {
+    await chrome.storage.local.set({ videos: state.videos, videoFolders: state.videoFolders });
+  } else {
+    await chrome.storage.local.set({ channels: state.channels, folders: state.folders });
   }
-  delete state.folders[id];
-  if (currentFolderId === id || childIds.includes(currentFolderId)) currentFolderId = "all";
-  await chrome.storage.local.set({ channels: state.channels, folders: state.folders });
   render();
 }
 
@@ -1888,10 +2630,11 @@ function hideContextMenu() {
 
 // Generic folder-picker submenu. `onPick(folderId)` fires on choice; `isActive`
 // (optional) marks the currently-selected destination. Only leaf folders are
-// valid targets — parents nest their children in a further submenu.
-function folderSubmenuItems(onPick, isActive = () => false) {
-  return getTopLevelFoldersOrdered().map(([id, f]) => {
-    const children = Object.entries(state.folders)
+// valid targets — parents nest their children in a further submenu. `folders`
+// defaults to channel folders; pass state.videoFolders for Watch Later lists.
+function folderSubmenuItems(onPick, isActive = () => false, folders = state.folders) {
+  return getTopLevelFoldersOrdered(folders).map(([id, f]) => {
+    const children = Object.entries(folders)
       .filter(([, cf]) => cf.parentId === id)
       .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0));
 
@@ -1918,6 +2661,13 @@ function buildFolderSubmenu(channelId, ch) {
     if (currentFolderId !== "all") renderGrid();
   };
   return folderSubmenuItems(moveTo, (id) => ch.folderId === id);
+}
+
+// Watch Later "move to list" submenu — the video-list equivalent of the channel
+// folder submenu.
+function buildListSubmenu(videoId, v) {
+  const moveTo = (listId) => moveVideoToList(videoId, listId);
+  return folderSubmenuItems(moveTo, (id) => (v.folderId || "unsorted") === id, state.videoFolders);
 }
 
 // ---------- Multi-select ----------
@@ -2035,8 +2785,97 @@ function showBulkContextMenu(x, y, ids) {
     { label: "Mark finished", action: () => bulkMutate(ids, (ch) => (ch.finished = true)) },
     { label: "Mark unfinished", action: () => bulkMutate(ids, (ch) => (ch.finished = false)) },
     { separator: true },
+    { label: "Track videos", action: () => bulkMutate(ids, (ch) => (ch.trackVideos = true)) },
+    { label: "Stop tracking videos", action: () => bulkMutate(ids, (ch) => (ch.trackVideos = false)) },
+    { label: `Fetch all videos (${n})`, action: () => fetchAllVideos(ids) },
+    { separator: true },
     { label: `Delete ${n} channels`, danger: true, action: () => bulkDelete(ids) },
   ]);
+}
+
+// ---------- Video multi-select (New / Watch Later) ----------
+
+// The displayed order of the active video view, for shift-range selection.
+function currentVideoOrder() {
+  return (currentView === "watchlater" ? getWatchLaterVideos() : getFilteredVideos()).map((v) => v.id);
+}
+
+// Ctrl/Cmd toggles one card; Shift add/removes the run from the anchor.
+function handleVideoSelectionClick(videoId, e) {
+  const ordered = currentVideoOrder();
+  if (e.shiftKey && videoSelectionAnchor && ordered.includes(videoSelectionAnchor)) {
+    const a = ordered.indexOf(videoSelectionAnchor);
+    const b = ordered.indexOf(videoId);
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    const adding = !selectedVideoIds.has(videoId);
+    for (let i = lo; i <= hi; i++) {
+      if (adding) selectedVideoIds.add(ordered[i]);
+      else selectedVideoIds.delete(ordered[i]);
+    }
+  } else {
+    if (selectedVideoIds.has(videoId)) selectedVideoIds.delete(videoId);
+    else selectedVideoIds.add(videoId);
+  }
+  videoSelectionAnchor = videoId;
+  paintVideoSelection();
+}
+
+function paintVideoSelection() {
+  for (const card of document.querySelectorAll(".video-card[data-video-id]")) {
+    card.classList.toggle("selected", selectedVideoIds.has(card.dataset.videoId));
+  }
+}
+
+function clearVideoSelection() {
+  if (!selectedVideoIds.size) return;
+  selectedVideoIds.clear();
+  videoSelectionAnchor = null;
+  paintVideoSelection();
+}
+
+// Apply `fn` to every selected video, persist once, then clear the selection.
+// The storage write re-renders both video views via onChanged.
+async function bulkVideoMutate(ids, fn) {
+  for (const id of ids) {
+    const v = state.videos[id];
+    if (v) fn(v);
+  }
+  await saveVideos();
+  clearVideoSelection();
+}
+
+async function bulkRemoveFromWatchLater(ids) {
+  for (const id of ids) {
+    const v = state.videos[id];
+    if (!v) continue;
+    if (!v.channelId || !state.channels[v.channelId]?.trackVideos) delete state.videos[id];
+    else { v.saved = false; delete v.folderId; }
+  }
+  await saveVideos();
+  clearVideoSelection();
+}
+
+function showVideoBulkContextMenu(x, y, ids) {
+  const n = ids.length;
+  const items = [
+    { label: `Mark ${n} watched`, action: () => bulkVideoMutate(ids, (v) => (v.watched = true)) },
+    { label: `Mark ${n} unwatched`, action: () => bulkVideoMutate(ids, (v) => (v.watched = false)) },
+    { separator: true },
+  ];
+  if (currentView === "watchlater") {
+    items.push({
+      label: `Move ${n} to list`,
+      submenu: () => folderSubmenuItems(
+        (listId) => bulkVideoMutate(ids, (v) => { if (v.saved) v.folderId = listId; }),
+        () => false,
+        state.videoFolders
+      ),
+    });
+    items.push({ label: `Remove ${n} from Watch Later`, danger: true, action: () => bulkRemoveFromWatchLater(ids) });
+  } else {
+    items.push({ label: `Remove ${n} from feed`, danger: true, action: () => bulkVideoMutate(ids, (v) => (v.hidden = true)) });
+  }
+  showContextMenu(x, y, items);
 }
 
 async function deleteChannel(channelId) {

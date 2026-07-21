@@ -4,7 +4,8 @@ A personal YouTube subscription organizer — an alternative to PocketTube,
 fully under your control, with no features locked behind a paywall. Sort your
 subscriptions into folders, tag them and set per-channel variables (language,
 active/finished flags), see when each channel last uploaded and how many videos
-it has, and (optionally) sync everything across devices through a private
+it has, follow a **curated video feed** of new uploads from just the channels
+you pick, and (optionally) sync everything across devices through a private
 GitHub Gist.
 
 It's a Manifest V3 Chrome extension with no build step and no backend: a
@@ -113,6 +114,8 @@ Each row's **Variables** cell holds per-channel attributes alongside its tags:
 - **Active** / **Finished** — two independent flags (a channel can be neither,
   either, or both). Click a chip to toggle it; it lights up when on. Use them to
   mark channels you're actively following versus ones you consider done.
+- **Track** — feeds this channel's new uploads into the **Videos** view (see
+  below). Toggling it on fetches that channel's recent videos right away.
 - **Tags** — the freeform labels described above.
 
 All of these are **filterable**. The filter bar above the list shows, for the
@@ -139,6 +142,11 @@ Click the **Last Video** or **Videos** column headers to sort; each click
 cycles none → descending → ascending, and the choice is remembered. The list
 uses infinite scroll, rendering channels in batches of 40 as you scroll.
 
+**Resize columns** by dragging the divider on the right edge of any column
+header. Each column has a minimum width, and your widths are remembered. When
+the **Last Video** column gets narrow, its dates switch to a compact numeric
+`DD/MM/YY` form (e.g. `06/07/07`).
+
 When no channel matches the current folder and filters, a **"No matching
 channels"** panel appears with a **Clear filters** button (shown only when a
 filter is actually active — an empty folder just says so).
@@ -150,11 +158,67 @@ Row interactions:
 - **Middle-click** → opens it in a background tab without leaving the dashboard.
 - **Right-click** → Move to folder / Delete channel.
 
+## Videos: New and Watch Later
+
+Two tabs at the top of the sidebar list videos, each for a different job.
+
+### New
+
+A curated feed of recent uploads — but only from the channels you flag with the
+**Track** variable, not your whole subscription list. Built for when you follow
+too many channels to keep up with YouTube's own subscriptions feed.
+
+- **Pick your channels.** Turn on **Track** on any channel — its chip in the
+  Variables cell, or right-click → **Track videos** (works on a multi-selection
+  too). Latest uploads are fetched on the next **Refresh Stats** (or right away
+  when you enable Track on a single channel).
+- **Organized your way.** Reuses your channel **folder sidebar** — select a
+  folder to see only its tracked channels' videos, grouped by day. **Sort** by
+  date or length (each click toggles ascending/descending). Filter with the
+  **Unwatched** chip or **Mark all watched**.
+- **Length & views.** Each card shows the video's view count; with an API key set
+  it also shows the **duration** (length isn't available from the free RSS feed).
+  Lengths fetch automatically when you open a video view with a key set.
+- **Remove & no live streams.** Hit **Remove** on a card to dismiss a video from
+  the feed — it won't come back on the next refresh. Live streams and scheduled
+  premieres are filtered out automatically (they're not finished videos); an API
+  key makes this detection reliable.
+- **Fetch the full back catalog.** A normal refresh only sees each channel's
+  latest ~15 uploads (YouTube's RSS limit). To pull a channel's **entire** upload
+  history, right-click it → **Fetch all videos** (or select several), or use
+  **Fetch full history** in the New toolbar for every tracked channel. This needs
+  an API key and can use notable quota for very large channels, but it isn't
+  capped afterward — the full history stays.
+- **RSS-powered, no quota.** Roughly the 15 latest per channel, no API key.
+- **Why not YouTube's algorithm?** No API exposes YouTube's personalized ranking
+  for a subset of channels, so this feed is **chronological**. Every video opens
+  on youtube.com, so YouTube's own algorithm still drives your actual watch
+  session (autoplay, up-next) — you're just curating which uploads reach you.
+
+### Watch Later
+
+A place to save individual videos and **organize them into nested lists**, just
+like channels have folders (parent lists, sub-lists, drag-to-reorder, emoji,
+rename/delete). Independent of the New feed.
+
+- **Add a video by right-clicking it on YouTube.** On any YouTube page,
+  right-click a video (or the watch page itself) → **“Save to MyTube Watch
+  Later.”** The extension grabs the video and fetches its title automatically —
+  no copy-pasting URLs, no API key. A notification confirms the save.
+- **Organize into lists.** Saved videos start in **Unsorted**. Create lists with
+  **+ New list**, nest them one level deep, and right-click a video → **Move to
+  list**. Right-click a list to rename, set an emoji, add a sub-list, or delete.
+- **Watch & clean up.** Click a video to open it on YouTube (marked **watched**);
+  **Remove** takes it out of Watch Later. The **Sort** (date/length), **Unwatched**
+  chip, and **Mark all watched** controls work here too. View count shows on each
+  card; duration shows when an API key is set.
+
 ## Cross-device sync (GitHub Gist)
 
 All data lives in `chrome.storage.local` by default. To sync it between
-devices, the extension mirrors your folders/tags/channels into a **secret
-GitHub Gist** (free):
+devices, the extension mirrors **everything** — channels, folders, tags, your
+**Watch Later lists**, and the whole **video library** (saved/watched/dismissed
+state and all) — into a **secret GitHub Gist** (free):
 
 1. On github.com go to **Settings → Developer settings → Personal access
    tokens → Fine-grained tokens → Generate new token**, and grant only the
@@ -173,15 +237,22 @@ Two ways to sync:
   removals opt-out. Upload makes the Gist match this device; Download makes this
   device match the Gist.
 - The **3-hour background refresh** also runs an automatic **union merge** (no
-  review): new channels, folders, tags and tag assignments flow both ways,
-  variables (language, active/finished) carry with each channel, and fresher
-  stats win. Deletions do **not** propagate through the background merge
-  — remove an item on each device, or use a directional Upload/Download to make
-  a deletion stick.
+  review): new channels, folders, tags, Watch Later lists and videos flow both
+  ways; per-video state combines (watched/saved/dismissed stay set if either
+  device set them, and an organized list assignment wins); variables carry with
+  each channel; and fresher stats win. Deletions do **not** propagate through the
+  background merge — remove an item on each device, or use a directional
+  Upload/Download to make a deletion stick.
 
-Notes: the gist is "secret" (unlisted, but anyone with the URL can read it — it
-holds only channel names/IDs and your folder/tag/variable structure, never the
-API key or token). The token is stored in `chrome.storage.local` on each device.
+Notes: the gist is "secret" (unlisted, but anyone with the URL can read it, and
+it does include your **API key** — but never the GitHub token, which stays only
+in `chrome.storage.local` on each device). To keep the gist small, only the
+videos you've **actually touched** sync — the ones you've saved, watched,
+dismissed, or filed into a list. The rest (the New-feed cache and anything pulled
+by "Fetch full history") is re-derivable, so it stays on each device and rebuilds
+locally rather than bloating the gist. That means a device won't inherit another
+device's full-history dump automatically — run "Fetch full history" there too if
+you want it — but your Watch Later, dismissals and watched state all carry over.
 
 ## Settings
 

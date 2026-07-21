@@ -20,6 +20,7 @@ const ALARM_NAME = "mytube-refresh";
 const REFRESH_PERIOD_MIN = 180; // auto-refresh every 3 hours
 const YT_CHANNELS_BATCH = 50; // YouTube channels.list max ids per call
 const HANDLE_RESOLVE_CONCURRENCY = 5; // parallel handle->id lookups per batch
+const VIDEO_KEEP_PER_CHANNEL = 60; // cap stored videos per tracked channel
 
 // Settings mirrored into the gist alongside the library. gistToken/gistId/
 // lastSyncedAt are deliberately excluded: the token is the credential used to
@@ -82,7 +83,7 @@ function notifyTrackedUpdates(updated) {
 // ---------- Setup ----------
 
 chrome.runtime.onInstalled.addListener(async () => {
-  const data = await chrome.storage.local.get(["channels", "folders", "tags"]);
+  const data = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
   if (!data.channels) await chrome.storage.local.set({ channels: {} });
   else await repairDoubledNames(data.channels);
   if (!data.folders) {
@@ -95,8 +96,143 @@ chrome.runtime.onInstalled.addListener(async () => {
     await chrome.storage.local.set({ folders: data.folders });
   }
   if (!data.tags) await chrome.storage.local.set({ tags: {} });
+  // Watch Later lists mirror channel folders: a pinned "unsorted" home list.
+  if (!data.videoFolders) {
+    await chrome.storage.local.set({ videoFolders: { unsorted: { name: "Unsorted", order: 0 } } });
+  }
+  // Backfill folderId on any pre-existing saved videos so they land in a list.
+  if (data.videos) {
+    let touched = false;
+    for (const v of Object.values(data.videos)) {
+      if (v.saved && !v.folderId) { v.folderId = "unsorted"; touched = true; }
+    }
+    if (touched) await chrome.storage.local.set({ videos: data.videos });
+  }
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: REFRESH_PERIOD_MIN });
+  setupContextMenus();
 });
+
+// The context menus also need (re)creating when the worker cold-starts, not only
+// on install — onInstalled doesn't fire on browser restart / worker wake.
+chrome.runtime.onStartup?.addListener(() => setupContextMenus());
+
+// ---------- "Save to Watch Later" context menu (YouTube pages) ----------
+
+const CTX_SAVE_ID = "mytube-save-watchlater";
+const YT_VIDEO_TARGETS = [
+  "*://*.youtube.com/watch*",
+  "*://*.youtube.com/shorts/*",
+  "*://youtu.be/*",
+];
+
+// Recreate the right-click items idempotently (removeAll first avoids duplicate-id
+// errors when this runs on both install and startup).
+function setupContextMenus() {
+  if (!chrome.contextMenus) return;
+  chrome.contextMenus.removeAll(() => {
+    // Right-click a video link/thumbnail anywhere on YouTube.
+    chrome.contextMenus.create({
+      id: CTX_SAVE_ID + "-link",
+      title: "Save to MyTube Watch Later",
+      contexts: ["link"],
+      targetUrlPatterns: YT_VIDEO_TARGETS,
+    });
+    // Right-click anywhere on a watch/shorts page itself.
+    chrome.contextMenus.create({
+      id: CTX_SAVE_ID + "-page",
+      title: "Save to MyTube Watch Later",
+      contexts: ["page", "video"],
+      documentUrlPatterns: YT_VIDEO_TARGETS,
+    });
+  });
+}
+
+chrome.contextMenus?.onClicked.addListener(async (info) => {
+  if (!info.menuItemId.startsWith(CTX_SAVE_ID)) return;
+  const videoId = extractVideoId(info.linkUrl || info.pageUrl || "");
+  if (!videoId) {
+    notify("mytube-save", "MyTube", "Couldn't find a YouTube video in that link.");
+    return;
+  }
+  await saveVideoToWatchLater(videoId);
+});
+
+// Pull an 11-char video id out of a watch / shorts / youtu.be URL.
+function extractVideoId(url) {
+  if (!url) return null;
+  const m =
+    url.match(/[?&]v=([0-9A-Za-z_-]{11})/) ||
+    url.match(/\/shorts\/([0-9A-Za-z_-]{11})/) ||
+    url.match(/youtu\.be\/([0-9A-Za-z_-]{11})/) ||
+    url.match(/\/embed\/([0-9A-Za-z_-]{11})/);
+  return m ? m[1] : null;
+}
+
+// Add a video to the Watch Later store. Title/author come from YouTube's public
+// oEmbed endpoint (no API key, no quota); the thumbnail is derived from the id.
+async function saveVideoToWatchLater(videoId) {
+  const { videos = {}, videoFolders = {} } = await chrome.storage.local.get(["videos", "videoFolders"]);
+  if (!videoFolders.unsorted) videoFolders.unsorted = { name: "Unsorted", order: 0 };
+
+  const existing = videos[videoId];
+  if (existing && existing.saved) {
+    notify("mytube-save", "Already saved", existing.title || "This video is already in Watch Later.");
+    return;
+  }
+
+  let title = existing?.title || `Video ${videoId}`;
+  let author = existing?.author || null;
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
+    );
+    if (res.ok) {
+      const meta = await res.json();
+      if (meta.title) title = meta.title;
+      if (meta.author_name) author = meta.author_name;
+    }
+  } catch (e) {
+    // Keep the fallback title; the save still succeeds offline.
+  }
+
+  videos[videoId] = {
+    ...(existing || {}),
+    id: videoId,
+    channelId: existing?.channelId || null,
+    title,
+    author,
+    published: existing?.published || null,
+    thumbnail: existing?.thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+    viewCount: existing?.viewCount ?? null,
+    watched: existing?.watched || false,
+    saved: true,
+    folderId: existing?.folderId || "unsorted",
+    addedAt: existing?.addedAt || Date.now(),
+  };
+  // Fill length + view count immediately if an API key is set (duration isn't
+  // available any other way); otherwise the card just shows no length.
+  const { apiKey } = await chrome.storage.local.get("apiKey");
+  if (apiKey && videos[videoId].duration === undefined) {
+    await fillVideoDetails(videos, apiKey, [videoId]);
+  }
+  await chrome.storage.local.set({ videos, videoFolders });
+  notify("mytube-save", "Saved to Watch Later", title);
+}
+
+// Generic single-line OS notification.
+function notify(idPrefix, title, message) {
+  try {
+    chrome.notifications.create(`${idPrefix}-${Date.now()}`, {
+      type: "basic",
+      iconUrl: NOTIFY_ICON,
+      title,
+      message,
+      priority: 0,
+    });
+  } catch (e) {
+    console.warn("notifications.create failed:", e);
+  }
+}
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== ALARM_NAME) return;
@@ -146,6 +282,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "FILL_MISSING_AVATARS") {
     fillMissingAvatars().then((r) => sendResponse(r || { ok: true }));
+    return true;
+  }
+  if (msg.type === "FILL_VIDEO_DETAILS") {
+    fillMissingVideoDetails().then((r) => sendResponse(r || { ok: true }));
+    return true;
+  }
+  if (msg.type === "FETCH_ALL_VIDEOS") {
+    fetchAllVideosForChannels(msg.channelIds || []).then(sendResponse);
     return true;
   }
   if (msg.type === "SYNC_GIST") {
@@ -484,25 +628,37 @@ async function refreshChannelStats(channelIds, preloaded) {
     }
   }
 
-  // 2) Last video date: via RSS feed, without spending quota. Track which
-  // active/finished channels gained a newer video so we can notify about them.
+  // 2) Last video date + tracked-channel video feed: via RSS, without spending
+  // quota. Track which active/finished channels gained a newer video so we can
+  // notify about them, and stash the recent uploads of `trackVideos` channels.
   const trackedUpdates = [];
+  const { videos: videoStore = {} } = await chrome.storage.local.get("videos");
+  const now = Date.now();
   await Promise.allSettled(
     channelIds.map(async (id) => {
       const ch = channels[id];
       const prevDate = ch?.lastVideoDate || null;
-      const date = await fetchLastVideoDate(id);
+      const { lastVideoDate, videos } = await fetchChannelVideos(id);
       if (ch) {
-        if (date) ch.lastVideoDate = date;
-        ch.lastFetched = Date.now();
-        if (date && date !== prevDate && (ch.active || ch.finished)) {
+        if (lastVideoDate) ch.lastVideoDate = lastVideoDate;
+        ch.lastFetched = now;
+        if (lastVideoDate && lastVideoDate !== prevDate && (ch.active || ch.finished)) {
           trackedUpdates.push({ name: ch.name, active: !!ch.active, finished: !!ch.finished });
         }
+        if (ch.trackVideos) upsertChannelVideos(videoStore, id, videos, now);
       }
     })
   );
+  pruneVideos(videoStore, channels);
+  // Duration isn't in RSS — backfill it (and fresher view counts) via the API
+  // when a key is set. Only newly-seen videos are queried, so this is cheap.
+  if (apiKey) {
+    const vd = await fillVideoDetails(videoStore, apiKey);
+    stats.videoDetailsFilled = vd.filled;
+    if (vd.lastError && !stats.lastError) stats.lastError = vd.lastError;
+  }
 
-  await chrome.storage.local.set({ channels });
+  await chrome.storage.local.set({ channels, videos: videoStore });
   notifyTrackedUpdates(trackedUpdates);
 
   stats.missingThumbs = channelIds.filter((id) => !channels[id]?.thumbnail).length;
@@ -510,21 +666,263 @@ async function refreshChannelStats(channelIds, preloaded) {
   return stats;
 }
 
-async function fetchLastVideoDate(channelId) {
+// Fetch a channel's RSS feed and parse its recent video entries (newest-first).
+// Returns { lastVideoDate, videos: [{ videoId, title, published, thumbnail }] }.
+// The feed's leading <published> is the channel's creation date — video dates
+// live inside <entry> elements. No DOMParser in a service worker, so each
+// <entry>…</entry> block is sliced out and scanned with regexes.
+async function fetchChannelVideos(channelId) {
+  const empty = { lastVideoDate: null, videos: [] };
   try {
     const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`);
-    if (!res.ok) return null;
+    if (!res.ok) return empty;
     const text = await res.text();
-    // The feed's first <published> is the channel's creation date — the video
-    // dates live inside <entry> elements. Entries are newest-first, but take the
-    // max to be safe. No DOMParser in service workers, so scan with a regex.
-    const entriesStart = text.indexOf("<entry>");
-    if (entriesStart === -1) return null;
-    const dates = [...text.slice(entriesStart).matchAll(/<published>([^<]+)<\/published>/g)].map((m) => m[1]);
-    if (!dates.length) return null;
-    return dates.reduce((a, b) => (b > a ? b : a));
+    const videos = [];
+    for (const part of text.split("<entry>").slice(1)) {
+      const block = part.slice(0, part.indexOf("</entry>"));
+      const videoId = (block.match(/<yt:videoId>([^<]+)<\/yt:videoId>/) || [])[1];
+      const published = (block.match(/<published>([^<]+)<\/published>/) || [])[1];
+      if (!videoId || !published) continue;
+      const rawTitle = (block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "";
+      // The RSS feed carries a live-ish view count in media:community. Duration
+      // is NOT in RSS — it's filled later via the API (fillVideoDetails).
+      const viewsMatch = block.match(/<media:statistics views="(\d+)"/);
+      videos.push({
+        videoId,
+        title: decodeXml(rawTitle).replace(/\s+/g, " ").trim(),
+        published,
+        viewCount: viewsMatch ? Number(viewsMatch[1]) : null,
+        // Derive the thumbnail from the id — always valid, no parsing needed.
+        thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      });
+    }
+    if (!videos.length) return empty;
+    const lastVideoDate = videos.reduce((a, v) => (v.published > a ? v.published : a), videos[0].published);
+    return { lastVideoDate, videos };
   } catch (e) {
-    return null;
+    return empty;
+  }
+}
+
+// Minimal XML entity decode for RSS video titles (no DOMParser in a worker).
+// &amp; is resolved last so double-encoded sequences unwind left-to-right.
+function decodeXml(str) {
+  return str
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&(?:apos|#39);/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, "&");
+}
+
+// Merge freshly fetched RSS entries into the persistent video store, preserving
+// each video's user state (watched / saved / addedAt) across refreshes.
+function upsertChannelVideos(store, channelId, videos, now) {
+  for (const v of videos) {
+    const existing = store[v.videoId];
+    if (existing) {
+      existing.title = v.title || existing.title;
+      existing.thumbnail = v.thumbnail || existing.thumbnail;
+      existing.published = v.published || existing.published;
+      existing.channelId = channelId;
+      if (v.viewCount != null) existing.viewCount = v.viewCount;
+    } else {
+      store[v.videoId] = {
+        id: v.videoId,
+        channelId,
+        title: v.title,
+        published: v.published,
+        thumbnail: v.thumbnail,
+        viewCount: v.viewCount ?? null,
+        watched: false,
+        saved: false,
+        addedAt: now,
+      };
+    }
+  }
+}
+
+// A video still needs an API detail fetch if its length is unknown, or it was
+// last seen live/upcoming (its status — and eventual real duration — changes
+// once the stream ends, so keep re-querying those).
+function videoNeedsDetails(v) {
+  return v.duration === undefined || v.live === "live" || v.live === "upcoming";
+}
+
+// Fill video duration + view count + live status via the Data API — none of
+// these (duration especially) are in the RSS feed. Batches of 50 (1 quota unit
+// each). `snippet.liveBroadcastContent` tells us live/upcoming vs a real video.
+// Returns diagnostics so callers can explain why lengths did/didn't fill.
+async function fillVideoDetails(store, apiKey, ids) {
+  const pending = ids || Object.keys(store).filter((id) => videoNeedsDetails(store[id]));
+  const out = { queried: pending.length, filled: 0, apiFailures: 0, lastError: null, changed: false };
+  for (const group of chunk(pending, YT_CHANNELS_BATCH)) {
+    try {
+      const url = `${API_BASE}/videos?part=contentDetails,statistics,snippet&id=${group.join(",")}&key=${apiKey}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const body = await res.text();
+        console.warn("videos.list failed:", res.status, body);
+        out.apiFailures++;
+        out.lastError = describeApiError(res, body);
+        continue;
+      }
+      const data = await res.json();
+      const seen = new Set();
+      for (const item of data.items || []) {
+        const v = store[item.id];
+        if (!v) continue;
+        seen.add(item.id);
+        const duration = parseIsoDuration(item.contentDetails?.duration);
+        const live = item.snippet?.liveBroadcastContent || "none";
+        const views = item.statistics?.viewCount != null ? Number(item.statistics.viewCount) : v.viewCount ?? null;
+        if (v.duration !== duration || v.live !== live || v.viewCount !== views) out.changed = true;
+        v.duration = duration;
+        v.live = live;
+        v.viewCount = views;
+        out.filled++;
+      }
+      // Private/deleted ids never come back — mark them so they aren't re-queried.
+      for (const id of group) if (!seen.has(id) && store[id] && store[id].duration === undefined) { store[id].duration = null; store[id].live = "none"; out.changed = true; }
+    } catch (e) {
+      console.warn("videos.list error:", e);
+      out.apiFailures++;
+      out.lastError = String(e?.message || e);
+    }
+  }
+  return out;
+}
+
+// Fill lengths/views for any videos still missing them (dashboard-triggered when
+// a video view opens with an API key set — so lengths appear without a manual
+// full refresh). Persists only when something actually changed.
+async function fillMissingVideoDetails() {
+  const { apiKey, videos = {} } = await chrome.storage.local.get(["apiKey", "videos"]);
+  if (!apiKey) return { ok: false, hasApiKey: false, filled: 0 };
+  const result = await fillVideoDetails(videos, apiKey);
+  if (result.changed) await chrome.storage.local.set({ videos });
+  return { ok: true, hasApiKey: true, ...result };
+}
+
+// A channel's uploads playlist id is usually its channel id with UC → UU, but
+// not always — some channels have a different uploads playlist that 404s under
+// the shortcut, so this is only a fallback for `resolveUploadsPlaylists`.
+function uploadsPlaylistId(channelId) {
+  return channelId && channelId.startsWith("UC") ? "UU" + channelId.slice(2) : null;
+}
+
+// Look up each channel's real uploads-playlist id via channels.list
+// (contentDetails.relatedPlaylists.uploads) — the reliable source. 1 unit / 50.
+async function resolveUploadsPlaylists(channelIds, apiKey) {
+  const map = {};
+  for (const group of chunk(channelIds, YT_CHANNELS_BATCH)) {
+    try {
+      const url = `${API_BASE}/channels?part=contentDetails&id=${group.join(",")}&key=${apiKey}`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const item of data.items || []) {
+        const up = item.contentDetails?.relatedPlaylists?.uploads;
+        if (up) map[item.id] = up;
+      }
+    } catch (e) {
+      /* fall back to the UU shortcut per-channel */
+    }
+  }
+  return map;
+}
+
+// Page through a channel's entire uploads playlist (50/page) to get ALL its
+// videos — the RSS feed only exposes the latest ~15. 1 quota unit per page.
+async function fetchAllUploads(playlistId, apiKey) {
+  if (!playlistId) return { videos: [], error: "no uploads playlist" };
+  const videos = [];
+  let pageToken = "";
+  let error = null;
+  for (let page = 0; page < 400; page++) { // safety cap: 400*50 = 20k videos
+    const url = `${API_BASE}/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=${playlistId}${pageToken ? `&pageToken=${pageToken}` : ""}&key=${apiKey}`;
+    let res;
+    try { res = await fetch(url); } catch (e) { error = String(e?.message || e); break; }
+    if (!res.ok) {
+      const body = await res.text();
+      // A 404 here usually means the channel has no public uploads playlist.
+      error = describeApiError(res, body);
+      break;
+    }
+    const data = await res.json();
+    for (const item of data.items || []) {
+      const videoId = item.contentDetails?.videoId;
+      const published = item.contentDetails?.videoPublishedAt || item.snippet?.publishedAt;
+      const title = (item.snippet?.title || "").replace(/\s+/g, " ").trim();
+      if (!videoId || !published) continue;
+      if (title === "Private video" || title === "Deleted video") continue;
+      videos.push({ videoId, title, published, viewCount: null, thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg` });
+    }
+    pageToken = data.nextPageToken || "";
+    if (!pageToken) break;
+  }
+  return { videos, error };
+}
+
+// Deep-fetch every upload for the given channels via the API, exempt them from
+// the per-channel cap (`fetchedAll`), auto-track them so the videos show, then
+// backfill lengths/views/live status. Dashboard-triggered (`FETCH_ALL_VIDEOS`).
+async function fetchAllVideosForChannels(channelIds) {
+  const { apiKey } = await chrome.storage.local.get("apiKey");
+  if (!apiKey) return { ok: false, hasApiKey: false };
+  const { channels = {}, videos: store = {} } = await chrome.storage.local.get(["channels", "videos"]);
+  const now = Date.now();
+  const result = { ok: true, hasApiKey: true, channels: 0, added: 0, total: 0, apiFailures: 0, lastError: null };
+  // Resolve real uploads-playlist ids up front (falls back to the UU shortcut).
+  const uploads = await resolveUploadsPlaylists(channelIds.filter((id) => channels[id]), apiKey);
+  for (const id of channelIds) {
+    if (!channels[id]) continue;
+    const { videos, error } = await fetchAllUploads(uploads[id] || uploadsPlaylistId(id), apiKey);
+    if (error) { result.apiFailures++; result.lastError = error; }
+    const before = Object.keys(store).length;
+    upsertChannelVideos(store, id, videos, now);
+    channels[id].fetchedAll = true;
+    channels[id].trackVideos = true; // so the pulled-in videos actually appear
+    result.added += Object.keys(store).length - before;
+    result.total += videos.length;
+    result.channels++;
+    // Persist after each channel so a long job's progress survives a worker
+    // restart (and the dashboard shows videos accumulating live).
+    await chrome.storage.local.set({ channels, videos: store });
+  }
+  // Fill duration/views/live for everything still missing them.
+  await fillVideoDetails(store, apiKey);
+  await chrome.storage.local.set({ videos: store });
+  return result;
+}
+
+// ISO-8601 duration ("PT1H2M10S") → seconds. Returns null on empty/malformed.
+function parseIsoDuration(iso) {
+  if (!iso) return null;
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return null;
+  return Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
+}
+
+// Keep the video store bounded: drop videos whose channel is gone or no longer
+// tracked, and cap per-channel history. Saved ("watch later") videos are always
+// kept so a manual bookmark never disappears.
+function pruneVideos(store, channels) {
+  for (const [vid, v] of Object.entries(store)) {
+    const ch = channels[v.channelId];
+    if (!v.saved && (!ch || !ch.trackVideos)) delete store[vid];
+  }
+  const byChannel = {};
+  for (const v of Object.values(store)) (byChannel[v.channelId] ||= []).push(v);
+  for (const [channelId, list] of Object.entries(byChannel)) {
+    if (channels[channelId]?.fetchedAll) continue; // full history kept intact
+    if (list.length <= VIDEO_KEEP_PER_CHANNEL) continue;
+    list.sort((a, b) => (a.published < b.published ? 1 : -1)); // newest first
+    for (const v of list.slice(VIDEO_KEEP_PER_CHANNEL)) {
+      if (!v.saved) delete store[v.id];
+    }
   }
 }
 
@@ -565,11 +963,14 @@ async function computeSyncDiff(direction) {
   try {
     const gistId = await resolveGistId(gistToken);
 
-    const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
+    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
     const localState = {
       channels: local.channels || {},
       folders: local.folders || {},
       tags: local.tags || {},
+      videoFolders: local.videoFolders || {},
+      // Compare only the syncable subset — the gist holds that, not the full cache.
+      videos: syncableVideos(local.videos || {}),
     };
 
     let remoteState = null;
@@ -578,7 +979,7 @@ async function computeSyncDiff(direction) {
     if (direction === "download" && !remoteState) {
       return { ok: false, error: gistId ? "Gist has no usable state yet." : "No Gist found — upload first to create one." };
     }
-    if (!remoteState) remoteState = { channels: {}, folders: {}, tags: {} };
+    if (!remoteState) remoteState = { channels: {}, folders: {}, tags: {}, videoFolders: {}, videos: {} };
 
     const localSettings = await readLocalSettings();
     const remoteSettings = pickRemoteSettings(remoteState.settings);
@@ -604,6 +1005,7 @@ async function computeSyncDiff(direction) {
         if ((sc.language || "") !== (tc.language || "")) changes.push("language");
         if (!!sc.active !== !!tc.active) changes.push("active");
         if (!!sc.finished !== !!tc.finished) changes.push("finished");
+        if (!!sc.trackVideos !== !!tc.trackVideos) changes.push("trackVideos");
         if (changes.length) modified.push({ id, name: sc.name, handle: sc.handle, changes });
       }
     }
@@ -633,6 +1035,39 @@ async function computeSyncDiff(direction) {
       if (!srcFo[id]) foRemoved.push({ id, name: tf.name });
     }
 
+    // Watch Later list diff — identical shape/logic to the channel folder diff.
+    const srcVf = src.videoFolders || {};
+    const tgtVf = tgt.videoFolders || {};
+    const vfAdded = [], vfRemoved = [], vfModified = [];
+    for (const [id, sf] of Object.entries(srcVf)) {
+      const tf = tgtVf[id];
+      if (!tf) {
+        vfAdded.push({ id, name: sf.name });
+      } else {
+        const changes = [];
+        if ((sf.name || "") !== (tf.name || "")) changes.push("name");
+        if ((sf.parentId || "") !== (tf.parentId || "")) changes.push("parent");
+        if ((sf.emoji || "") !== (tf.emoji || "")) changes.push("emoji");
+        if ((sf.order ?? 0) !== (tf.order ?? 0)) changes.push("order");
+        if (changes.length) vfModified.push({ id, name: sf.name, oldName: tf.name, changes });
+      }
+    }
+    for (const [id, tf] of Object.entries(tgtVf)) {
+      if (!srcVf[id]) vfRemoved.push({ id, name: tf.name });
+    }
+
+    // Video store is too large to review per-item; summarize how many will be
+    // added/updated on the target (a union merge — nothing is removed).
+    const srcVids = src.videos || {};
+    const tgtVids = tgt.videos || {};
+    const userStateKey = (v) => `${!!v.watched}|${!!v.saved}|${!!v.hidden}|${v.folderId || ""}`;
+    let vidsAdded = 0, vidsModified = 0;
+    for (const [id, sv] of Object.entries(srcVids)) {
+      const tv = tgtVids[id];
+      if (!tv) vidsAdded++;
+      else if (userStateKey(sv) !== userStateKey(tv)) vidsModified++;
+    }
+
     // Settings diff: compare the CURRENT target value against the value the apply
     // would actually write, so the review matches the real outcome. Upload uses
     // mergeSettings (non-empty local wins); download overlays picked remote keys.
@@ -654,6 +1089,8 @@ async function computeSyncDiff(direction) {
       direction,
       channels: { added, removed, modified },
       folders: { added: foAdded, removed: foRemoved, modified: foModified },
+      videoFolders: { added: vfAdded, removed: vfRemoved, modified: vfModified },
+      videos: { added: vidsAdded, modified: vidsModified, srcTotal: Object.keys(srcVids).length },
       settings,
     };
   } catch (e) {
@@ -668,8 +1105,10 @@ async function applyUpload(removeFromGistIds = []) {
   try {
     let gistId = await resolveGistId(gistToken);
 
-    const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
+    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
     let uploadChannels = { ...(local.channels || {}) };
+    // Video store is union-merged with the gist (deletions don't propagate).
+    let uploadVideos = { ...(local.videos || {}) };
 
     // Re-include any Gist-only channels the user chose to keep
     let remoteSettings = {};
@@ -681,6 +1120,7 @@ async function applyUpload(removeFromGistIds = []) {
         for (const [id, rc] of Object.entries(remoteState.channels || {})) {
           if (!uploadChannels[id] && !removeSet.has(id)) uploadChannels[id] = rc;
         }
+        uploadVideos = mergeVideos(local.videos || {}, remoteState.videos || {});
       }
     }
 
@@ -688,6 +1128,8 @@ async function applyUpload(removeFromGistIds = []) {
       channels: uploadChannels,
       folders: local.folders || {},
       tags: local.tags || {},
+      videoFolders: local.videoFolders || {},
+      videos: syncableVideos(uploadVideos), // only user-touched videos go to the gist
       settings: mergeSettings(await readLocalSettings(), remoteSettings),
     };
     const body = {
@@ -721,7 +1163,7 @@ async function applyDownload(removeLocalIds = []) {
     const remoteState = await fetchGistState(gistToken, gistId);
     if (!remoteState) return { ok: false, error: "Gist has no usable state yet." };
 
-    const local = await chrome.storage.local.get(["channels", "folders"]);
+    const local = await chrome.storage.local.get(["channels", "folders", "videoFolders", "videos"]);
     const removeSet = new Set(removeLocalIds);
 
     // Start with Gist channels, then re-add local-only channels user chose to keep
@@ -732,10 +1174,13 @@ async function applyDownload(removeLocalIds = []) {
 
     // Gist folders win, but keep local folders referenced by preserved local-only channels
     const folders = { ...(local.folders || {}), ...remoteState.folders };
+    // Watch Later lists: gist wins, local-only lists kept. Video store: union merge.
+    const videoFolders = { ...(local.videoFolders || {}), ...(remoteState.videoFolders || {}) };
+    const videos = mergeVideos(local.videos || {}, remoteState.videos || {});
 
     const lastSyncedAt = Date.now();
     const settings = pickRemoteSettings(remoteState.settings);
-    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {}, gistId, lastSyncedAt, ...settings });
+    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {}, videoFolders, videos, gistId, lastSyncedAt, ...settings });
     return { ok: true, gistId, lastSyncedAt };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
@@ -760,19 +1205,23 @@ async function syncWithGist() {
       if (remoteState === undefined) gistId = null; // gist was deleted on github.com
     }
 
-    const local = await chrome.storage.local.get(["channels", "folders", "tags"]);
+    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
     const localState = {
       channels: local.channels || {},
       folders: local.folders || { unsorted: { name: "Unsorted", order: 0 } },
       tags: local.tags || {},
+      videoFolders: local.videoFolders || { unsorted: { name: "Unsorted", order: 0 } },
+      videos: local.videos || {},
     };
     const merged = remoteState ? mergeStates(localState, remoteState) : localState;
     const mergedSettings = mergeSettings(await readLocalSettings(), remoteState?.settings);
     await chrome.storage.local.set({ ...merged, ...mergedSettings });
 
+    // The gist carries only the user-touched video subset (see syncableVideos).
+    const gistPayload = { ...merged, videos: syncableVideos(merged.videos), settings: mergedSettings };
     const body = {
       description: "MyTube Organizer sync data",
-      files: { [GIST_FILENAME]: { content: JSON.stringify({ ...merged, settings: mergedSettings }, null, 2) } },
+      files: { [GIST_FILENAME]: { content: JSON.stringify(gistPayload, null, 2) } },
     };
     if (gistId) {
       await ghApi(gistToken, `${GIST_API}/${gistId}`, "PATCH", body);
@@ -846,6 +1295,59 @@ function mergeStates(local, remote) {
     channels,
     folders: { ...(remote.folders || {}), ...(local.folders || {}) },
     tags: { ...(remote.tags || {}), ...(local.tags || {}) },
+    videoFolders: { ...(remote.videoFolders || {}), ...(local.videoFolders || {}) },
+    videos: mergeVideos(local.videos, remote.videos),
+  };
+}
+
+// The subset of the video store worth syncing: only videos the user has actually
+// touched (saved, watched, dismissed, or filed into a non-default list). The rest
+// — the New-feed cache and full-history dumps — is re-derivable per device from
+// RSS/API, so keeping it out of the gist bounds the payload by activity, not by
+// catalog size. Each device rebuilds its own cache; user state merges across.
+function syncableVideos(videos = {}) {
+  const out = {};
+  for (const [id, v] of Object.entries(videos)) {
+    if (v.saved || v.watched || v.hidden || (v.folderId && v.folderId !== "unsorted")) out[id] = v;
+  }
+  return out;
+}
+
+// Union-merge two video stores by id — deletions don't propagate. For a video
+// present on both sides, user state is combined (watched/saved/hidden OR-ed, an
+// organized list assignment preferred) and the richer metadata wins.
+function mergeVideos(local = {}, remote = {}) {
+  const out = { ...remote };
+  for (const [id, lv] of Object.entries(local)) {
+    out[id] = out[id] ? mergeVideo(lv, out[id]) : lv;
+  }
+  return out;
+}
+
+function mergeVideo(a, b) {
+  const firstSet = (...xs) => xs.find((x) => x !== undefined && x !== null && x !== "");
+  const numDuration = [a.duration, b.duration].find((d) => typeof d === "number");
+  const views = Math.max(a.viewCount ?? -1, b.viewCount ?? -1);
+  const seenTimes = [a.addedAt, b.addedAt].filter((t) => typeof t === "number");
+  return {
+    ...b,
+    ...a,
+    watched: !!(a.watched || b.watched),
+    saved: !!(a.saved || b.saved),
+    hidden: !!(a.hidden || b.hidden),
+    // Prefer a real (non-"unsorted") Watch Later list assignment from either side.
+    folderId: a.folderId && a.folderId !== "unsorted" ? a.folderId
+      : b.folderId && b.folderId !== "unsorted" ? b.folderId
+      : a.folderId || b.folderId || "unsorted",
+    duration: numDuration !== undefined ? numDuration : a.duration ?? b.duration,
+    viewCount: views >= 0 ? views : null,
+    live: firstSet(a.live, b.live) ?? "none",
+    title: firstSet(a.title, b.title) ?? "",
+    thumbnail: firstSet(a.thumbnail, b.thumbnail) ?? a.thumbnail,
+    author: firstSet(a.author, b.author) ?? null,
+    channelId: firstSet(a.channelId, b.channelId) ?? null,
+    published: firstSet(a.published, b.published) ?? null,
+    addedAt: seenTimes.length ? Math.min(...seenTimes) : Date.now(),
   };
 }
 

@@ -4,7 +4,7 @@
   "short_name": "MyTube",
   "version": "0.1.0",
   "description": "Organize your YouTube subscriptions into folders and tags; track last video date and video count.",
-  "permissions": ["storage", "alarms", "unlimitedStorage", "notifications"],
+  "permissions": ["storage", "alarms", "unlimitedStorage", "notifications", "contextMenus"],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://www.googleapis.com/*",
