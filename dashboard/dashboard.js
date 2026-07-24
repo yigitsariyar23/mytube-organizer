@@ -289,15 +289,22 @@ function fdom() {
       collapsed: collapsedVideoLists,
     };
   }
+  // The New view shares the channel folders, but only its tracked channels feed
+  // the uploads list — so its sidebar counts (and, in renderFolders, which
+  // folders show at all) are restricted to channels with `trackVideos`.
+  const trackedOnly = currentView === "new";
   return {
     folders: state.folders,
     persist: () => chrome.storage.local.set({ folders: state.folders }),
     counts: () => {
       const m = {};
-      for (const c of Object.values(state.channels)) m[c.folderId] = (m[c.folderId] || 0) + 1;
+      for (const c of Object.values(state.channels)) {
+        if (trackedOnly && !c.trackVideos) continue;
+        m[c.folderId] = (m[c.folderId] || 0) + 1;
+      }
       return m;
     },
-    total: () => Object.values(state.channels).length,
+    total: () => Object.values(state.channels).filter((c) => !trackedOnly || c.trackVideos).length,
     get selected() { return currentFolderId; },
     select: (id) => { currentFolderId = id; },
     collapsed: collapsedFolders,
@@ -778,8 +785,13 @@ function renderFolders() {
       order: folder.order ?? 0,
     }));
 
-  const unsorted = topLevelEntries.find((f) => f.id === "unsorted");
-  let rest = topLevelEntries.filter((f) => f.id !== "unsorted");
+  // In the New view the sidebar lists only folders that actually contain a
+  // tracked channel (counts above are tracked-only), so empty ones drop out.
+  const hideEmpty = currentView === "new";
+  const visibleTop = hideEmpty ? topLevelEntries.filter((f) => f.count > 0) : topLevelEntries;
+
+  const unsorted = visibleTop.find((f) => f.id === "unsorted");
+  let rest = visibleTop.filter((f) => f.id !== "unsorted");
 
   if (folderSort === "alpha") {
     rest.sort((a, b) => a.name.localeCompare(b.name));
@@ -796,7 +808,7 @@ function renderFolders() {
   for (const f of topLevelSorted) {
     const draggable = f.id !== "unsorted" && folderSort === "custom";
     const li = document.createElement("li");
-    const childIds = childIndex[f.id] || [];
+    const childIds = (childIndex[f.id] || []).filter((cid) => !hideEmpty || (directCount[cid] || 0) > 0);
     const hasChildren = f.id !== "unsorted" && childIds.length > 0;
     const isCollapsed = hasChildren && collapsed.has(f.id);
     li.className = "folder-item" + (f.id === selected ? " active" : "") + (hasChildren ? " folder-item--parent" : "") + (isCollapsed ? " folder-item--collapsed" : "");
