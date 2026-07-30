@@ -1428,25 +1428,17 @@ function nextTagColor() {
   return TAG_PALETTE[idx];
 }
 
-// The background union merge only runs on the 3-hour alarm, so a device that has
-// been closed shows stale state on open — a Watch Later list saved on another
-// device wouldn't appear until the alarm happened to fire. Kick a sync when the
-// dashboard opens instead. It's the same silent union merge (nothing is ever
-// removed), throttled so reopening the tab repeatedly doesn't hammer GitHub.
-const AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 // Matches the background alarm period: if no refresh has landed in that long,
 // this device's New feed is stale (or, on a device that was just set up, empty —
 // the alarm's first fire is three hours after install). Pull it on open.
+//
+// Only YouTube data is fetched here. The gist is never touched automatically:
+// an auto-sync on open meant a device opened after sitting stale pushed its old
+// library up before pulling anything down, overwriting newer state from another
+// device. Upload and Download are explicit, reviewed actions in Settings.
 const AUTO_REFRESH_STALE_MS = 3 * 60 * 60 * 1000;
 
-// Sync first, then refresh: the merge brings in the channel list and its
-// trackVideos flags, which is what the RSS pass then fetches uploads for.
 async function catchUpOnOpen() {
-  await maybeAutoSync();
-  await maybeAutoRefresh();
-}
-
-async function maybeAutoRefresh() {
   const ids = Object.keys(state.channels);
   if (!ids.length) return;
   const newest = ids.reduce((max, id) => Math.max(max, state.channels[id].lastFetched || 0), 0);
@@ -1458,21 +1450,6 @@ async function maybeAutoRefresh() {
   el.statusText.textContent = res?.ok
     ? `Updated ${new Date().toLocaleTimeString()}.`
     : `Refresh failed. ${res?.error || ""}`;
-}
-
-async function maybeAutoSync() {
-  if (!state.gistToken) return;
-  if (state.lastSyncedAt && Date.now() - state.lastSyncedAt < AUTO_SYNC_INTERVAL_MS) return;
-  const res = await chrome.runtime.sendMessage({ type: "SYNC_GIST" });
-  if (res?.ok) {
-    state.gistId = res.gistId;
-    state.lastSyncedAt = res.lastSyncedAt;
-    await loadState();
-    render();
-  } else if (res?.error) {
-    render();
-    el.statusText.textContent = `Sync failed: ${res.error}`;
-  }
 }
 
 function renderSyncStatus() {

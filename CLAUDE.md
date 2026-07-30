@@ -108,7 +108,6 @@ and reply through `sendResponse` (async, so each returns `true`).
 | `PLAYLIST_SCAN_RESULT` | `{ playlistId, title, videos, statedCount, scrapedCount }` (from the injected scraper) | `{ ok, count }`; stashes `pendingPlaylistImport`, opens dashboard |
 | `APPLY_PLAYLIST_IMPORT` | `{ listName, moveIds }` | `{ ok, listId, added, moved }` (creates a Watch Later list, saves the reviewed playlist into it) |
 | `DISCARD_PLAYLIST_IMPORT` | — | `{ ok }` (clears `pendingPlaylistImport`) |
-| `SYNC_GIST` | — | `{ ok, gistId, lastSyncedAt }` (background union merge) |
 | `FETCH_SYNC_DIFF` | `{ direction }` | `{ ok, direction, channels: { added, removed, modified } }` |
 | `APPLY_UPLOAD` | `{ removeFromGistIds }` | `{ ok, gistId, lastSyncedAt }` |
 | `APPLY_DOWNLOAD` | `{ removeLocalIds }` | `{ ok, gistId, lastSyncedAt }` |
@@ -119,12 +118,18 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 ## Data flows worth knowing
 
 - **Catch-up on open.** The 3-hour alarm is the only *background* trigger, and
-  its first fire is 3 hours after install — so a second device used to show
-  empty/stale data until it happened to run. `catchUpOnOpen()` (dashboard `init`,
-  after the `onChanged` listener is wired) fixes that: `SYNC_GIST` if a token is
-  set and the last sync is over 5 min old, then `REFRESH_STATS` if no channel has
-  been fetched in 3 hours. Sync runs first — the merge supplies the channel list
-  and its `trackVideos` flags that the RSS pass then reads.
+  its first fire is 3 hours after install — so a device left closed showed stale
+  data until it happened to run. `catchUpOnOpen()` (dashboard `init`, after the
+  `onChanged` listener is wired) fires `REFRESH_STATS` if no channel has been
+  fetched in 3 hours. **YouTube data only — it never touches the gist.**
+- **Sync is never automatic.** Nothing reads or writes the gist unless the user
+  asks: no alarm sync, no sync on open. An automatic merge meant a device opened
+  after sitting stale pushed its old library up before pulling anything down, so
+  whichever device ran first decided the shared state and newer work elsewhere
+  was overwritten. Both directions now go through the explicit
+  `FETCH_SYNC_DIFF` → review → `APPLY_UPLOAD`/`APPLY_DOWNLOAD` flow. (The old
+  silent union merge — `SYNC_GIST`/`syncWithGist`/`mergeStates` — is gone; don't
+  reintroduce a background merge.)
 - **Scan → review → apply.** The content script scrapes links and posts
   `SCAN_RESULT`. `background.js` resolves handles to IDs, diffs against the
   library, writes `pendingScan`, and opens the dashboard, which shows the review
@@ -234,10 +239,11 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   `APPLY_PLAYLIST_IMPORT` creates the `videoFolders` list and saves the videos
   (`saved:true`, `folderId` = new list); lengths/views backfill via `fillVideoDetails`
   only if an API key is set. **No API key required**; works for private/unlisted/public.
-- **Sync.** Directional (`FETCH_SYNC_DIFF` → review → `APPLY_UPLOAD`/
-  `APPLY_DOWNLOAD`) surfaces every change for confirmation. The background
-  `SYNC_GIST` is a silent **union merge**: local wins on names, tags combine,
-  fresher `lastFetched` wins on stats, and **deletions do not propagate**.
+- **Sync.** Directional and manual only (`FETCH_SYNC_DIFF` → review →
+  `APPLY_UPLOAD`/`APPLY_DOWNLOAD`), so every change is confirmed before it moves.
+  Both directions union-merge — tags combine, fresher `lastFetched` wins on stats,
+  and **deletions do not propagate** except for the channel removals the user
+  ticks in the review.
 - **The directional review shows more than channels.** `computeSyncDiff` also
   diffs folders (add/rename/reparent/emoji), the Watch Later lists (`videoFolders`,
   same diff), the video store (a **count summary** — too many to review per item),
@@ -258,11 +264,11 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   `mergeVideo` — watched/saved/hidden OR-ed, an organized (non-`unsorted`) list
   assignment wins, higher view count / filled duration win, and **nothing is
   removed** by the merge itself. `mergeSettings` keeps non-empty local values and
-  adopts remote for the rest — so a *changed* pref propagates only through an
-  explicit Download, not the silent merge.
+  adopts remote for the rest, so an upload never clears a pref the other device
+  set; a *changed* pref propagates only through an explicit Download.
 - **Syncing the whole store has two consequences the code has to handle.**
-  1. *Bounds.* Since the merge unions the gist's videos back in, `pruneVideos` is
-     re-run on the merged result (`syncWithGist`, `applyDownload`) and on what's
+  1. *Bounds.* Since a download unions the gist's videos back in, `pruneVideos` is
+     re-run on the merged result (`applyDownload`) and on what's
      uploaded (`applyUpload`) — otherwise an untracked channel's videos would
      ping-pong back forever and the gist would only ever grow. The cap now spares
      any `isUserTouched` video (not just `saved`), because dropping a watched or

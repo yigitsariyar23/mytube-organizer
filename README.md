@@ -236,34 +236,37 @@ state and all) — into a **secret GitHub Gist** (free):
    **Gists** permission (read and write). Classic tokens with just the `gist`
    scope work too.
 2. In the dashboard open **⚙ Settings**, paste the token into the GitHub token
-   field. The first sync creates the gist automatically.
-3. On every other device, install the extension, paste the **same token** —
-   the gist is found by its filename (`mytube-organizer.json`), so that's the
-   whole setup.
+   field, then hit **⬆ Upload** — the first upload creates the gist for you.
+3. On every other device, install the extension, paste the **same token** and
+   hit **⬇ Download** — the gist is found by its filename
+   (`mytube-organizer.json`), so that's the whole setup.
 
-Two ways to sync:
+**Syncing is always something you ask for.** Nothing is uploaded or downloaded
+in the background — use **⬆ Upload / ⬇ Download** in Settings. Each runs a
+**directional** sync and shows a review screen first: exactly what will be added,
+overwritten or removed, with removals opt-out. Upload makes the Gist match this
+device; Download makes this device match the Gist.
 
-- **⬆ Upload / ⬇ Download** (in Settings) run a **directional** sync and show a
-  review screen first: exactly what will be added, overwritten or removed, with
-  removals opt-out. Upload makes the Gist match this device; Download makes this
-  device match the Gist.
-- The **3-hour background refresh** also runs an automatic **union merge** (no
-  review): new channels, folders, tags, Watch Later lists and videos flow both
-  ways; per-video state combines (watched/saved/dismissed stay set if either
-  device set them, and an organized list assignment wins); variables carry with
-  each channel; and fresher stats win. Deletions do **not** propagate through the
-  background merge — remove an item on each device, or use a directional
-  Upload/Download to make a deletion stick.
+There used to be an automatic union merge on the 3-hour refresh, and it caused
+exactly the problem you'd expect: open a device that had been sitting untouched
+for a week and it pushed its stale library up before pulling anything down, so
+the device that happened to sync first won. Now the order is yours to pick —
+**Download first on a device that's behind**, then Upload once it's caught up.
+
+Both directions still *merge* rather than clobber: new channels, folders, tags,
+Watch Later lists and videos flow across; per-video state combines
+(watched/saved/dismissed stay set if either side set them, and an organized list
+assignment wins); variables carry with each channel; and fresher stats win. The
+only things deleted are the ones you tick in the review screen.
 
 Notes: the gist is "secret" (unlisted, but anyone with the URL can read it, and
 it does include your **API key** — but never the GitHub token, which stays only
-in `chrome.storage.local` on each device). To keep the gist small, only the
-videos you've **actually touched** sync — the ones you've saved, watched,
-dismissed, or filed into a list. The rest (the New-feed cache and anything pulled
-by "Fetch full history") is re-derivable, so it stays on each device and rebuilds
-locally rather than bloating the gist. That means a device won't inherit another
-device's full-history dump automatically — run "Fetch full history" there too if
-you want it — but your Watch Later, dismissals and watched state all carry over.
+in `chrome.storage.local` on each device). The whole library goes in, including
+the New-feed cache and anything pulled by "Fetch full history", so a second
+device inherits the full picture rather than rebuilding it. If your library ever
+grows past what the Gist API can serve back (10 MB), the sync stops with a
+message asking you to untrack a channel or two instead of writing a gist it
+couldn't read again.
 
 ## Settings
 

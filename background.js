@@ -544,12 +544,13 @@ function notify(idPrefix, title, message) {
   }
 }
 
+// Stats only. Sync is never automatic: a silent background merge let a device
+// holding stale data push it up before it had pulled anything down, so whichever
+// device happened to run first decided the shared state. Both directions now go
+// through the explicit Upload/Download review in Settings.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== ALARM_NAME) return;
   await refreshAllChannelStats();
-  // keep devices converged in the background; a no-op unless a token is set
-  const { gistToken } = await chrome.storage.local.get("gistToken");
-  if (gistToken) await syncWithGist();
 });
 
 // ---------- Toolbar icon click -> open / focus the dashboard ----------
@@ -612,10 +613,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "DISCARD_PLAYLIST_IMPORT") {
     chrome.storage.local.remove("pendingPlaylistImport").then(() => sendResponse({ ok: true }));
-    return true;
-  }
-  if (msg.type === "SYNC_GIST") {
-    syncWithGist().then(sendResponse);
     return true;
   }
   if (msg.type === "FETCH_SYNC_DIFF") {
@@ -1605,59 +1602,11 @@ async function applyDownload(removeLocalIds = []) {
 }
 
 // ---------- Cross-device sync via a secret GitHub Gist ----------
-// Pull the gist, merge it with local state (union — deletions don't propagate),
-// write the merged state locally, then push it back. The gist is found by
-// filename, so pasting the same token on another device is the whole setup.
-
-async function syncWithGist() {
-  const { gistToken } = await chrome.storage.local.get("gistToken");
-  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
-
-  try {
-    let gistId = await resolveGistId(gistToken);
-
-    let remoteState = null;
-    if (gistId) {
-      remoteState = await fetchGistState(gistToken, gistId);
-      if (remoteState === undefined) gistId = null; // gist was deleted on github.com
-    }
-
-    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
-    const localState = {
-      channels: local.channels || {},
-      folders: local.folders || { unsorted: { name: "Unsorted", order: 0 } },
-      tags: local.tags || {},
-      videoFolders: local.videoFolders || { unsorted: { name: "Unsorted", order: 0 } },
-      videos: local.videos || {},
-    };
-    const merged = remoteState ? mergeStates(localState, remoteState) : localState;
-    // The merge unions in every video the gist knows about, including ones this
-    // device (or another) deliberately dropped. Re-apply the store's bounds to
-    // the merged result so an untrack converges instead of ping-ponging, and so
-    // both sides of the write — local and gist — hold the same thing.
-    pruneVideos(merged.videos, merged.channels);
-    const mergedSettings = mergeSettings(await readLocalSettings(), remoteState?.settings);
-    await chrome.storage.local.set({ ...merged, ...mergedSettings });
-
-    const gistPayload = { ...merged, settings: mergedSettings };
-    const body = {
-      description: "MyTube Organizer sync data",
-      files: { [GIST_FILENAME]: { content: serializeGistPayload(gistPayload) } },
-    };
-    if (gistId) {
-      await ghApi(gistToken, `${GIST_API}/${gistId}`, "PATCH", body);
-    } else {
-      const created = await ghApi(gistToken, GIST_API, "POST", { ...body, public: false });
-      gistId = created.id;
-    }
-
-    const lastSyncedAt = Date.now();
-    await chrome.storage.local.set({ gistId, lastSyncedAt });
-    return { ok: true, gistId, lastSyncedAt };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-}
+// Every transfer is user-driven and reviewed: computeSyncDiff shows what an
+// Upload or a Download would change, then applyUpload/applyDownload carries it
+// out. There is deliberately no automatic merge — see the alarm listener. The
+// gist is found by filename, so pasting the same token on another device is the
+// whole setup.
 
 // undefined = gist gone (recreate), null = gist exists but has no usable state yet
 async function fetchGistState(token, gistId) {
@@ -1686,39 +1635,6 @@ async function findExistingGist(token) {
   if (!res.ok) throw new Error(`GitHub: ${res.status} ${res.statusText}`);
   const gists = await res.json();
   return gists.find((g) => g.files?.[GIST_FILENAME])?.id || null;
-}
-
-// Union merge. Local wins on name conflicts; per-channel tags are combined,
-// remote stats are adopted when fresher, and a remote folder assignment is
-// adopted when this device hasn't organized the channel yet.
-function mergeStates(local, remote) {
-  const channels = { ...(remote.channels || {}) };
-  for (const [id, lc] of Object.entries(local.channels || {})) {
-    const rc = channels[id];
-    if (!rc) {
-      channels[id] = lc;
-      continue;
-    }
-    const merged = { ...rc, ...lc };
-    if ((!lc.folderId || lc.folderId === "unsorted") && rc.folderId && rc.folderId !== "unsorted") {
-      merged.folderId = rc.folderId;
-    }
-    merged.tags = [...new Set([...(rc.tags || []), ...(lc.tags || [])])];
-    if ((rc.lastFetched || 0) > (lc.lastFetched || 0)) {
-      merged.lastVideoDate = rc.lastVideoDate;
-      merged.videoCount = rc.videoCount;
-      merged.subscriberCount = rc.subscriberCount;
-      merged.lastFetched = rc.lastFetched;
-    }
-    channels[id] = merged;
-  }
-  return {
-    channels,
-    folders: { ...(remote.folders || {}), ...(local.folders || {}) },
-    tags: { ...(remote.tags || {}), ...(local.tags || {}) },
-    videoFolders: { ...(remote.videoFolders || {}), ...(local.videoFolders || {}) },
-    videos: mergeVideos(local.videos, remote.videos),
-  };
 }
 
 // Serialize the gist payload. Pretty-printed while it's still small enough to
