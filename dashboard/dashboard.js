@@ -227,6 +227,10 @@ async function init() {
     }
     render();
   });
+
+  // After the listener is wired, so a long background job's incremental writes
+  // land in the UI. Not awaited — the first paint shouldn't wait on the network.
+  catchUpOnOpen();
 }
 
 // The seed library: a single pinned "Unsorted" folder. A factory (not a shared
@@ -1424,6 +1428,53 @@ function nextTagColor() {
   return TAG_PALETTE[idx];
 }
 
+// The background union merge only runs on the 3-hour alarm, so a device that has
+// been closed shows stale state on open — a Watch Later list saved on another
+// device wouldn't appear until the alarm happened to fire. Kick a sync when the
+// dashboard opens instead. It's the same silent union merge (nothing is ever
+// removed), throttled so reopening the tab repeatedly doesn't hammer GitHub.
+const AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+// Matches the background alarm period: if no refresh has landed in that long,
+// this device's New feed is stale (or, on a device that was just set up, empty —
+// the alarm's first fire is three hours after install). Pull it on open.
+const AUTO_REFRESH_STALE_MS = 3 * 60 * 60 * 1000;
+
+// Sync first, then refresh: the merge brings in the channel list and its
+// trackVideos flags, which is what the RSS pass then fetches uploads for.
+async function catchUpOnOpen() {
+  await maybeAutoSync();
+  await maybeAutoRefresh();
+}
+
+async function maybeAutoRefresh() {
+  const ids = Object.keys(state.channels);
+  if (!ids.length) return;
+  const newest = ids.reduce((max, id) => Math.max(max, state.channels[id].lastFetched || 0), 0);
+  if (Date.now() - newest < AUTO_REFRESH_STALE_MS) return;
+  el.statusText.textContent = "Refreshing…";
+  const res = await chrome.runtime.sendMessage({ type: "REFRESH_STATS" });
+  await loadState();
+  render();
+  el.statusText.textContent = res?.ok
+    ? `Updated ${new Date().toLocaleTimeString()}.`
+    : `Refresh failed. ${res?.error || ""}`;
+}
+
+async function maybeAutoSync() {
+  if (!state.gistToken) return;
+  if (state.lastSyncedAt && Date.now() - state.lastSyncedAt < AUTO_SYNC_INTERVAL_MS) return;
+  const res = await chrome.runtime.sendMessage({ type: "SYNC_GIST" });
+  if (res?.ok) {
+    state.gistId = res.gistId;
+    state.lastSyncedAt = res.lastSyncedAt;
+    await loadState();
+    render();
+  } else if (res?.error) {
+    render();
+    el.statusText.textContent = `Sync failed: ${res.error}`;
+  }
+}
+
 function renderSyncStatus() {
   if (state.lastSyncedAt) {
     el.syncStatus.textContent = "Last synced: " + new Date(state.lastSyncedAt).toLocaleString();
@@ -1613,13 +1664,18 @@ const SETTING_LABELS = {
   sortDate: "Date sort",
   sortCount: "Count sort",
   folderSort: "Folder sort",
+  videoSort: "Video sort",
+  currentView: "Open view",
+  colWidths: "Column widths",
 };
 
 // The API key is the user's secret — show presence, not the value.
 function formatSettingValue(key, val) {
   if (val === null || val === undefined || val === "") return "(none)";
   if (key === "apiKey") return "(set)";
+  if (key === "colWidths") return Array.isArray(val) ? val.map(Math.round).join(" / ") + " px" : "(none)";
   if (Array.isArray(val)) return val.join(", ") || "(none)";
+  if (typeof val === "object") return Object.entries(val).map(([k, v]) => `${k}: ${v}`).join(", ");
   return String(val);
 }
 
@@ -2432,7 +2488,10 @@ function bindEvents() {
   el.clearDataBtn.addEventListener("click", async () => {
     if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
     await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt"]);
-    state = { channels: {}, folders: defaultFolders(), tags: {}, apiKey: state.apiKey, gistToken: state.gistToken, gistId: "", lastSyncedAt: null };
+    // Only the cleared keys are reset — Watch Later (videos/videoFolders) is left
+    // alone, so `state` must be spread, not rebuilt (a rebuilt object dropped
+    // state.videos entirely and broke every video view).
+    state = { ...state, channels: {}, folders: defaultFolders(), tags: {}, gistId: "", lastSyncedAt: null };
     currentFolderId = "all";
     resetVariableFilters();
     searchQuery = "";

@@ -22,10 +22,14 @@ const YT_CHANNELS_BATCH = 50; // YouTube channels.list max ids per call
 const HANDLE_RESOLVE_CONCURRENCY = 5; // parallel handle->id lookups per batch
 const VIDEO_KEEP_PER_CHANNEL = 60; // cap stored videos per tracked channel
 
-// Settings mirrored into the gist alongside the library. gistToken/gistId/
-// lastSyncedAt are deliberately excluded: the token is the credential used to
-// reach the gist (never store it inside), and the ids are per-device bookkeeping.
-const SYNC_SETTING_KEYS = ["apiKey", "languages", "sortDate", "sortCount", "folderSort"];
+// Settings mirrored into the gist alongside the library — everything the user
+// can set. Three keys stay out on purpose: `gistToken` is the credential used to
+// reach the gist (never store it inside), and `gistId`/`lastSyncedAt` are
+// per-device bookkeeping. `pendingScan`/`pendingPlaylistImport` are excluded for
+// the same reason: they're an in-flight review on one device, not library state.
+const SYNC_SETTING_KEYS = [
+  "apiKey", "languages", "sortDate", "sortCount", "folderSort", "videoSort", "currentView", "colWidths",
+];
 
 async function readLocalSettings() {
   const data = await chrome.storage.local.get(SYNC_SETTING_KEYS);
@@ -950,7 +954,7 @@ async function refreshChannelStats(channelIds, preloaded) {
   // quota. Track which active/finished channels gained a newer video so we can
   // notify about them, and stash the recent uploads of `trackVideos` channels.
   const trackedUpdates = [];
-  const { videos: videoStore = {} } = await chrome.storage.local.get("videos");
+  const { store: videoStore, seenIds } = await readVideoStore();
   const now = Date.now();
   await Promise.allSettled(
     channelIds.map(async (id) => {
@@ -976,7 +980,7 @@ async function refreshChannelStats(channelIds, preloaded) {
     if (vd.lastError && !stats.lastError) stats.lastError = vd.lastError;
   }
 
-  await chrome.storage.local.set({ channels, videos: videoStore });
+  await commitVideos(videoStore, seenIds, { channels });
   notifyTrackedUpdates(trackedUpdates);
 
   stats.missingThumbs = channelIds.filter((id) => !channels[id]?.thumbnail).length;
@@ -1060,6 +1064,39 @@ function upsertChannelVideos(store, channelId, videos, now) {
       };
     }
   }
+}
+
+// The whole video store lives under one storage key, so a job that read it and
+// writes it back minutes later (a stats refresh, a full-history fetch, a detail
+// backfill) would overwrite everything the dashboard wrote meanwhile — marking a
+// video watched or dismissing one during a refresh silently undid itself. Read
+// through `readVideoStore` and write through `commitVideos`: the commit re-reads
+// storage and re-applies the fields the user owns, so only our own updates land.
+const USER_VIDEO_FLAGS = ["watched", "saved", "hidden", "folderId"];
+
+async function readVideoStore() {
+  const { videos = {} } = await chrome.storage.local.get("videos");
+  return { store: videos, seenIds: new Set(Object.keys(videos)) };
+}
+
+// `seenIds` is the set of ids the store held when we read it. An id in storage
+// that isn't in it appeared while we worked (a context-menu save, a playlist
+// import) and is kept; one we've since dropped was pruned on purpose and stays
+// dropped. After the write, the set is re-baselined for the next commit.
+async function commitVideos(store, seenIds, extra = {}) {
+  const { videos: current = {} } = await chrome.storage.local.get("videos");
+  for (const [id, cur] of Object.entries(current)) {
+    if (!seenIds.has(id)) {
+      store[id] = cur;
+      continue;
+    }
+    const ours = store[id];
+    if (!ours) continue;
+    for (const k of USER_VIDEO_FLAGS) if (cur[k] !== undefined) ours[k] = cur[k];
+  }
+  await chrome.storage.local.set({ ...extra, videos: store });
+  seenIds.clear();
+  for (const id of Object.keys(store)) seenIds.add(id);
 }
 
 // A video still needs an API detail fetch if its length is unknown, or it was
@@ -1172,10 +1209,11 @@ async function fillChannelThumbnails(store, apiKey, videoIds, out) {
 // a video view opens with an API key set — so lengths appear without a manual
 // full refresh). Persists only when something actually changed.
 async function fillMissingVideoDetails() {
-  const { apiKey, videos = {} } = await chrome.storage.local.get(["apiKey", "videos"]);
+  const { apiKey } = await chrome.storage.local.get("apiKey");
   if (!apiKey) return { ok: false, hasApiKey: false, filled: 0 };
+  const { store: videos, seenIds } = await readVideoStore();
   const result = await fillVideoDetails(videos, apiKey);
-  if (result.changed) await chrome.storage.local.set({ videos });
+  if (result.changed) await commitVideos(videos, seenIds);
   return { ok: true, hasApiKey: true, ...result };
 }
 
@@ -1245,7 +1283,8 @@ async function fetchAllUploads(playlistId, apiKey) {
 async function fetchAllVideosForChannels(channelIds) {
   const { apiKey } = await chrome.storage.local.get("apiKey");
   if (!apiKey) return { ok: false, hasApiKey: false };
-  const { channels = {}, videos: store = {} } = await chrome.storage.local.get(["channels", "videos"]);
+  const { channels = {} } = await chrome.storage.local.get("channels");
+  const { store, seenIds } = await readVideoStore();
   const now = Date.now();
   const result = { ok: true, hasApiKey: true, channels: 0, added: 0, total: 0, apiFailures: 0, lastError: null };
   // Resolve real uploads-playlist ids up front (falls back to the UU shortcut).
@@ -1263,11 +1302,11 @@ async function fetchAllVideosForChannels(channelIds) {
     result.channels++;
     // Persist after each channel so a long job's progress survives a worker
     // restart (and the dashboard shows videos accumulating live).
-    await chrome.storage.local.set({ channels, videos: store });
+    await commitVideos(store, seenIds, { channels });
   }
   // Fill duration/views/live for everything still missing them.
   await fillVideoDetails(store, apiKey);
-  await chrome.storage.local.set({ videos: store });
+  await commitVideos(store, seenIds);
   return result;
 }
 
@@ -1281,7 +1320,9 @@ function parseIsoDuration(iso) {
 
 // Keep the video store bounded: drop videos whose channel is gone or no longer
 // tracked, and cap per-channel history. Saved ("watch later") videos are always
-// kept so a manual bookmark never disappears.
+// kept so a manual bookmark never disappears; aging out past the cap spares
+// anything else the user acted on too, since the whole store now syncs and a
+// dropped watched/dismissed flag would propagate to every device.
 function pruneVideos(store, channels) {
   for (const [vid, v] of Object.entries(store)) {
     const ch = channels[v.channelId];
@@ -1294,7 +1335,7 @@ function pruneVideos(store, channels) {
     if (list.length <= VIDEO_KEEP_PER_CHANNEL) continue;
     list.sort((a, b) => (a.published < b.published ? 1 : -1)); // newest first
     for (const v of list.slice(VIDEO_KEEP_PER_CHANNEL)) {
-      if (!v.saved) delete store[v.id];
+      if (!isUserTouched(v)) delete store[v.id];
     }
   }
 }
@@ -1342,8 +1383,7 @@ async function computeSyncDiff(direction) {
       folders: local.folders || {},
       tags: local.tags || {},
       videoFolders: local.videoFolders || {},
-      // Compare only the syncable subset — the gist holds that, not the full cache.
-      videos: syncableVideos(local.videos || {}),
+      videos: local.videos || {},
     };
 
     let remoteState = null;
@@ -1497,17 +1537,20 @@ async function applyUpload(removeFromGistIds = []) {
       }
     }
 
+    // Bound what goes up the same way the local store is bounded, so untracked
+    // channels don't live on in the gist and come back on the next merge.
+    pruneVideos(uploadVideos, uploadChannels);
     const uploadState = {
       channels: uploadChannels,
       folders: local.folders || {},
       tags: local.tags || {},
       videoFolders: local.videoFolders || {},
-      videos: syncableVideos(uploadVideos), // only user-touched videos go to the gist
+      videos: uploadVideos,
       settings: mergeSettings(await readLocalSettings(), remoteSettings),
     };
     const body = {
       description: "MyTube Organizer sync data",
-      files: { [GIST_FILENAME]: { content: JSON.stringify(uploadState, null, 2) } },
+      files: { [GIST_FILENAME]: { content: serializeGistPayload(uploadState) } },
     };
 
     if (gistId) {
@@ -1550,6 +1593,7 @@ async function applyDownload(removeLocalIds = []) {
     // Watch Later lists: gist wins, local-only lists kept. Video store: union merge.
     const videoFolders = { ...(local.videoFolders || {}), ...(remoteState.videoFolders || {}) };
     const videos = mergeVideos(local.videos || {}, remoteState.videos || {});
+    pruneVideos(videos, channels); // keep the merged store within the same bounds
 
     const lastSyncedAt = Date.now();
     const settings = pickRemoteSettings(remoteState.settings);
@@ -1587,14 +1631,18 @@ async function syncWithGist() {
       videos: local.videos || {},
     };
     const merged = remoteState ? mergeStates(localState, remoteState) : localState;
+    // The merge unions in every video the gist knows about, including ones this
+    // device (or another) deliberately dropped. Re-apply the store's bounds to
+    // the merged result so an untrack converges instead of ping-ponging, and so
+    // both sides of the write — local and gist — hold the same thing.
+    pruneVideos(merged.videos, merged.channels);
     const mergedSettings = mergeSettings(await readLocalSettings(), remoteState?.settings);
     await chrome.storage.local.set({ ...merged, ...mergedSettings });
 
-    // The gist carries only the user-touched video subset (see syncableVideos).
-    const gistPayload = { ...merged, videos: syncableVideos(merged.videos), settings: mergedSettings };
+    const gistPayload = { ...merged, settings: mergedSettings };
     const body = {
       description: "MyTube Organizer sync data",
-      files: { [GIST_FILENAME]: { content: JSON.stringify(gistPayload, null, 2) } },
+      files: { [GIST_FILENAME]: { content: serializeGistPayload(gistPayload) } },
     };
     if (gistId) {
       await ghApi(gistToken, `${GIST_API}/${gistId}`, "PATCH", body);
@@ -1673,17 +1721,34 @@ function mergeStates(local, remote) {
   };
 }
 
-// The subset of the video store worth syncing: only videos the user has actually
-// touched (saved, watched, dismissed, or filed into a non-default list). The rest
-// — the New-feed cache and full-history dumps — is re-derivable per device from
-// RSS/API, so keeping it out of the gist bounds the payload by activity, not by
-// catalog size. Each device rebuilds its own cache; user state merges across.
-function syncableVideos(videos = {}) {
-  const out = {};
-  for (const [id, v] of Object.entries(videos)) {
-    if (v.saved || v.watched || v.hidden || (v.folderId && v.folderId !== "unsorted")) out[id] = v;
+// Serialize the gist payload. Pretty-printed while it's still small enough to
+// read on github.com, compact once the video store makes the indentation a real
+// cost. The API truncates reads past 1 MB (handled by following `raw_url`) and
+// needs a git clone past 10 MB — which an extension can't do — so refuse instead
+// of writing a gist this device could no longer read back. The check is on
+// string length rather than encoded bytes: close enough with the limit set below
+// GitHub's, and it avoids duplicating a multi-megabyte payload just to measure.
+const GIST_PRETTY_LIMIT = 512 * 1024;
+const GIST_MAX_LENGTH = 9 * 1024 * 1024;
+
+function serializeGistPayload(payload) {
+  let content = JSON.stringify(payload, null, 2);
+  if (content.length > GIST_PRETTY_LIMIT) content = JSON.stringify(payload);
+  if (content.length > GIST_MAX_LENGTH) {
+    throw new Error(
+      `Sync payload is ${(content.length / 1048576).toFixed(1)} MB, past the 10 MB the Gist API can serve back. ` +
+      `Untrack a few channels (or a large "fetch all videos" channel) and sync again.`
+    );
   }
-  return out;
+  return content;
+}
+
+// A video the user has acted on: saved, watched, dismissed, or filed into a
+// non-default list. These are never dropped by `pruneVideos` — losing one would
+// lose a decision the user made, and (unlike the rest of the store) it isn't
+// re-derivable from RSS.
+function isUserTouched(v) {
+  return !!(v.saved || v.watched || v.hidden || (v.folderId && v.folderId !== "unsorted"));
 }
 
 // Union-merge two video stores by id — deletions don't propagate. For a video

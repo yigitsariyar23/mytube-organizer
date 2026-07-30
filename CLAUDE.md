@@ -69,8 +69,8 @@ videos:  { [videoId]: {
   addedAt,                  // epoch ms first seen / saved
 } }
               // New-tab uploads (from RSS, per-channel-capped, pruned when a channel untracks) AND
-              // Watch Later items (saved:true) coexist here. Only the user-touched subset
-              // (saved/watched/hidden/organized) is synced — see `syncableVideos` below.
+              // Watch Later items (saved:true) coexist here. The whole store syncs; `isUserTouched`
+              // (saved/watched/hidden/organized) marks what `pruneVideos` must never drop.
 apiKey, gistToken, gistId, lastSyncedAt                        // settings + sync bookkeeping
 languages                                                     // string[] — editable language dropdown set (Settings)
 sortDate, sortCount, folderSort, currentView                  // persisted UI prefs ("channels"|"new"|"watchlater")
@@ -118,6 +118,13 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 
 ## Data flows worth knowing
 
+- **Catch-up on open.** The 3-hour alarm is the only *background* trigger, and
+  its first fire is 3 hours after install — so a second device used to show
+  empty/stale data until it happened to run. `catchUpOnOpen()` (dashboard `init`,
+  after the `onChanged` listener is wired) fixes that: `SYNC_GIST` if a token is
+  set and the last sync is over 5 min old, then `REFRESH_STATS` if no channel has
+  been fetched in 3 hours. Sync runs first — the merge supplies the channel list
+  and its `trackVideos` flags that the RSS pass then reads.
 - **Scan → review → apply.** The content script scrapes links and posts
   `SCAN_RESULT`. `background.js` resolves handles to IDs, diffs against the
   library, writes `pendingScan`, and opens the dashboard, which shows the review
@@ -133,11 +140,20 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   "tracked update" alert.
 - **Two video tabs share one `videos` store.** The sidebar has three views:
   **Channels**, **New**, **Watch Later** (`currentView`).
+  - **Writing the store.** It's one storage key, so any background job that reads
+    it and writes back minutes later (stats refresh, `FETCH_ALL_VIDEOS`, detail
+    backfill) would clobber whatever the dashboard wrote meanwhile — a video
+    marked watched mid-refresh used to un-mark itself. Those jobs read via
+    `readVideoStore()` and write via `commitVideos(store, seenIds, extra)`, which
+    re-reads storage, re-applies the user-owned fields (`USER_VIDEO_FLAGS`:
+    watched/saved/hidden/folderId), and keeps ids that appeared after the read
+    (`seenIds` distinguishes those from ones `pruneVideos` dropped on purpose).
   - **New (RSS feed).** `fetchChannelVideos` parses the *full* `<entry>` list
     (not just the max date) for every `trackVideos` channel and upserts each into
     `videos` (`upsertChannelVideos`), preserving `watched` across refreshes;
     `pruneVideos` caps history per channel and drops videos whose channel
-    untracked/vanished (saved ones survive). No API key or quota. Rendered
+    untracked/vanished (saved ones survive; the cap also spares anything else
+    `isUserTouched`). No API key or quota. Rendered
     newest-first, grouped by day, filtered by the channel-folder sidebar + search
     + unwatched chip. **No algorithmic ranking** (no API exposes YouTube's
     per-subset feed); videos open on youtube.com/watch, where YouTube's own
@@ -230,20 +246,32 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   matches reality. Those sections are read-only — folders/lists/settings/videos
   apply wholesale/merge; only channel removals are opt-out via checkboxes. Folder
   and list *removals* only show on upload (download keeps local-only ones).
-- **Everything is in the gist — but only the *touched* video subset.** The
-  payload carries `channels`, `folders`, `tags`, `videoFolders`, a `settings` blob
-  (the `SYNC_SETTING_KEYS`: `apiKey`, `languages`, `sortDate`, `sortCount`,
-  `folderSort`), and `videos` **filtered by `syncableVideos`** — only videos the
-  user has saved/watched/dismissed/organized. The New-feed cache and full-history
-  dumps (the bulk) are re-derivable per device and stay out of the gist, so the
-  payload is bounded by *activity*, not catalog size. On download the subset is
-  union-merged into the full local store, so each device keeps its own cache while
-  user state converges. `videoFolders` merge like `folders`; `videos` merge via
-  `mergeVideos`/`mergeVideo` — watched/saved/hidden OR-ed, an organized
-  (non-`unsorted`) list assignment wins, higher view count / filled duration win,
-  and **nothing is removed**. `mergeSettings` keeps non-empty local values and
-  adopts remote for the rest. `gistToken` is **never** synced. Reads already fall
-  back to `raw_url` past GitHub's 1 MB inline limit; the subset keeps writes small.
+- **The gist holds the whole library.** The payload carries `channels`, `folders`,
+  `tags`, `videoFolders`, the **entire** `videos` store (New-feed cache and
+  full-history dumps included, not just the user-touched subset), and a `settings`
+  blob — every `SYNC_SETTING_KEYS` entry: `apiKey`, `languages`, `sortDate`,
+  `sortCount`, `folderSort`, `videoSort`, `currentView`, `colWidths`. Three keys
+  are deliberately excluded: `gistToken` (the credential — **never** synced),
+  `gistId`/`lastSyncedAt` (per-device bookkeeping), and `pendingScan`/
+  `pendingPlaylistImport` (an in-flight review on one device).
+  `videoFolders` merge like `folders`; `videos` merge via `mergeVideos`/
+  `mergeVideo` — watched/saved/hidden OR-ed, an organized (non-`unsorted`) list
+  assignment wins, higher view count / filled duration win, and **nothing is
+  removed** by the merge itself. `mergeSettings` keeps non-empty local values and
+  adopts remote for the rest — so a *changed* pref propagates only through an
+  explicit Download, not the silent merge.
+- **Syncing the whole store has two consequences the code has to handle.**
+  1. *Bounds.* Since the merge unions the gist's videos back in, `pruneVideos` is
+     re-run on the merged result (`syncWithGist`, `applyDownload`) and on what's
+     uploaded (`applyUpload`) — otherwise an untracked channel's videos would
+     ping-pong back forever and the gist would only ever grow. The cap now spares
+     any `isUserTouched` video (not just `saved`), because dropping a watched or
+     dismissed flag would now propagate everywhere.
+  2. *Size.* `serializeGistPayload` pretty-prints under 512 KB and switches to
+     compact JSON above it. Reads past GitHub's 1 MB inline limit already follow
+     `raw_url`; past **10 MB** the API can't serve the file back at all, so the
+     serializer throws a plain-language error at 9 MB rather than writing a gist
+     this extension could no longer read.
 
 ## Conventions
 
