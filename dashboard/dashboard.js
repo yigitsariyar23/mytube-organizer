@@ -1591,8 +1591,9 @@ function openSyncDiffModal(diff) {
   const vf = diff.videoFolders || { added: [], removed: [], modified: [] };
   const vfRemoved = isUpload ? vf.removed : [];
   const vfCount = vf.added.length + vf.modified.length + vfRemoved.length;
-  const vids = diff.videos || { added: 0, modified: 0 };
-  const vidsCount = vids.added + vids.modified;
+  const vids = diff.videos || { added: 0, modified: 0, removed: 0 };
+  const vidsRemoved = vids.removed || 0;
+  const vidsCount = vids.added + vids.modified + vidsRemoved;
 
   el.syncDiffTitle.textContent = isUpload ? "Review upload" : "Review download";
 
@@ -1628,7 +1629,9 @@ function openSyncDiffModal(diff) {
   if (folderCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Folders — will overwrite ${dest}`, fo.added, fo.modified, foRemoved));
   if (vfCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Watch Later lists — will overwrite ${dest}`, vf.added, vf.modified, vfRemoved));
   if (vidsCount) el.syncDiffBody.appendChild(buildSyncNoteSection(`Videos — merged ${dest}`, vidsCount,
-    `${vids.added} new, ${vids.modified} with changed watched/saved/list state. Videos merge both ways; none are removed.`));
+    `${vids.added} new, ${vids.modified} with changed watched/saved/list state`
+    + (vidsRemoved ? `, ${vidsRemoved} dropped (untracked channel, or past the per-channel history cap)` : "")
+    + `. Videos merge both ways; a merge never removes a saved, watched or dismissed video.`));
 
   el.syncDiffApply.textContent = isUpload ? "Apply upload" : "Apply download";
   el.syncDiffApply.disabled = totalChanges === 0;

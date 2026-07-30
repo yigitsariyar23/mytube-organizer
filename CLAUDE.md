@@ -252,6 +252,17 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   matches reality. Those sections are read-only — folders/lists/settings/videos
   apply wholesale/merge; only channel removals are opt-out via checkboxes. Folder
   and list *removals* only show on upload (download keeps local-only ones).
+  **The video count comes from `effectiveSyncVideos`** — the same union merge +
+  `pruneVideos` pass the apply runs, over `effectiveSyncChannels` (the channel set
+  the apply lands on). Diffing the raw union instead was a bug: a merged video the
+  prune then dropped (untracked channel, or the union pushing a channel past
+  `VIDEO_KEEP_PER_CHANNEL`) was reported as "N new" on *every* sync, applied
+  cleanly, and was still missing afterwards — a diff that could never be cleared.
+  If you change what an apply writes, change these two helpers, not a parallel
+  copy of the logic. The same rule bit the per-video comparison: an absent
+  `folderId` and `"unsorted"` are one state (RSS videos carry none, `mergeVideo`
+  stamps `"unsorted"`), so `userStateKey` normalizes them or the whole overlap
+  reads as "changed list state" forever.
 - **The gist holds the whole library.** The payload carries `channels`, `folders`,
   `tags`, `videoFolders`, the **entire** `videos` store (New-feed cache and
   full-history dumps included, not just the user-touched subset), and a `settings`

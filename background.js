@@ -1467,16 +1467,29 @@ async function computeSyncDiff(direction) {
     }
 
     // Video store is too large to review per-item; summarize how many will be
-    // added/updated on the target (a union merge — nothing is removed).
+    // added/updated on the target. The count has to come from the *effective*
+    // result (union merge + the same pruneVideos pass the apply runs), not from
+    // the raw union: a merged video the prune then drops — its channel isn't
+    // tracked on the target, or the union pushed a channel past the per-channel
+    // cap — would otherwise be reported as "added" on every sync, apply cleanly,
+    // and still be missing afterwards, so the same diff came back forever.
     const srcVids = src.videos || {};
     const tgtVids = tgt.videos || {};
-    const userStateKey = (v) => `${!!v.watched}|${!!v.saved}|${!!v.hidden}|${v.folderId || ""}`;
-    let vidsAdded = 0, vidsModified = 0;
-    for (const [id, sv] of Object.entries(srcVids)) {
+    const resultVids = effectiveSyncVideos(direction, localState, remoteState);
+    // An absent folderId and "unsorted" are the same state — the default list.
+    // They must compare equal: RSS-created videos carry no folderId at all, but
+    // mergeVideo stamps "unsorted" on anything it merges, so treating them as
+    // different reported the entire overlapping store as "changed list state"
+    // on every sync, forever.
+    const listOf = (v) => (v.folderId && v.folderId !== "unsorted" ? v.folderId : "");
+    const userStateKey = (v) => `${!!v.watched}|${!!v.saved}|${!!v.hidden}|${listOf(v)}`;
+    let vidsAdded = 0, vidsModified = 0, vidsRemoved = 0;
+    for (const [id, rv] of Object.entries(resultVids)) {
       const tv = tgtVids[id];
       if (!tv) vidsAdded++;
-      else if (userStateKey(sv) !== userStateKey(tv)) vidsModified++;
+      else if (userStateKey(rv) !== userStateKey(tv)) vidsModified++;
     }
+    for (const id of Object.keys(tgtVids)) if (!resultVids[id]) vidsRemoved++;
 
     // Settings diff: compare the CURRENT target value against the value the apply
     // would actually write, so the review matches the real outcome. Upload uses
@@ -1500,12 +1513,37 @@ async function computeSyncDiff(direction) {
       channels: { added, removed, modified },
       folders: { added: foAdded, removed: foRemoved, modified: foModified },
       videoFolders: { added: vfAdded, removed: vfRemoved, modified: vfModified },
-      videos: { added: vidsAdded, modified: vidsModified, srcTotal: Object.keys(srcVids).length },
+      videos: { added: vidsAdded, modified: vidsModified, removed: vidsRemoved, srcTotal: Object.keys(srcVids).length },
       settings,
     };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
   }
+}
+
+// The channel set an apply ends up with: on upload local wins and Gist-only
+// channels are kept (unless ticked for removal); on download the Gist wins and
+// local-only channels are kept. `trackVideos` on these decides what pruneVideos
+// keeps, so the video preview has to use the same set the apply will.
+function effectiveSyncChannels(direction, localState, remoteState, removeIds = []) {
+  const localCh = localState.channels || {};
+  const remoteCh = remoteState.channels || {};
+  const removeSet = new Set(removeIds);
+  const kept = {};
+  for (const [id, c] of Object.entries(direction === "upload" ? remoteCh : localCh)) {
+    if (!removeSet.has(id)) kept[id] = c;
+  }
+  return direction === "upload" ? { ...kept, ...localCh } : { ...kept, ...remoteCh };
+}
+
+// The video store an apply would actually write: union merge, then bounded by
+// the same pruneVideos pass. Used by computeSyncDiff so the review matches the
+// outcome — keep it in step with applyUpload/applyDownload.
+function effectiveSyncVideos(direction, localState, remoteState, removeIds = []) {
+  const channels = effectiveSyncChannels(direction, localState, remoteState, removeIds);
+  const videos = mergeVideos(localState.videos || {}, remoteState.videos || {});
+  pruneVideos(videos, channels);
+  return videos;
 }
 
 async function applyUpload(removeFromGistIds = []) {
@@ -1516,27 +1554,24 @@ async function applyUpload(removeFromGistIds = []) {
     let gistId = await resolveGistId(gistToken);
 
     const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
-    let uploadChannels = { ...(local.channels || {}) };
-    // Video store is union-merged with the gist (deletions don't propagate).
-    let uploadVideos = { ...(local.videos || {}) };
+    const localState = { channels: local.channels || {}, videos: local.videos || {} };
 
-    // Re-include any Gist-only channels the user chose to keep
+    // Gist-only channels the user chose to keep are re-included; the video store
+    // is union-merged with the gist (deletions don't propagate) and then bounded
+    // the same way the local store is, so untracked channels don't live on in
+    // the gist and come back on the next merge.
+    let remoteState = { channels: {}, videos: {} };
     let remoteSettings = {};
     if (gistId) {
-      const remoteState = await fetchGistState(gistToken, gistId);
-      if (remoteState) {
-        remoteSettings = remoteState.settings || {};
-        const removeSet = new Set(removeFromGistIds);
-        for (const [id, rc] of Object.entries(remoteState.channels || {})) {
-          if (!uploadChannels[id] && !removeSet.has(id)) uploadChannels[id] = rc;
-        }
-        uploadVideos = mergeVideos(local.videos || {}, remoteState.videos || {});
+      const fetched = await fetchGistState(gistToken, gistId);
+      if (fetched) {
+        remoteState = fetched;
+        remoteSettings = fetched.settings || {};
       }
     }
+    const uploadChannels = effectiveSyncChannels("upload", localState, remoteState, removeFromGistIds);
+    const uploadVideos = effectiveSyncVideos("upload", localState, remoteState, removeFromGistIds);
 
-    // Bound what goes up the same way the local store is bounded, so untracked
-    // channels don't live on in the gist and come back on the next merge.
-    pruneVideos(uploadVideos, uploadChannels);
     const uploadState = {
       channels: uploadChannels,
       folders: local.folders || {},
@@ -1577,20 +1612,17 @@ async function applyDownload(removeLocalIds = []) {
     if (!remoteState) return { ok: false, error: "Gist has no usable state yet." };
 
     const local = await chrome.storage.local.get(["channels", "folders", "videoFolders", "videos"]);
-    const removeSet = new Set(removeLocalIds);
+    const localState = { channels: local.channels || {}, videos: local.videos || {} };
 
-    // Start with Gist channels, then re-add local-only channels user chose to keep
-    const channels = { ...remoteState.channels };
-    for (const [id, lc] of Object.entries(local.channels || {})) {
-      if (!channels[id] && !removeSet.has(id)) channels[id] = lc;
-    }
+    // Gist channels win; local-only ones the user chose to keep are re-added.
+    const channels = effectiveSyncChannels("download", localState, remoteState, removeLocalIds);
 
     // Gist folders win, but keep local folders referenced by preserved local-only channels
     const folders = { ...(local.folders || {}), ...remoteState.folders };
-    // Watch Later lists: gist wins, local-only lists kept. Video store: union merge.
+    // Watch Later lists: gist wins, local-only lists kept. Video store: union
+    // merge, kept within the same bounds as any other write.
     const videoFolders = { ...(local.videoFolders || {}), ...(remoteState.videoFolders || {}) };
-    const videos = mergeVideos(local.videos || {}, remoteState.videos || {});
-    pruneVideos(videos, channels); // keep the merged store within the same bounds
+    const videos = effectiveSyncVideos("download", localState, remoteState, removeLocalIds);
 
     const lastSyncedAt = Date.now();
     const settings = pickRemoteSettings(remoteState.settings);
