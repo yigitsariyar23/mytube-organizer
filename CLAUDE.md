@@ -20,6 +20,8 @@ dashboard/
   dashboard.js                        UI logic: render, filter/sort, folders/tags, dialogs, events
 content-scripts/
   scrape-subscriptions.js             runs only on youtube.com/feed/channels; scrapes channel links
+version.json                          build stamp (UTC), rewritten by .githooks/pre-commit
+.githooks/pre-commit                  stamps version.json; enable with `git config core.hooksPath .githooks`
 icons/                                EMPTY — no packaged icon (manifest icon keys commented out)
 check-missing.sh, csv-ids.txt,        one-off dev utilities / personal data dumps (see "Cruft")
   scraped-ids.txt
@@ -38,6 +40,9 @@ channels: { [channelId]: {
   folderId,                 // "unsorted" by default; a leaf folder id otherwise
   tags: [tagId, ...],       // free-form multi-value labels
   language,                 // string | null — the "Variables" cell language dropdown
+                            //   (and the right-click "Set language" menu); shown with a flag
+                            //   from LANG_FLAGS, 🌐 when unknown, or a leading emoji the
+                            //   label itself carries
   active,                   // bool — user flag: a channel you're following
   finished,                 // bool — user flag: a channel you consider done
   trackVideos,              // bool — user flag: feed this channel's uploads into the New videos tab
@@ -66,14 +71,24 @@ videos:  { [videoId]: {
   hidden,                   // bool — user-dismissed from the New feed; kept so a refresh won't re-add it
   saved,                    // bool — in Watch Later
   folderId,                 // which Watch Later list ("unsorted" default); only meaningful when saved
+  userStateAt,              // epoch ms | absent — when the user last changed watched/saved/hidden/
+                            //   folderId. Stamped automatically by the dashboard's saveVideos()
+                            //   (it diffs against videoStateSnapshot) and by the background's own
+                            //   saves; sync resolves those four fields last-writer-wins from it
   addedAt,                  // epoch ms first seen / saved
 } }
               // New-tab uploads (from RSS, per-channel-capped, pruned when a channel untracks) AND
               // Watch Later items (saved:true) coexist here. The whole store syncs; `isUserTouched`
               // (saved/watched/hidden/organized) marks what `pruneVideos` must never drop.
 apiKey, gistToken, gistId, lastSyncedAt                        // settings + sync bookkeeping
-languages                                                     // string[] — editable language dropdown set (Settings)
-sortDate, sortCount, folderSort, currentView                  // persisted UI prefs ("channels"|"new"|"watchlater")
+dismissedUpdateBuild                                          // the version.json build the user dismissed
+                                                              //   in the update banner (per-device)
+lastSyncCheckAt                                               // epoch ms of the last on-open gist check
+                                                              //   (throttle only; per-device, never synced)
+languages                                                     // string[] — editable language dropdown set (Settings, or
+                                                              //   "+ New language…" in the right-click language submenu)
+sortDate, sortCount, folderSort, currentView                  // persisted UI prefs ("channels"|"new"|"watchlater");
+                                                              //   per-device — deliberately NOT synced
 colWidths                                                    // number[5] | absent — resized px widths of the 5 sized table columns
 pendingScan: { scannedAt, scannedCount, unresolved, added[], modified[], removed[] }
               // a scan awaiting review; never applied to `channels` until confirmed, never synced
@@ -109,8 +124,8 @@ and reply through `sendResponse` (async, so each returns `true`).
 | `APPLY_PLAYLIST_IMPORT` | `{ listName, moveIds }` | `{ ok, listId, added, moved }` (creates a Watch Later list, saves the reviewed playlist into it) |
 | `DISCARD_PLAYLIST_IMPORT` | — | `{ ok }` (clears `pendingPlaylistImport`) |
 | `FETCH_SYNC_DIFF` | `{ direction }` | `{ ok, direction, channels: { added, removed, modified } }` |
-| `APPLY_UPLOAD` | `{ removeFromGistIds }` | `{ ok, gistId, lastSyncedAt }` |
-| `APPLY_DOWNLOAD` | `{ removeLocalIds }` | `{ ok, gistId, lastSyncedAt }` |
+| `APPLY_UPLOAD` | `{ removeFromGistIds, skipVideoIds }` | `{ ok, gistId, lastSyncedAt }` |
+| `APPLY_DOWNLOAD` | `{ removeLocalIds, skipVideoIds }` | `{ ok, gistId, lastSyncedAt }` |
 
 The dashboard also reacts to `chrome.storage.onChanged` so background writes
 (auto-refresh, a scan that finished while it was closed) update the UI live.
@@ -122,14 +137,28 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   data until it happened to run. `catchUpOnOpen()` (dashboard `init`, after the
   `onChanged` listener is wired) fires `REFRESH_STATS` if no channel has been
   fetched in 3 hours. **YouTube data only — it never touches the gist.**
-- **Sync is never automatic.** Nothing reads or writes the gist unless the user
-  asks: no alarm sync, no sync on open. An automatic merge meant a device opened
-  after sitting stale pushed its old library up before pulling anything down, so
-  whichever device ran first decided the shared state and newer work elsewhere
-  was overwritten. Both directions now go through the explicit
-  `FETCH_SYNC_DIFF` → review → `APPLY_UPLOAD`/`APPLY_DOWNLOAD` flow. (The old
-  silent union merge — `SYNC_GIST`/`syncWithGist`/`mergeStates` — is gone; don't
-  reintroduce a background merge.)
+- **Sync never *applies* by itself.** Nothing is written to the gist, and nothing
+  from the gist is written locally, without the user confirming a review. An
+  automatic merge meant a device opened after sitting stale pushed its old
+  library up before pulling anything down, so whichever device ran first decided
+  the shared state and newer work elsewhere was overwritten. Both directions go
+  through the explicit `FETCH_SYNC_DIFF` → review →
+  `APPLY_UPLOAD`/`APPLY_DOWNLOAD` flow. (The old silent union merge —
+  `SYNC_GIST`/`syncWithGist`/`mergeStates` — is gone; don't reintroduce a
+  background merge.)
+- **Looking, however, is automatic.** `checkRemoteChangesOnOpen()` (dashboard
+  `init`, chained behind `catchUpOnOpen` so the diff sees refreshed local data)
+  fetches the **download** diff and opens the normal review when the gist
+  actually differs — a device that sat closed otherwise had no way of knowing.
+  It's a read: `FETCH_SYNC_DIFF` computes, `openSyncDiffModal` shows, and not a
+  byte moves until Apply. Guards: no token → skip; another review already open →
+  skip (checked again after the fetch, since the wait is a network round trip);
+  a failure is **silent** (an unrequested check shouldn't show "GitHub: 401" to
+  someone who just opened their subscriptions); and `lastSyncCheckAt` throttles
+  it to once per `SYNC_CHECK_INTERVAL_MS` (10 min) so reopening the dashboard
+  isn't a GitHub request every time. `syncDiffTotal()` decides "actually
+  differs" — the same count the review's summary and Apply button use, so the
+  modal can never open on a diff that would render as "already in sync".
 - **Scan → review → apply.** The content script scrapes links and posts
   `SCAN_RESULT`. `background.js` resolves handles to IDs, diffs against the
   library, writes `pendingScan`, and opens the dashboard, which shows the review
@@ -202,8 +231,9 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   - **Watch Later.** Saved videos (`saved:true`) organized into `videoFolders`
     (a second, independent folder tree with the *same* nesting/drag/emoji/rename
     rules as channel folders). Its own list sidebar; a video's `folderId` is its
-    list. Right-click a card → move to list / remove. Removing a manually-saved
-    video deletes it; removing a tracked-channel video just clears `saved`.
+    list. Right-click a card → move to list / remove. Removing only clears
+    `saved` + `folderId` — for a manual save too, whose record is then a tombstone
+    (see the sync notes); a tracked channel's video simply returns to the New feed.
 - **The folder sidebar is domain-generalized.** One `#folderList` and one set of
   folder functions serve both trees; `fdom()` returns the active domain (channel
   `folders` + `currentFolderId` for Channels/New, `videoFolders` + `currentListId`
@@ -241,17 +271,24 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   only if an API key is set. **No API key required**; works for private/unlisted/public.
 - **Sync.** Directional and manual only (`FETCH_SYNC_DIFF` → review →
   `APPLY_UPLOAD`/`APPLY_DOWNLOAD`), so every change is confirmed before it moves.
-  Both directions union-merge — tags combine, fresher `lastFetched` wins on stats,
-  and **deletions do not propagate** except for the channel removals the user
-  ticks in the review.
+  Both directions union-merge — **channels, folders, tags, Watch Later lists and
+  videos all union** (local wins the overlap on upload, the gist wins it on
+  download), fresher `lastFetched` wins on stats, and **deletions do not
+  propagate** except for the channel removals the user ticks in the review.
+  Folders/lists/tags used to be written wholesale from one side, which meant a
+  device that hadn't downloaded yet wiped every folder, list or tag the other had
+  just added — while the channels and videos filed under them survived the merge
+  and were left pointing at an id with nothing behind it. Don't reintroduce a
+  wholesale write on either side.
 - **The directional review shows more than channels.** `computeSyncDiff` also
   diffs folders (add/rename/reparent/emoji), the Watch Later lists (`videoFolders`,
   same diff), the video store (a **count summary** — too many to review per item),
   and the mirrored settings, computed against the *effective* apply result (upload
   uses `mergeSettings`, download overlays picked remote keys) so the preview
-  matches reality. Those sections are read-only — folders/lists/settings/videos
-  apply wholesale/merge; only channel removals are opt-out via checkboxes. Folder
-  and list *removals* only show on upload (download keeps local-only ones).
+  matches reality. Folders/lists/settings apply as a whole; **channel removals and
+  individual video changes are the two opt-outs**. Folder and list *removals* are
+  never reported by the diff any more — both directions union them, so a folder
+  the target has and the source doesn't simply stays.
   **The video count comes from `effectiveSyncVideos`** — the same union merge +
   `pruneVideos` pass the apply runs, over `effectiveSyncChannels` (the channel set
   the apply lands on). Diffing the raw union instead was a bug: a merged video the
@@ -259,24 +296,54 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   `VIDEO_KEEP_PER_CHANNEL`) was reported as "N new" on *every* sync, applied
   cleanly, and was still missing afterwards — a diff that could never be cleared.
   If you change what an apply writes, change these two helpers, not a parallel
-  copy of the logic. The same rule bit the per-video comparison: an absent
+  copy of the logic. **The same diff also carries `videos.items`** — one row per
+  added/changed video (`{ id, title, author, from, to }`, `from: null` for a video
+  the target lacks), modified rows first, capped at `VIDEO_DIFF_LIMIT` with the
+  overflow reported as `truncated`. The review lists them behind a "Show the N
+  video changes" button, each ticked; unticking sends the id back as
+  `skipVideoIds`, and `effectiveSyncVideos` then leaves that video exactly as the
+  target has it (dropping it if the target never had it). It's the only way to
+  take part of a sync — the counts alone couldn't say *which* video moved.
+  **Videos the apply would drop are rows too** (`to: null`, plus a `reason`: the
+  channel isn't tracked, or it's past `VIDEO_KEEP_PER_CHANNEL`), listed first
+  because they're the destructive ones. For those, unticking *keeps* the video —
+  which is why `skipVideoIds` is applied **after** `pruneVideos`, not before. The same rule bit the per-video comparison: an absent
   `folderId` and `"unsorted"` are one state (RSS videos carry none, `mergeVideo`
   stamps `"unsorted"`), so `userStateKey` normalizes them or the whole overlap
   reads as "changed list state" forever.
 - **The gist holds the whole library.** The payload carries `channels`, `folders`,
   `tags`, `videoFolders`, the **entire** `videos` store (New-feed cache and
   full-history dumps included, not just the user-touched subset), and a `settings`
-  blob — every `SYNC_SETTING_KEYS` entry: `apiKey`, `languages`, `sortDate`,
-  `sortCount`, `folderSort`, `videoSort`, `currentView`, `colWidths`. Three keys
-  are deliberately excluded: `gistToken` (the credential — **never** synced),
+  blob — `SYNC_SETTING_KEYS`, which is now just `apiKey` and `languages`: real
+  configuration you'd otherwise re-enter on a new device. The **view preferences
+  are not synced** (`sortDate`, `sortCount`, `folderSort`, `videoSort`,
+  `currentView`, `colWidths`) — they say how one device is being looked at right
+  now, and syncing them re-sorted the other device's list and put a pointless
+  "1 setting" row in every review. Old gists still carry them; readers filter
+  through `SYNC_SETTING_KEYS`, so they're ignored and drop out on the next
+  upload. Also excluded: `gistToken` (the credential — **never** synced),
   `gistId`/`lastSyncedAt` (per-device bookkeeping), and `pendingScan`/
   `pendingPlaylistImport` (an in-flight review on one device).
   `videoFolders` merge like `folders`; `videos` merge via `mergeVideos`/
-  `mergeVideo` — watched/saved/hidden OR-ed, an organized (non-`unsorted`) list
-  assignment wins, higher view count / filled duration win, and **nothing is
-  removed** by the merge itself. `mergeSettings` keeps non-empty local values and
+  `mergeVideo` — higher view count / filled duration win, **nothing is removed**
+  by the merge itself, and the four user-owned fields go through `mergeUserState`
+  (below). `mergeSettings` keeps non-empty local values and
   adopts remote for the rest, so an upload never clears a pref the other device
   set; a *changed* pref propagates only through an explicit Download.
+- **User state resolves last-writer-wins, not by union.** `watched`/`saved`/
+  `hidden`/`folderId` used to be OR-ed on merge. OR only ever turns a flag *on*,
+  so un-saving, un-watching, un-hiding and moving back to Unsorted never reached
+  the other device — and the gist's stale `true` merged back over the local
+  change, so removing something from Watch Later undid itself on the next sync.
+  Now every user change stamps `userStateAt` and `mergeUserState` gives all four
+  fields to the newer stamp (they're one decision — mixing halves of two devices'
+  states invents a third nobody chose). Unstamped on both sides = pre-update
+  record, keeps the old union; stamped beats unstamped. **A removal is a record,
+  not a deletion**: un-saving leaves `saved:false` behind (even for a manual save,
+  which used to be deleted outright) because a deleted row carries no information
+  and the gist would merge the video straight back. `pruneVideos` keeps any record
+  changed within `USER_STATE_TOMBSTONE_MS` (90 days) so the tombstone outlives the
+  next sync on every device, then lets it go.
 - **Syncing the whole store has two consequences the code has to handle.**
   1. *Bounds.* Since a download unions the gist's videos back in, `pruneVideos` is
      re-run on the merged result (`applyDownload`) and on what's
@@ -295,6 +362,18 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 - **Never commit any AI usage including co-author etc.** No `Co-Authored-By`
   trailers, no "Generated with" lines, no AI attribution of any kind in commit
   messages or PR bodies.
+- **Every commit updates two things besides the code:**
+  1. `version.json` — the build stamp the update banner compares against. The
+     `.githooks/pre-commit` hook rewrites and stages it automatically, so this
+     only needs doing by hand when the hook can't run: a fresh clone that hasn't
+     had `git config core.hooksPath .githooks`, or a `--no-verify` commit. A
+     commit that leaves the stamp untouched doesn't break anything loudly — it
+     just silently stops every other device from being told to pull.
+  2. **These docs.** `CLAUDE.md` for anything that changes how the code works
+     (a new message type, a storage key, a data-flow rule, a gotcha worth not
+     rediscovering) and `README.md` for anything the user can see or do. Both in
+     the same commit as the change, not after it — a doc that lags is worse than
+     one that's missing, because it gets believed.
 - Vanilla everything. New UI = a `render*()` function reading from `state` +
   event delegation in `bindEvents()`. `state` in `dashboard.js` mirrors storage.
 - Always `escapeHtml()` any channel/folder/tag text interpolated into
@@ -308,6 +387,58 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 
 ## Known gaps / gotchas
 
+- **The update banner can't update anything.** `checkForAppUpdate()` (dashboard
+  `init`) compares the local `version.json` build against the one on GitHub and,
+  when the remote is newer, shows a banner with the last commit's subject, the
+  `git pull` to run, and a **Reload extension** button. That button is the only
+  part the extension can actually do — `chrome.runtime.reload()` makes Chrome
+  re-read an unpacked extension from disk. There is **no way** to pull from in
+  here: an MV3 worker has no shell and no filesystem (not even to its own
+  folder), and Chrome's auto-update only covers Web Store installs. Don't
+  "improve" this into a self-updater; it can't exist.
+  - The stamp is a **timestamp, not a SHA**: at pre-commit time the commit's own
+    hash doesn't exist yet. It also has to *order*, so a local commit that hasn't
+    been pushed reads as "ahead", not as "an update is available".
+  - The raw fetch is cache-busted (`?t=` + `no-store`) — raw.githubusercontent
+    caches for minutes, and a stale copy would hide the very push being looked
+    for. The commit *subject* comes from `api.github.com` and is optional: a
+    rate-limited API just means a banner with no title.
+  - Dismissing stores that build in `dismissedUpdateBuild`, so it stays quiet
+    until the next push rather than the next dashboard open.
+- **The toolbar counts results** (`renderResultCount`, `#resultCount`): "42 of
+  380 channels", or just "380 channels" when nothing is filtered. The
+  denominator is the current folder/list, so navigation never reads as a
+  filtered-out count. This is why each view is split into a *universe* function
+  (`channelsInCurrentFolder`, `newFeedUniverse`, `watchLaterUniverse` — folder
+  scope + intrinsic exclusions) and the chips applied on top (`applyVideoChips`);
+  the renderers compute the universe once and filter it, so the count costs no
+  extra pass. It lives in its own element, **not** `#statusText`, because the
+  two used to overwrite each other ("Refreshing…" vs "240 videos").
+- **Filter chips are two-sided.** Left click = "only these", right click = "not
+  these", and clicking the side a chip already holds clears it (`toggleChipFilter`
+  for the set-backed tag/language chips, `toggleTriState` for the string-backed
+  Active/Finished/watched ones — `activateFilterChip` routes both mouse buttons
+  into the same place). Tags and languages therefore keep **two** sets each
+  (`activeTagFilters`/`excludedTagFilters`, `activeLangFilters`/
+  `excludedLangFilters`) and every one of them has to be reset in
+  `resetVariableFilters` and counted in `anyFilterActive`. This replaced a
+  one-button cycle (off → only → not) that could only be reversed by clicking
+  through, and that tags/languages never had at all. Because right-click is now
+  filter UI, the tag rename/delete menu moved to **shift**+right-click.
+- **Number filters scrub.** `setupNumberScrubbing()` gives every number input a
+  Unity-style horizontal drag and an FM-style wheel; the native spinners are
+  hidden in CSS. Two details that matter: the wheel listener is
+  `{ passive: false }` (otherwise the page scrolls under the cursor) and the
+  drag only begins after the pointer actually moves, so click-to-type survives.
+  Values are written through `setScrubValue`, which clamps to the input's
+  min/max and dispatches a real `input` event — the filter handlers listening
+  for typing are the only code path, scrubbing has none of its own.
+- **The year dropdowns come from the data.** `populateYearDropdowns()` lists only
+  years present in `lastVideoDate` (newest first), rebuilding when that set
+  changes — it's keyed on `yearOptionsKey` so the common render does nothing. A
+  rebuild preserves the current selection, and if the selected year no longer
+  exists it falls back to "—" **and fires `change`**, so the filter state can't
+  drift from what the dropdown shows.
 - **Two empty states.** `#emptyState` shows when the library is empty (zero
   channels); `#noResultsState` shows when the library is non-empty but the
   current folder + filters match nothing — with a **Clear filters** button
@@ -327,6 +458,12 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   Variables), so resizing is a wide-window feature. The date cell is a CSS
   `container` (`container-type: inline-size`): under ~100px it swaps the wordy
   `formatShortDate` span for the numeric `formatNumericDate` one (`DD/MM/YY`).
+- **Last Video is tinted by recency.** `dateAgeClass()` puts each date in a
+  bucket — this/last month, this year, the two years before, the two before
+  those, older — and the `.date-age-*` classes color it (blue → green → yellow →
+  orange → red, tokens in `:root`). Every bucket is measured against `new Date()`
+  at render time, so **never hardcode a year here**; the buckets have to slide
+  forward on their own. A missing/unparseable date gets no class on purpose.
 - **Multi-select** lives entirely in the dashboard: a module-level
   `selectedChannelIds` Set (not in `state`, never persisted) plus a
   `selectionAnchor` pivot. Ctrl/Cmd-click toggles one row; Shift-click

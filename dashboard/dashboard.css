@@ -8,6 +8,13 @@
   --accent: #e8b355;
   --accent-dim: #6b5530;
   --danger: #e0705a;
+  /* Last Video recency scale — see dateAgeClass(). Blue for this/last month,
+     then green → yellow → orange → red as the year distance grows. */
+  --age-current: #56B6E9;
+  --age-year: #6FCF97;
+  --age-recent: #E4C767;
+  --age-old: #F0913C;
+  --age-stale: #E0705A;
   --scroll-thumb: #3a3841;
   --scroll-thumb-hover: #4c4a55;
   --radius: 10px;
@@ -352,9 +359,17 @@ html, body {
   margin-bottom: 20px;
 }
 
-.search-input {
+.search-wrap {
+  position: relative;
+  display: flex;
   flex: 1;
   max-width: 360px;
+}
+
+.search-input {
+  flex: 1;
+  /* the × sits inside the field, so keep its text clear of it */
+  padding-right: 28px;
   background: var(--panel);
   border: 1px solid var(--border);
   color: var(--text);
@@ -391,6 +406,106 @@ html, body {
 
 .filter-input:focus { outline: none; border-color: var(--accent); }
 .filter-input::placeholder { color: var(--text-muted); }
+
+/* Scrubbable fields: drag/scroll replaces the native spinner, so hide it — its
+   arrows were a 6px target inside a 44px box. See setupNumberScrubbing(). */
+.filter-input.scrubbable {
+  appearance: textfield;
+  -moz-appearance: textfield;
+  cursor: ew-resize;
+}
+
+.filter-input.scrubbable::-webkit-outer-spin-button,
+.filter-input.scrubbable::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+/* While a drag is in flight: no text selection dragging along with it. */
+.filter-input.scrubbing {
+  user-select: none;
+  border-color: var(--accent);
+}
+
+/* The ghost × buttons: one per filter group, one inside the search box, one on
+   the update banner. Only .input-clear is positioned (it sits *in* the field). */
+.filter-clear,
+.input-clear,
+.banner-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.filter-clear:hover,
+.input-clear:hover,
+.banner-dismiss:hover { color: var(--accent); background: var(--panel-2); }
+
+.filter-clear[hidden],
+.input-clear[hidden],
+.banner-dismiss[hidden] { display: none; }
+
+.input-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* "A new version is on GitHub" bar. Accent-tinted rather than red: nothing is
+   wrong, there's just something to pull. */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-size: 12.5px;
+}
+
+.update-banner[hidden] { display: none; }
+
+.update-banner-text { flex: 1; min-width: 0; }
+
+.update-banner-cmd {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--accent);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 7px;
+  white-space: nowrap;
+  user-select: all; /* one click selects the whole command */
+}
+
+/* The topbar's right-hand group: result count, clear-all, status message. Kept
+   in one flex box with the auto margin on the box — not on its first child —
+   so the three wrap together instead of the count flying right and leaving the
+   button stranded at the start of the next line. */
+.topbar-end {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+/* "12 of 240 videos" — its own element so a count and a transient status
+   message ("Refreshing…") can't overwrite each other. */
+.result-count {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 
 .filter-input-num { width: 68px; }
 .filter-input-day { width: 44px; }
@@ -581,6 +696,14 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   white-space: nowrap;
 }
 
+/* Last Video is tinted by how long ago it was; the bucket class comes from
+   dateAgeClass() in dashboard.js. An undated row keeps the plain text color. */
+.row-date.date-age-current { color: var(--age-current); }
+.row-date.date-age-year    { color: var(--age-year); }
+.row-date.date-age-recent  { color: var(--age-recent); }
+.row-date.date-age-old     { color: var(--age-old); }
+.row-date.date-age-stale   { color: var(--age-stale); }
+
 /* The date cell is its own query container: when the (resizable) column gets
    narrow, swap the wordy "Jul 6, 2007" for the compact numeric "06/07/07". */
 .row-date { container-type: inline-size; }
@@ -603,7 +726,8 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .var-lang {
   font-size: 11px;
   padding: 2px 4px;
-  max-width: 92px;
+  /* Wide enough for a flag emoji + the language name (see langLabel). */
+  max-width: 108px;
   color: var(--text-muted);
   background: var(--panel-2);
   border: 1px solid var(--border);
@@ -727,6 +851,15 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 
 /* Active language filter chip: dark text over its per-language color (set inline
    in renderTagFilters). The .tag-chip.active rule supplies the dark text. */
+
+/* Right-clicked ("not these") filter chip. It keeps the tag/language color so
+   you can still tell which one it is, and is struck through to say it's being
+   ruled out rather than selected. */
+.tag-chip.excluded {
+  text-decoration: line-through;
+  border-style: dashed;
+  opacity: 0.85;
+}
 
 .tag-chip.add-tag {
   border-style: dashed;
@@ -1073,6 +1206,34 @@ label.scan-diff-row { cursor: pointer; }
   flex-shrink: 0;
 }
 
+/* "Show the N video changes" — expands the per-video list in the sync review. */
+.scan-diff-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 12px;
+  border: none;
+  border-top: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.15);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.scan-diff-toggle:hover { background: var(--panel-2); }
+
+/* Long enough to scan, short enough that the section header stays reachable. */
+.scan-diff-videos {
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+/* A ticked video row means "apply this change", not "remove it" — so these
+   don't take the danger red the removal checkboxes use. */
+.scan-diff-row input[data-video-id],
+.scan-diff-row input[data-role="select-all-videos"] { accent-color: var(--accent); }
+
 .scan-diff-text {
   min-width: 0;
   display: flex;
@@ -1139,6 +1300,13 @@ body[data-view="watchlater"] #videoFetchAllBtn { display: none; }
   color: #1a1220;
   background: #C792EA;
   border-color: transparent;
+}
+
+/* The watched chip's other side ("only watched"), mirroring .off-active. */
+.video-filters .var-toggle.on-neg {
+  color: var(--text);
+  background: color-mix(in srgb, #C792EA 40%, transparent);
+  border-color: #C792EA;
 }
 
 /* Sort buttons (Date / Views) — mirror the channel table's header sort look. */

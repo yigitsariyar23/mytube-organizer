@@ -1,0 +1,20 @@
+#!/bin/sh
+# Stamp version.json so the extension can tell "the checkout running on this
+# machine" apart from "what's on GitHub" — the dashboard compares the two on
+# open and offers to reload (see checkForAppUpdate in dashboard/dashboard.js).
+#
+# The stamp is a UTC timestamp, not the commit SHA: at pre-commit time the
+# commit doesn't exist yet, so its hash is unknowable. Anything that changes on
+# every commit does the job, and a timestamp also orders — which is how the
+# dashboard tells "GitHub is ahead" from "this checkout is ahead of GitHub".
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -e
+
+# A merge/rebase in progress writes its own commit — don't restamp mid-flight.
+git_dir=$(git rev-parse --git-dir)
+[ -e "$git_dir/MERGE_HEAD" ] && exit 0
+
+root=$(git rev-parse --show-toplevel)
+printf '{\n  "build": "%s"\n}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$root/version.json"
+git add "$root/version.json"

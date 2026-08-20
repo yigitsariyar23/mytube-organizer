@@ -42,17 +42,108 @@ const DEFAULT_LANGUAGES = [
 let LANGUAGES = [...DEFAULT_LANGUAGES];
 const LANG_OTHER = "__other__";
 
+// Flag emoji per language. Keyed by the lowercased label, with the native name,
+// the English name and the ISO 639-1 code all mapping to the same flag — so a
+// language typed by hand as "Dutch", "nederlands" or "nl" still resolves. A
+// language this table doesn't know shows the globe; a label that *starts* with
+// an emoji keeps that emoji instead (the escape hatch for anything unguessable,
+// e.g. "🏴󠁧󠁢󠁳󠁣󠁴󠁿 Gaidhlig" or a made-up language).
+const LANG_FLAG_SPECS = [
+  ["🇬🇧", "english", "en"],
+  ["🇹🇷", "türkçe", "turkish", "tr"],
+  ["🇪🇸", "español", "spanish", "es", "castellano"],
+  ["🇵🇹", "português", "portuguese", "pt"],
+  ["🇧🇷", "português (brasil)", "brazilian portuguese", "pt-br"],
+  ["🇩🇪", "deutsch", "german", "de"],
+  ["🇫🇷", "français", "french", "fr"],
+  ["🇮🇹", "italiano", "italian", "it"],
+  ["🇷🇺", "русский", "russian", "ru"],
+  ["🇯🇵", "日本語", "japanese", "ja"],
+  ["🇰🇷", "한국어", "korean", "ko"],
+  ["🇨🇳", "中文", "chinese", "zh", "mandarin"],
+  ["🇮🇳", "हिन्दी", "hindi", "hi", "தமிழ்", "tamil", "ta", "telugu", "te", "marathi", "mr"],
+  ["🇸🇦", "العربية", "arabic", "ar"],
+  ["🇳🇱", "nederlands", "dutch", "nl"],
+  ["🇵🇱", "polski", "polish", "pl"],
+  ["🇸🇪", "svenska", "swedish", "sv"],
+  ["🇳🇴", "norsk", "norwegian", "no", "nb"],
+  ["🇩🇰", "dansk", "danish", "da"],
+  ["🇫🇮", "suomi", "finnish", "fi"],
+  ["🇮🇸", "íslenska", "icelandic", "is"],
+  ["🇬🇷", "Ελληνικά", "greek", "el"],
+  ["🇨🇿", "čeština", "czech", "cs"],
+  ["🇸🇰", "slovenčina", "slovak", "sk"],
+  ["🇭🇺", "magyar", "hungarian", "hu"],
+  ["🇷🇴", "română", "romanian", "ro"],
+  ["🇧🇬", "български", "bulgarian", "bg"],
+  ["🇺🇦", "українська", "ukrainian", "uk"],
+  ["🇷🇸", "srpski", "serbian", "sr"],
+  ["🇭🇷", "hrvatski", "croatian", "hr"],
+  ["🇸🇮", "slovenščina", "slovenian", "sl"],
+  ["🇮🇱", "עברית", "hebrew", "he"],
+  ["🇮🇷", "فارسی", "persian", "farsi", "fa"],
+  ["🇹🇭", "ไทย", "thai", "th"],
+  ["🇻🇳", "tiếng việt", "vietnamese", "vi"],
+  ["🇮🇩", "bahasa indonesia", "indonesian", "id"],
+  ["🇲🇾", "bahasa melayu", "malay", "ms"],
+  ["🇵🇭", "filipino", "tagalog", "tl"],
+  ["🇧🇩", "বাংলা", "bengali", "bn"],
+  ["🇵🇰", "اردو", "urdu", "ur"],
+  ["🇰🇪", "kiswahili", "swahili", "sw"],
+  ["🇦🇿", "azərbaycan", "azerbaijani", "az"],
+  ["🇰🇿", "қазақша", "kazakh", "kk"],
+  ["🇪🇪", "eesti", "estonian", "et"],
+  ["🇱🇻", "latviešu", "latvian", "lv"],
+  ["🇱🇹", "lietuvių", "lithuanian", "lt"],
+];
+const LANG_FLAGS = Object.fromEntries(
+  LANG_FLAG_SPECS.flatMap(([flag, ...names]) => names.map((n) => [n, flag]))
+);
+const UNKNOWN_LANG_FLAG = "🌐";
+// A leading flag (regional-indicator pair, tag sequence) or any leading emoji,
+// written by the user in the language label itself.
+const LEADING_FLAG_RE =
+  /^\s*([\u{1F1E6}-\u{1F1FF}]{2}|\p{Extended_Pictographic}(?:[\u{E0020}-\u{E007F}\u{1F3FB}-\u{1F3FF}\uFE0F]|\u200D\p{Extended_Pictographic})*)\s*/u;
+
+// The flag for a language label — the user's own leading emoji if there is one,
+// else the table's, else a globe. Never empty for a set language, so every
+// picker row lines up.
+function langFlag(lang) {
+  if (!lang) return "";
+  const own = lang.match(LEADING_FLAG_RE);
+  if (own) return own[1];
+  return LANG_FLAGS[lang.trim().toLowerCase()] || UNKNOWN_LANG_FLAG;
+}
+
+// The label without a user-authored leading flag, so it isn't shown twice.
+function langName(lang) {
+  if (!lang) return "";
+  return lang.replace(LEADING_FLAG_RE, "").trim() || lang.trim();
+}
+
+// "🇹🇷 Türkçe" — how a language is shown everywhere: filter chips, the row
+// dropdown, and the context menus.
+function langLabel(lang) {
+  return lang ? `${langFlag(lang)} ${langName(lang)}` : "";
+}
+
 let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null, pendingPlaylistImport: null };
 let currentFolderId = "all";       // selected channel folder (Channels/New views)
 let currentListId = "all";         // selected Watch Later list
 let currentView = "channels";      // "channels" | "new" | "watchlater"
-let newUnwatchedOnly = true;         // New feed: hide already-watched (on by default)
-let watchLaterUnwatchedOnly = true;  // Watch Later: hide already-watched (on by default)
+// Watched filter per video view: "" (everything) | "unwatched" | "watched".
+// Same left/right-click rule as every other chip — see toggleChipFilter.
+let newWatchedFilter = "unwatched";        // New feed defaults to hiding watched
+let watchLaterWatchedFilter = "unwatched"; // …and so does Watch Later
 let videoSortKey = "date";         // "date" | "length"
 let videoSortDir = "desc";         // "desc" | "asc"
 let videoDetailsRequested = false; // guards the one-shot auto length/view fetch
-let activeTagFilters = new Set();
-let activeLangFilters = new Set(); // languages selected in the filter bar
+// Filter chips are two-sided: left click puts a value in the "must have" set,
+// right click in the "must not have" set. A value is never in both.
+const activeTagFilters = new Set();
+const excludedTagFilters = new Set();
+const activeLangFilters = new Set();   // languages selected in the filter bar
+const excludedLangFilters = new Set(); // …and languages ruled out
 const selectedChannelIds = new Set(); // multi-select highlight (ctrl/shift click)
 let selectionAnchor = null;           // last clicked id, the shift-range pivot
 const selectedVideoIds = new Set();   // video multi-select (New / Watch Later)
@@ -101,7 +192,17 @@ const el = {
   noResultsBody: document.getElementById("noResultsBody"),
   clearFiltersBtn: document.getElementById("clearFiltersBtn"),
   statusText: document.getElementById("statusText"),
+  updateBanner: document.getElementById("updateBanner"),
+  updateBannerText: document.getElementById("updateBannerText"),
+  updateReloadBtn: document.getElementById("updateReloadBtn"),
+  updateDismissBtn: document.getElementById("updateDismissBtn"),
+  resultCount: document.getElementById("resultCount"),
   searchInput: document.getElementById("searchInput"),
+  searchClear: document.getElementById("searchClear"),
+  clearAllFiltersBtn: document.getElementById("clearAllFiltersBtn"),
+  clearCountBtn: document.querySelector('[data-clear="count"]'),
+  clearAfterBtn: document.querySelector('[data-clear="after"]'),
+  clearBeforeBtn: document.querySelector('[data-clear="before"]'),
   scanBtn: document.getElementById("scanBtn"),
   refreshBtn: document.getElementById("refreshBtn"),
   fillAvatarsBtn: document.getElementById("fillAvatarsBtn"),
@@ -177,12 +278,34 @@ const el = {
 
 init();
 
+// Only the years the library actually covers. These dropdowns bound
+// `lastVideoDate`, so a fixed 2005→today list was mostly dead choice: scrolling
+// past a decade of years no channel has. Rebuilt whenever that set changes —
+// cheap, because the key check short-circuits the common case.
+let yearOptionsKey = "";
+
 function populateYearDropdowns() {
-  const currentYear = new Date().getFullYear();
-  const years = ["—"];
-  for (let y = currentYear; y >= 2005; y--) years.push(y);
+  const years = [...new Set(
+    Object.values(state.channels)
+      .map((c) => (c.lastVideoDate ? new Date(c.lastVideoDate).getFullYear() : null))
+      .filter((y) => y && !isNaN(y))
+  )].sort((a, b) => b - a);
+  if (!years.length) years.push(new Date().getFullYear());
+
+  const key = years.join(",");
+  if (key === yearOptionsKey) return;
+  yearOptionsKey = key;
+
+  const html = ["—", ...years].map((y) => `<option value="${y}">${y}</option>`).join("");
   for (const sel of [el.filterAfterYear, el.filterBeforeYear]) {
-    sel.innerHTML = years.map(y => `<option value="${y}">${y}</option>`).join("");
+    const previous = sel.value;
+    sel.innerHTML = html;
+    // Keep the selection when that year survives the rebuild; otherwise fall
+    // back to "—" (the filter's "no bound") and tell the listeners, so the
+    // filter state can't disagree with what the dropdown shows.
+    const kept = previous && [...sel.options].some((o) => o.value === previous);
+    sel.value = kept ? previous : "—";
+    if (!kept && previous && previous !== "—") sel.dispatchEvent(new Event("change", { bubbles: true }));
   }
 }
 
@@ -200,6 +323,7 @@ async function init() {
   render();
   bindEvents();
   setupColumnResize();
+  setupNumberScrubbing();
 
   // A scan / playlist import finished while the dashboard was closed — review it on open.
   if (state.pendingScan) openScanDiffModal(state.pendingScan);
@@ -210,7 +334,10 @@ async function init() {
     if (changes.channels) state.channels = changes.channels.newValue || {};
     if (changes.folders) state.folders = changes.folders.newValue || {};
     if (changes.tags) state.tags = changes.tags.newValue || {};
-    if (changes.videos) state.videos = changes.videos.newValue || {};
+    if (changes.videos) {
+      state.videos = changes.videos.newValue || {};
+      resetVideoStateSnapshot();
+    }
     if (changes.videoFolders) state.videoFolders = changes.videoFolders.newValue || defaultFolders();
     // Settings synced from another device (background gist merge / download).
     if (changes.apiKey) state.apiKey = changes.apiKey.newValue || "";
@@ -230,7 +357,14 @@ async function init() {
 
   // After the listener is wired, so a long background job's incremental writes
   // land in the UI. Not awaited — the first paint shouldn't wait on the network.
-  catchUpOnOpen();
+  // The gist check runs after the refresh, not alongside it, so its diff is
+  // computed against freshly-refreshed local data; neither is allowed to surface
+  // as an unhandled rejection.
+  (async () => {
+    await checkForAppUpdate(); // small and quick; the banner shouldn't wait on a refresh
+    try { await catchUpOnOpen(); } catch (e) { /* reported in the status line */ }
+    try { await checkRemoteChangesOnOpen(); } catch (e) { /* silent by design */ }
+  })();
 }
 
 // The seed library: a single pinned "Unsorted" folder. A factory (not a shared
@@ -247,6 +381,7 @@ async function loadState() {
   state.folders = data.folders || defaultFolders();
   state.tags = data.tags || {};
   state.videos = data.videos || {};
+  resetVideoStateSnapshot();
   state.videoFolders = data.videoFolders && Object.keys(data.videoFolders).length ? data.videoFolders : defaultFolders();
   // "videos" was the old single video tab; it split into "new" + "watchlater".
   const v = data.currentView === "videos" ? "new" : data.currentView;
@@ -341,6 +476,7 @@ function render() {
     el.searchInput.placeholder = "Search channels…";
     el.videoEmptyState.hidden = true;
     el.watchLaterEmptyState.hidden = true;
+    populateYearDropdowns();
     renderTagFilters();
     renderGrid();
     return;
@@ -385,20 +521,36 @@ function anyTrackedChannel() {
 
 // New uploads from tracked channels, honoring the channel-folder selection,
 // search, the unwatched chip, and the active video sort.
-function getFilteredVideos() {
+// Everything the New feed *could* show for the selected folder: tracked
+// channels, nothing dismissed, no live/upcoming. The search box and watched chip
+// narrow this down — keeping the two steps apart is what lets the toolbar say
+// "12 of 240" without walking the store twice.
+function newFeedUniverse() {
   const inFolder = currentFolderId === "all" ? null : getFolderAndDescendantIds(currentFolderId);
-  const q = searchQuery.trim().toLowerCase();
-  const list = Object.values(state.videos).filter((v) => {
+  return Object.values(state.videos).filter((v) => {
     const ch = state.channels[v.channelId];
     if (!ch || !ch.trackVideos) return false;
     if (v.hidden) return false;              // user-dismissed from the feed
     if (isUpcomingOrLive(v)) return false;   // live streams / scheduled premieres
     if (inFolder && !inFolder.has(ch.folderId)) return false;
-    if (newUnwatchedOnly && v.watched) return false;
-    if (q && !`${v.title} ${ch.name || ""}`.toLowerCase().includes(q)) return false;
     return true;
   });
-  return sortVideos(list);
+}
+
+// The search box + watched chip: the two filters both video views share.
+function applyVideoChips(list, watchedFilter) {
+  const q = searchQuery.trim().toLowerCase();
+  return list.filter((v) => {
+    if (watchedFilter === "unwatched" && v.watched) return false;
+    if (watchedFilter === "watched" && !v.watched) return false;
+    if (!q) return true;
+    const author = v.channelId ? state.channels[v.channelId]?.name : v.author;
+    return `${v.title} ${author || ""}`.toLowerCase().includes(q);
+  });
+}
+
+function getFilteredVideos() {
+  return sortVideos(applyVideoChips(newFeedUniverse(), newWatchedFilter));
 }
 
 // A live stream or a scheduled/upcoming premiere — not a real uploaded video.
@@ -457,7 +609,8 @@ function updateVideoSortButtons() {
 }
 
 function renderVideoFeed() {
-  el.videoUnwatchedChip.classList.toggle("on", newUnwatchedOnly);
+  renderFilterClears();
+  renderWatchedChip(newWatchedFilter);
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
@@ -465,15 +618,16 @@ function renderVideoFeed() {
   el.videoEmptyState.hidden = !noneTracked;
   if (noneTracked) {
     el.videoFeed.innerHTML = "";
-    el.statusText.textContent = "";
+    renderResultCount(0, 0, "video");
     return;
   }
 
-  const vids = getFilteredVideos();
-  el.statusText.textContent = vids.length ? `${vids.length} video${vids.length === 1 ? "" : "s"}` : "";
+  const universe = newFeedUniverse();
+  const vids = sortVideos(applyVideoChips(universe, newWatchedFilter));
+  renderResultCount(vids.length, universe.length, "video");
 
   if (!vids.length) {
-    const filtered = !!searchQuery.trim() || newUnwatchedOnly;
+    const filtered = !!searchQuery.trim() || newWatchedFilter !== "";
     el.videoFeed.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No videos match the current filters." : "No videos fetched yet — click Refresh Stats to pull them."}</p></div>`;
     return;
   }
@@ -550,23 +704,23 @@ function formatViews(n) {
 
 // Saved videos in the selected list (+ its sub-lists), matching search, newest
 // saved first.
-function getWatchLaterVideos() {
+// Every saved video in the selected list (+ its sub-lists), before the search
+// box and watched chip — the New feed's `newFeedUniverse` for Watch Later.
+function watchLaterUniverse() {
   const inList = currentListId === "all" ? null : getFolderAndDescendantIds(currentListId, state.videoFolders);
-  const q = searchQuery.trim().toLowerCase();
-  const list = Object.values(state.videos).filter((v) => {
+  return Object.values(state.videos).filter((v) => {
     if (!v.saved) return false;
-    const fid = v.folderId || "unsorted";
-    if (inList && !inList.has(fid)) return false;
-    if (watchLaterUnwatchedOnly && v.watched) return false;
-    const author = v.channelId ? state.channels[v.channelId]?.name : v.author;
-    if (q && !`${v.title} ${author || ""}`.toLowerCase().includes(q)) return false;
-    return true;
+    return !inList || inList.has(v.folderId || "unsorted");
   });
-  return sortVideos(list);
+}
+
+function getWatchLaterVideos() {
+  return sortVideos(applyVideoChips(watchLaterUniverse(), watchLaterWatchedFilter));
 }
 
 function renderWatchLater() {
-  el.videoUnwatchedChip.classList.toggle("on", watchLaterUnwatchedOnly);
+  renderFilterClears();
+  renderWatchedChip(watchLaterWatchedFilter);
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
@@ -574,15 +728,16 @@ function renderWatchLater() {
   el.watchLaterEmptyState.hidden = anySaved;
   if (!anySaved) {
     el.watchLaterGrid.innerHTML = "";
-    el.statusText.textContent = "";
+    renderResultCount(0, 0, "video");
     return;
   }
 
-  const vids = getWatchLaterVideos();
-  el.statusText.textContent = vids.length ? `${vids.length} video${vids.length === 1 ? "" : "s"}` : "";
+  const universe = watchLaterUniverse();
+  const vids = sortVideos(applyVideoChips(universe, watchLaterWatchedFilter));
+  renderResultCount(vids.length, universe.length, "video");
 
   if (!vids.length) {
-    const filtered = !!searchQuery.trim() || watchLaterUnwatchedOnly;
+    const filtered = !!searchQuery.trim() || watchLaterWatchedFilter !== "";
     el.watchLaterGrid.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No saved videos match the current filters." : "This list is empty."}</p></div>`;
     return;
   }
@@ -612,7 +767,35 @@ function relativeTime(iso) {
   return formatShortDate(iso);
 }
 
+// The user-owned fields of a video as one comparable string. An absent folderId
+// and "unsorted" are the same state (RSS videos carry none), so they compare
+// equal — same rule the sync diff uses.
+function videoUserStateKey(v) {
+  const list = v.folderId && v.folderId !== "unsorted" ? v.folderId : "";
+  return `${!!v.watched}|${!!v.saved}|${!!v.hidden}|${list}`;
+}
+
+// What those fields looked like at the last write. saveVideos() diffs against it
+// and stamps `userStateAt` on whatever the user changed, so no mutation site has
+// to remember to — and forgetting would matter: sync resolves these four fields
+// last-writer-wins from that stamp (`mergeUserState` in background.js), so an
+// unstamped change loses to the gist's older copy on the next sync.
+let videoStateSnapshot = new Map();
+
+function resetVideoStateSnapshot() {
+  videoStateSnapshot = new Map(
+    Object.entries(state.videos).map(([id, v]) => [id, videoUserStateKey(v)])
+  );
+}
+
 async function saveVideos() {
+  const now = Date.now();
+  for (const [id, v] of Object.entries(state.videos)) {
+    const key = videoUserStateKey(v);
+    const prev = videoStateSnapshot.get(id);
+    if (prev !== undefined && prev !== key) v.userStateAt = now;
+    videoStateSnapshot.set(id, key);
+  }
   await chrome.storage.local.set({ videos: state.videos });
 }
 
@@ -628,18 +811,18 @@ function openVideo(videoId, background) {
   }
 }
 
-// Remove a video from Watch Later. A manually-saved video (no tracked channel)
-// is dropped entirely; a tracked-channel video just loses its saved flag so it
-// stays available in the New feed.
+// Remove a video from Watch Later: clear `saved` and its list. A tracked
+// channel's video stays available in the New feed; a manually-saved one is left
+// behind as a `saved:false` record rather than deleted, because that record is
+// the only trace of the removal — delete it and the gist's older `saved:true`
+// merges the video back on the next sync. `pruneVideos` drops it once the
+// tombstone ages out (USER_STATE_TOMBSTONE_MS), and neither view shows it
+// meanwhile (Watch Later needs `saved`, the New feed needs a tracked channel).
 async function removeFromWatchLater(videoId) {
   const v = state.videos[videoId];
   if (!v) return;
-  if (!v.channelId || !state.channels[v.channelId]?.trackVideos) {
-    delete state.videos[videoId];
-  } else {
-    v.saved = false;
-    delete v.folderId;
-  }
+  v.saved = false;
+  delete v.folderId;
   await saveVideos();
 }
 
@@ -1033,11 +1216,14 @@ function renderTagFilters() {
   bar.appendChild(label);
 
   for (const [id, tag] of tagEntries) {
+    const included = activeTagFilters.has(id);
     const chip = document.createElement("span");
-    chip.className = "tag-chip" + (activeTagFilters.has(id) ? " active" : "");
+    chip.className = "tag-chip" + (included ? " active" : excludedTagFilters.has(id) ? " excluded" : "");
     chip.textContent = tag.name;
-    chip.style.background = activeTagFilters.has(id) ? tag.color : "";
+    chip.title = `${tag.name} — left click: only these · right click: exclude · shift+right click: rename or delete`;
+    chip.style.background = included ? tag.color : "";
     chip.style.borderColor = tag.color;
+    if (!included) chip.style.color = excludedTagFilters.has(id) ? tag.color : "";
     chip.dataset.tagId = id;
     chip.dataset.role = "filter-tag";
     bar.appendChild(chip);
@@ -1045,24 +1231,29 @@ function renderTagFilters() {
 
   // Language chips
   for (const lang of langs) {
+    const included = activeLangFilters.has(lang);
+    const excluded = excludedLangFilters.has(lang);
     const chip = document.createElement("span");
-    const active = activeLangFilters.has(lang);
-    chip.className = "tag-chip filter-lang-chip" + (active ? " active" : "");
-    chip.textContent = lang;
+    chip.className = "tag-chip filter-lang-chip" + (included ? " active" : excluded ? " excluded" : "");
+    chip.textContent = langLabel(lang);
+    chip.title = `${langName(lang)} — left click: only these · right click: exclude`;
     const color = langColor(lang);
-    chip.style.background = active ? color : "";
+    chip.style.background = included ? color : "";
     chip.style.borderColor = color;
+    if (!included) chip.style.color = excluded ? color : "";
     chip.dataset.lang = lang;
     chip.dataset.role = "filter-lang";
     bar.appendChild(chip);
   }
 
-  // Active / Finished tri-state toggle chips: click cycles off → only → excluded.
+  // Active / Finished: the two-sided chips whose *label* flips, since "not
+  // active" has its own name. Left click = Active, right click = Inactive.
   if (hasActive) {
     const chip = document.createElement("span");
     const cls = filterActive === "only" ? " on-active" : filterActive === "not" ? " off-active" : "";
     chip.className = "tag-chip var-toggle" + cls;
     chip.textContent = filterActive === "not" ? "Inactive" : "Active";
+    chip.title = "Left click: only active channels · right click: only inactive ones";
     chip.dataset.role = "filter-active";
     bar.appendChild(chip);
   }
@@ -1071,12 +1262,24 @@ function renderTagFilters() {
     const cls = filterFinished === "only" ? " on-finished" : filterFinished === "not" ? " off-finished" : "";
     chip.className = "tag-chip var-toggle" + cls;
     chip.textContent = filterFinished === "not" ? "Unfinished" : "Finished";
+    chip.title = "Left click: only finished channels · right click: only unfinished ones";
     chip.dataset.role = "filter-finished";
     bar.appendChild(chip);
   }
 }
 
+// The video views' watched chip, which flips label like Active/Finished does:
+// left click narrows to unwatched, right click to watched.
+function renderWatchedChip(mode) {
+  const chip = el.videoUnwatchedChip;
+  chip.textContent = mode === "watched" ? "Watched" : "Unwatched";
+  chip.title = "Left click: only unwatched · right click: only watched";
+  chip.classList.toggle("on", mode === "unwatched");
+  chip.classList.toggle("on-neg", mode === "watched");
+}
+
 function renderGrid() {
+  renderFilterClears();
   pendingChannels = getFilteredChannels();
   // Precompute the leaf-folder <option> data once per render; buildChannelRow
   // (called lazily per scroll page) then only applies each row's `selected`.
@@ -1089,6 +1292,7 @@ function renderGrid() {
 
   const totalChannels = Object.keys(state.channels).length;
   const filteredCount = pendingChannels.length;
+  renderResultCount(filteredCount, channelsInCurrentFolder().length, "channel");
   const libraryEmpty = totalChannels === 0;
   const noMatches = !libraryEmpty && filteredCount === 0;
 
@@ -1141,9 +1345,193 @@ function setupScrollObserver() {
 // when switching folders and on "Clear all data", since they're per-folder-view.
 function resetVariableFilters() {
   activeTagFilters.clear();
+  excludedTagFilters.clear();
   activeLangFilters.clear();
+  excludedLangFilters.clear();
   filterActive = "";
   filterFinished = "";
+}
+
+// The one rule every filter chip follows: **left click means "only these",
+// right click means "not these"**, and clicking the side a chip is already on
+// switches it off. It replaces the old single-button cycle (off → only → not),
+// where reaching "not" meant clicking past "only" and there was no way back
+// without a third click — and where tags and languages had no "not" at all.
+
+// Set-backed chips (tags, languages): move `key` in or out, never both.
+function toggleChipFilter(include, exclude, key, negative) {
+  const own = negative ? exclude : include;
+  const other = negative ? include : exclude;
+  if (own.has(key)) own.delete(key);
+  else { own.add(key); other.delete(key); }
+}
+
+// String-backed chips. `positive`/`negative` are the two values the chip can
+// hold; clicking the current one clears it back to "".
+function toggleTriState(current, negative, positiveValue = "only", negativeValue = "not") {
+  const want = negative ? negativeValue : positiveValue;
+  return current === want ? "" : want;
+}
+
+// ---------- Number scrubbing ----------
+// The filter fields are 44–68px boxes whose native spinner arrows are ~6px of
+// target. So they also take the two gestures people already know from elsewhere:
+// **drag** left/right across the field like a Unity inspector, or **point and
+// scroll** like the old Football Manager spinners. Typing still works — a drag
+// only starts once the pointer has actually moved.
+const SCRUB_PX_PER_STEP = 6;
+
+function setupNumberScrubbing() {
+  const fields = [
+    el.filterMinCount, el.filterMaxCount,
+    el.filterAfterDay, el.filterAfterMonth,
+    el.filterBeforeDay, el.filterBeforeMonth,
+  ];
+  for (const input of fields) enableNumberScrub(input);
+  // The year pickers are <select>s, so scrolling walks their options instead.
+  for (const sel of [el.filterAfterYear, el.filterBeforeYear]) enableSelectWheel(sel);
+}
+
+function numberBounds(input) {
+  return {
+    min: input.min !== "" ? Number(input.min) : -Infinity,
+    max: input.max !== "" ? Number(input.max) : Infinity,
+  };
+}
+
+// Where an empty field starts counting from: its own min, or 0 when unbounded.
+function scrubBase(input) {
+  const { min } = numberBounds(input);
+  return min === -Infinity ? 0 : min;
+}
+
+// Write the value back clamped, and fire `input` so the filter handlers that
+// already listen to typing pick it up — scrubbing isn't a separate code path.
+function setScrubValue(input, value) {
+  const { min, max } = numberBounds(input);
+  const clamped = Math.min(max, Math.max(min, Math.round(value)));
+  if (String(clamped) === input.value) return;
+  input.value = String(clamped);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function enableNumberScrub(input) {
+  input.classList.add("scrubbable");
+
+  // Hover is enough — no click first. passive:false because the page would
+  // otherwise scroll out from under the cursor as the value changes.
+  input.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const dir = e.deltaY < 0 ? 1 : -1;
+    // An empty field lands on its base value on the first notch, not base±1.
+    const from = input.value === "" ? scrubBase(input) - dir : Number(input.value);
+    setScrubValue(input, from + dir);
+  }, { passive: false });
+
+  let startX = 0, startValue = 0, dragging = false, moved = false;
+
+  input.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    dragging = true;
+    moved = false;
+    startX = e.clientX;
+    startValue = input.value === "" ? scrubBase(input) : Number(input.value);
+  });
+
+  input.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const steps = Math.round((e.clientX - startX) / SCRUB_PX_PER_STEP);
+    if (!steps && !moved) return; // still a click, not a drag
+    if (!moved) {
+      moved = true;
+      input.classList.add("scrubbing"); // ew-resize cursor + no text selection
+      input.setPointerCapture(e.pointerId); // keep the drag alive outside the box
+    }
+    setScrubValue(input, startValue + steps);
+  });
+
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    input.classList.remove("scrubbing");
+    if (input.hasPointerCapture?.(e.pointerId)) input.releasePointerCapture(e.pointerId);
+  };
+  input.addEventListener("pointerup", endDrag);
+  input.addEventListener("pointercancel", endDrag);
+}
+
+function enableSelectWheel(select) {
+  select.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const next = select.selectedIndex + (e.deltaY < 0 ? -1 : 1);
+    if (next < 0 || next >= select.options.length) return;
+    select.selectedIndex = next;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  }, { passive: false });
+}
+
+// "12 of 240 videos" while something is filtered, "240 videos" when nothing is.
+// The denominator is what the current folder/list holds, not the whole library —
+// picking a folder is navigation, so it shouldn't read as a filtered-out count.
+function renderResultCount(shown, total, noun) {
+  const withNoun = (n) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+  el.resultCount.textContent = !total ? "" : shown === total ? withNoun(total) : `${shown} of ${withNoun(total)}`;
+}
+
+// Re-render whichever view is showing. Every filter control ends here.
+function renderCurrentView() {
+  if (currentView === "new") renderVideoFeed();
+  else if (currentView === "watchlater") renderWatchLater();
+  else renderGrid();
+}
+
+// Show each clear button only while its filter is actually set — a row of dead
+// × buttons reads as clutter, and a live one is a hint that something is on.
+function renderFilterClears() {
+  el.searchClear.hidden = !searchQuery.trim();
+  el.clearCountBtn.hidden = filterMinCount === null && filterMaxCount === null;
+  el.clearAfterBtn.hidden = !dateFilterSet(el.filterAfterDay, el.filterAfterMonth, el.filterAfterYear);
+  el.clearBeforeBtn.hidden = !dateFilterSet(el.filterBeforeDay, el.filterBeforeMonth, el.filterBeforeYear);
+  el.clearAllFiltersBtn.hidden = !anyFilterActiveInView();
+}
+
+function dateFilterSet(dayEl, monthEl, yearEl) {
+  return !!(dayEl.value || monthEl.value || (yearEl.value && yearEl.value !== "—"));
+}
+
+// What the topbar's "Clear filters" button keys off. The video views only have
+// search and the watched chip, and the chip *starts* on "unwatched" — counting
+// that default would leave the button showing forever, so only its non-default
+// side counts there.
+function anyFilterActiveInView() {
+  if (currentView === "channels") return anyFilterActive();
+  const watched = currentView === "watchlater" ? watchLaterWatchedFilter : newWatchedFilter;
+  return !!searchQuery.trim() || watched === "watched";
+}
+
+function clearCountFilter() {
+  filterMinCount = null;
+  filterMaxCount = null;
+  el.filterMinCount.value = "";
+  el.filterMaxCount.value = "";
+  renderGrid();
+}
+
+// `which` is "after" | "before" — the two date bounds are identical otherwise.
+function clearDateFilter(which) {
+  const after = which === "after";
+  (after ? [el.filterAfterDay, el.filterAfterMonth] : [el.filterBeforeDay, el.filterBeforeMonth])
+    .forEach((input) => (input.value = ""));
+  (after ? el.filterAfterYear : el.filterBeforeYear).value = "—";
+  if (after) filterAfterDate = null;
+  else filterBeforeDate = null;
+  renderGrid();
+}
+
+function clearSearch() {
+  searchQuery = "";
+  el.searchInput.value = "";
+  renderCurrentView();
 }
 
 // Any filter that can hide channels within the current folder view. Excludes
@@ -1152,7 +1540,9 @@ function anyFilterActive() {
   return (
     !!searchQuery.trim() ||
     activeTagFilters.size > 0 ||
+    excludedTagFilters.size > 0 ||
     activeLangFilters.size > 0 ||
+    excludedLangFilters.size > 0 ||
     filterActive !== "" ||
     filterFinished !== "" ||
     filterMinCount !== null ||
@@ -1180,21 +1570,35 @@ function clearAllFilters() {
   el.filterBeforeDay.value = "";
   el.filterBeforeMonth.value = "";
   el.filterBeforeYear.value = "—";
+  // "Clear" means nothing is hidden — including the watched chip, even though
+  // it *starts* on "unwatched" when the dashboard opens.
+  newWatchedFilter = "";
+  watchLaterWatchedFilter = "";
   render();
 }
 
-function getFilteredChannels() {
-  let list = Object.values(state.channels);
+// Everything the selected folder (and its sub-folders) holds, before any filter.
+// The denominator of the toolbar's count, and the starting point of the filters.
+function channelsInCurrentFolder() {
+  const list = Object.values(state.channels);
+  if (currentFolderId === "all") return list;
+  const allIds = getFolderAndDescendantIds(currentFolderId);
+  return list.filter((c) => allIds.has(c.folderId));
+}
 
-  if (currentFolderId !== "all") {
-    const allIds = getFolderAndDescendantIds(currentFolderId);
-    list = list.filter((c) => allIds.has(c.folderId));
-  }
+function getFilteredChannels() {
+  let list = channelsInCurrentFolder();
   if (activeTagFilters.size) {
     list = list.filter((c) => c.tags?.some((t) => activeTagFilters.has(t)));
   }
+  if (excludedTagFilters.size) {
+    list = list.filter((c) => !c.tags?.some((t) => excludedTagFilters.has(t)));
+  }
   if (activeLangFilters.size) {
     list = list.filter((c) => activeLangFilters.has(c.language));
+  }
+  if (excludedLangFilters.size) {
+    list = list.filter((c) => !excludedLangFilters.has(c.language));
   }
   if (filterActive === "only") {
     list = list.filter((c) => c.active);
@@ -1273,7 +1677,7 @@ function buildChannelRow(ch) {
         <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
       </div>
     </div>
-    <div class="row-date" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}"><span class="date-long">${formatShortDate(ch.lastVideoDate)}</span><span class="date-short">${formatNumericDate(ch.lastVideoDate)}</span></div>
+    <div class="row-date ${dateAgeClass(ch.lastVideoDate)}" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}"><span class="date-long">${formatShortDate(ch.lastVideoDate)}</span><span class="date-short">${formatNumericDate(ch.lastVideoDate)}</span></div>
     <div class="row-count">${ch.videoCount ?? "—"}</div>
     <div class="row-subs" title="${escapeHtml(subscriberTitle(ch.subscriberCount))}">${formatSubscribers(ch.subscriberCount)}</div>
     <div class="channel-tags channel-vars">
@@ -1342,7 +1746,7 @@ function languageOptionsHtml(ch) {
   // A custom language not in the curated list still needs its own option.
   const list = current && !LANGUAGES.includes(current) ? [current, ...LANGUAGES] : LANGUAGES;
   const opts = list
-    .map((l) => `<option value="${escapeHtml(l)}" ${l === current ? "selected" : ""}>${escapeHtml(l)}</option>`)
+    .map((l) => `<option value="${escapeHtml(l)}" ${l === current ? "selected" : ""}>${escapeHtml(langLabel(l))}</option>`)
     .join("");
   return (
     `<option value="" ${current ? "" : "selected"}>lang…</option>` +
@@ -1363,6 +1767,30 @@ function tagChipsHtml(ch) {
 }
 
 // ---------- Helpers ----------
+
+// Recency bucket for the Last Video cell, as a CSS class. Everything is measured
+// against *today*, never a fixed year, so the buckets keep sliding forward on
+// their own: this month and last month are "current", then it's calendar-year
+// distance — this year, the two years before it, the two before those, and
+// everything older. An unknown date gets no class and stays the plain text color
+// (missing ≠ ancient).
+function dateAgeClass(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const now = new Date();
+
+  // Whole months between the two month-starts: 0 = this month, 1 = last month.
+  // Future dates (a scheduled premiere) come out negative and count as current.
+  const monthsAgo = (now.getFullYear() - d.getFullYear()) * 12 + (now.getMonth() - d.getMonth());
+  if (monthsAgo <= 1) return "date-age-current";
+
+  const yearsAgo = now.getFullYear() - d.getFullYear();
+  if (yearsAgo <= 0) return "date-age-year";   // earlier this year
+  if (yearsAgo <= 2) return "date-age-recent"; // the previous two years
+  if (yearsAgo <= 4) return "date-age-old";    // the two before those
+  return "date-age-stale";
+}
 
 function formatShortDate(iso) {
   if (!iso) return "—";
@@ -1450,6 +1878,87 @@ async function catchUpOnOpen() {
   el.statusText.textContent = res?.ok
     ? `Updated ${new Date().toLocaleTimeString()}.`
     : `Refresh failed. ${res?.error || ""}`;
+}
+
+// ---------- "There's a newer version on GitHub" ----------
+// A `git pull` is not something this extension can do: an MV3 worker has no
+// shell and no filesystem, not even to the folder it was loaded from, and
+// Chrome's own auto-update only covers Web Store installs. What it *can* do is
+// notice — and then restart itself once you've pulled, which is the only part
+// that needs to happen from inside the extension (`chrome.runtime.reload()`
+// makes Chrome re-read an unpacked extension's files from disk).
+//
+// "Newer" can't come from the manifest version, which only moves when someone
+// remembers to bump it. `.githooks/pre-commit` stamps `version.json` with a UTC
+// timestamp on every commit instead, so any push registers, and comparing the
+// two stamps also says *which side* is ahead — an unpushed local commit must
+// not read as "an update is available".
+const REPO = { owner: "yigitsariyar23", name: "mytube-organizer", branch: "main" };
+const UPDATE_STAMP_URL = `https://raw.githubusercontent.com/${REPO.owner}/${REPO.name}/${REPO.branch}/version.json`;
+const UPDATE_HEAD_URL = `https://api.github.com/repos/${REPO.owner}/${REPO.name}/commits/${REPO.branch}`;
+
+async function checkForAppUpdate() {
+  try {
+    const local = await fetch(chrome.runtime.getURL("version.json")).then((r) => r.json());
+    // Cache-busted: raw.githubusercontent serves a cached copy for minutes, and
+    // a stale one would hide exactly the push we're looking for.
+    const res = await fetch(`${UPDATE_STAMP_URL}?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const remote = await res.json();
+    if (!local?.build || !remote?.build) return;
+    if (remote.build <= local.build) return; // same commit, or this checkout is ahead
+
+    const { dismissedUpdateBuild } = await chrome.storage.local.get("dismissedUpdateBuild");
+    if (dismissedUpdateBuild === remote.build) return; // already said "not now" to this one
+
+    // Nice-to-have only: the banner still works if the API is rate-limited.
+    let head = null;
+    try {
+      const r = await fetch(UPDATE_HEAD_URL);
+      if (r.ok) head = await r.json();
+    } catch (e) { /* no commit detail, no problem */ }
+    showUpdateBanner(remote.build, head);
+  } catch (e) {
+    // Offline, rate-limited, no version.json yet — an update check is never
+    // worth interrupting someone over.
+  }
+}
+
+function showUpdateBanner(build, head) {
+  const subject = (head?.commit?.message || "").split("\n")[0];
+  const when = head?.commit?.author?.date ? formatShortDate(head.commit.author.date) : "";
+  el.updateBannerText.textContent = subject
+    ? `A newer version is on GitHub — “${subject}”${when ? ` · ${when}` : ""}. Pull it, then reload:`
+    : "A newer version is on GitHub. Pull it, then reload:";
+  el.updateBanner.dataset.build = build;
+  el.updateBanner.hidden = false;
+}
+
+// Nothing syncs by itself — but *looking* is free, and a device that sat closed
+// has no way of knowing the gist moved on. On open, fetch the download diff and,
+// if the gist really differs, open the same review the Download button opens.
+// Applying is still entirely the user's call; this only saves them from having
+// to remember to check. Deliberately NOT an auto-merge — see the sync notes.
+const SYNC_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+
+async function checkRemoteChangesOnOpen() {
+  if (!state.gistToken) return;                // sync was never set up
+  if (anyReviewOpen()) return;                 // a scan / import review comes first
+  const { lastSyncCheckAt } = await chrome.storage.local.get("lastSyncCheckAt");
+  if (lastSyncCheckAt && Date.now() - lastSyncCheckAt < SYNC_CHECK_INTERVAL_MS) return;
+  await chrome.storage.local.set({ lastSyncCheckAt: Date.now() });
+
+  const diff = await chrome.runtime.sendMessage({ type: "FETCH_SYNC_DIFF", direction: "download" });
+  // Silent on failure: a check nobody asked for shouldn't put "GitHub: 401" in
+  // front of someone who just wanted to look at their subscriptions. The manual
+  // Download button still reports everything.
+  if (!diff?.ok || !syncDiffTotal(diff)) return;
+  if (anyReviewOpen()) return;                 // something opened while we waited
+  openSyncDiffModal(diff);
+}
+
+function anyReviewOpen() {
+  return !el.scanDiffModal.hidden || !el.playlistImportModal.hidden || !el.syncDiffModal.hidden;
 }
 
 function renderSyncStatus() {
@@ -1576,6 +2085,23 @@ function listName(id) {
 
 let pendingSyncDiff = null;
 
+// How many changes a diff carries. The summary line and the Apply button key off
+// it — and so does the on-open check, which only bothers the user when this is
+// non-zero. Removals of folders/lists only ever apply on upload.
+function syncDiffTotal(diff) {
+  const isUpload = diff.direction === "upload";
+  const empty = { added: [], removed: [], modified: [] };
+  const ch = diff.channels || empty;
+  const vids = diff.videos || { added: 0, modified: 0, removed: 0 };
+  const folderish = (f = empty) => f.added.length + f.modified.length + (isUpload ? f.removed.length : 0);
+  return (
+    ch.added.length + ch.removed.length + ch.modified.length +
+    folderish(diff.folders) + folderish(diff.videoFolders) +
+    (diff.settings || []).length +
+    vids.added + vids.modified + (vids.removed || 0)
+  );
+}
+
 function openSyncDiffModal(diff) {
   pendingSyncDiff = diff;
   const { direction, channels: { added, removed, modified } } = diff;
@@ -1597,7 +2123,7 @@ function openSyncDiffModal(diff) {
 
   el.syncDiffTitle.textContent = isUpload ? "Review upload" : "Review download";
 
-  const totalChanges = added.length + removed.length + modified.length + folderCount + settings.length + vfCount + vidsCount;
+  const totalChanges = syncDiffTotal(diff);
   const extra = [];
   if (folderCount) extra.push(`${folderCount} folder change${folderCount === 1 ? "" : "s"}`);
   if (vfCount) extra.push(`${vfCount} list change${vfCount === 1 ? "" : "s"}`);
@@ -1628,25 +2154,18 @@ function openSyncDiffModal(diff) {
   if (settings.length) el.syncDiffBody.appendChild(buildSyncSettingsSection(`Settings — will overwrite ${dest}`, settings));
   if (folderCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Folders — will overwrite ${dest}`, fo.added, fo.modified, foRemoved));
   if (vfCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Watch Later lists — will overwrite ${dest}`, vf.added, vf.modified, vfRemoved));
-  if (vidsCount) el.syncDiffBody.appendChild(buildSyncNoteSection(`Videos — merged ${dest}`, vidsCount,
-    `${vids.added} new, ${vids.modified} with changed watched/saved/list state`
-    + (vidsRemoved ? `, ${vidsRemoved} dropped (untracked channel, or past the per-channel history cap)` : "")
-    + `. Videos merge both ways; a merge never removes a saved, watched or dismissed video.`));
+  if (vidsCount) el.syncDiffBody.appendChild(buildSyncVideoSection(`Videos — merged ${dest}`, vids, dest));
 
   el.syncDiffApply.textContent = isUpload ? "Apply upload" : "Apply download";
   el.syncDiffApply.disabled = totalChanges === 0;
   el.syncDiffModal.hidden = false;
 }
 
+// Only the keys in SYNC_SETTING_KEYS reach this section — view preferences
+// (sorts, open view, column widths) are no longer synced, so they never appear.
 const SETTING_LABELS = {
   apiKey: "YouTube API key",
   languages: "Language set",
-  sortDate: "Date sort",
-  sortCount: "Count sort",
-  folderSort: "Folder sort",
-  videoSort: "Video sort",
-  currentView: "Open view",
-  colWidths: "Column widths",
 };
 
 // The API key is the user's secret — show presence, not the value.
@@ -1710,17 +2229,97 @@ function buildSyncFolderSection(title, added, modified, removed) {
 
 // A read-only one-line section (used for the video-store summary, which is too
 // large to review per item).
-function buildSyncNoteSection(title, count, note) {
+// One video's change, in words: what the review row's second line says.
+// `from` is null for a video the target doesn't have at all; `to` is null for
+// one the apply would drop.
+function describeVideoChange(it) {
+  const listOf = (s) => (s.folderId && s.folderId !== "unsorted" ? s.folderId : "unsorted");
+  if (!it.to) return `will be dropped — ${it.reason || "outside what the store keeps"}`;
+  if (!it.from) {
+    const bits = ["new"];
+    if (it.to.saved) bits.push(`in Watch Later (${listName(listOf(it.to))})`);
+    if (it.to.watched) bits.push("watched");
+    if (it.to.hidden) bits.push("dismissed");
+    return bits.join(" · ");
+  }
+  const parts = [];
+  const fromList = listOf(it.from), toList = listOf(it.to);
+  if (!it.from.saved && it.to.saved) parts.push(`saved to Watch Later (${listName(toList)})`);
+  else if (it.from.saved && !it.to.saved) parts.push("removed from Watch Later");
+  else if (it.to.saved && fromList !== toList) parts.push(`moved to ${listName(toList)}`);
+  if (!!it.from.watched !== !!it.to.watched) parts.push(it.to.watched ? "marked watched" : "marked unwatched");
+  if (!!it.from.hidden !== !!it.to.hidden) parts.push(it.to.hidden ? "dismissed from feed" : "back in the feed");
+  return parts.join(" · ") || "list changed";
+}
+
+// The Videos section of the sync review. The store is far too big to list every
+// video, so the section leads with the merged counts — but the *changes* are
+// reviewable: a button expands one row per affected video, each ticked by
+// default. Unticking a row leaves that video exactly as the target already has
+// it (its id goes back to the apply as `skipVideoIds`), which is the only way to
+// take some of a sync and not the rest.
+function buildSyncVideoSection(title, vids, dest) {
+  const items = vids.items || [];
+  const removed = vids.removed || 0;
   const sec = document.createElement("div");
   sec.className = "scan-diff-section";
-  sec.appendChild(buildDiffSectionHeader(title, "mod", count));
+  sec.appendChild(buildDiffSectionHeader(title, "mod", vids.added + vids.modified + removed));
+
   const list = document.createElement("div");
   list.className = "scan-diff-list";
-  const row = document.createElement("div");
-  row.className = "scan-diff-row";
-  row.innerHTML = `<span class="scan-diff-text">${escapeHtml(note)}</span>`;
-  list.appendChild(row);
+  const note = document.createElement("div");
+  note.className = "scan-diff-row";
+  note.innerHTML = `<span class="scan-diff-text">${escapeHtml(
+    `${vids.added} new, ${vids.modified} with changed watched/saved/list state`
+    + (removed ? `, ${removed} dropped (untracked channel, or past the per-channel history cap)` : "")
+    + `. Videos merge both ways; a merge never removes a saved, watched or dismissed video.`
+    + (items.length ? ` Untick a row below to leave that video alone — including a dropped one, which keeps it.` : "")
+  )}</span>`;
+  list.appendChild(note);
   sec.appendChild(list);
+
+  if (!items.length) return sec;
+
+  const details = document.createElement("div");
+  details.className = "scan-diff-list scan-diff-videos";
+  details.hidden = true;
+
+  const all = document.createElement("label");
+  all.className = "scan-diff-row scan-diff-selectall";
+  all.innerHTML = `<input type="checkbox" data-role="select-all-videos" checked /> <span>Apply all of these — untick one to leave it as it is ${escapeHtml(dest)}</span>`;
+  details.appendChild(all);
+
+  for (const it of items) {
+    const row = document.createElement("label");
+    row.className = "scan-diff-row";
+    const sub = [it.author, describeVideoChange(it)].filter(Boolean).join(" · ");
+    row.innerHTML =
+      `<input type="checkbox" data-video-id="${escapeHtml(it.id)}" checked />` +
+      `<span class="scan-diff-text"><b>${escapeHtml(it.title)}</b>` +
+      `<span class="scan-diff-sub">${escapeHtml(sub)}</span></span>`;
+    details.appendChild(row);
+  }
+  if (vids.truncated) {
+    const more = document.createElement("div");
+    more.className = "scan-diff-row";
+    more.innerHTML = `<span class="scan-diff-text"><span class="scan-diff-sub">${escapeHtml(
+      `+ ${vids.truncated} more not listed here (too many to review one by one) — these are applied.`
+    )}</span></span>`;
+    details.appendChild(more);
+  }
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "scan-diff-toggle";
+  const label = (hidden) =>
+    `${hidden ? "Show" : "Hide"} the ${items.length} video change${items.length === 1 ? "" : "s"}`;
+  toggle.textContent = label(true);
+  toggle.addEventListener("click", () => {
+    details.hidden = !details.hidden;
+    toggle.textContent = label(details.hidden);
+  });
+  sec.appendChild(toggle);
+  sec.appendChild(details);
   return sec;
 }
 
@@ -1876,34 +2475,50 @@ function bindEvents() {
     performFolderDrop(folderDragSrcId, li.dataset.folderId, intent);
   });
 
-  el.tagFilterBar.addEventListener("click", (e) => {
-    const chip = e.target.closest("[data-role]");
-    if (!chip) return;
+  // One entry point for both mouse buttons: `negative` is what right-clicking
+  // means. Returns false for a target that isn't a filter chip.
+  function activateFilterChip(chip, negative) {
     const role = chip.dataset.role;
     if (role === "filter-tag") {
-      const id = chip.dataset.tagId;
-      if (activeTagFilters.has(id)) activeTagFilters.delete(id);
-      else activeTagFilters.add(id);
+      toggleChipFilter(activeTagFilters, excludedTagFilters, chip.dataset.tagId, negative);
     } else if (role === "filter-lang") {
-      const lang = chip.dataset.lang;
-      if (activeLangFilters.has(lang)) activeLangFilters.delete(lang);
-      else activeLangFilters.add(lang);
+      toggleChipFilter(activeLangFilters, excludedLangFilters, chip.dataset.lang, negative);
     } else if (role === "filter-active") {
-      filterActive = filterActive === "" ? "only" : filterActive === "only" ? "not" : "";
+      filterActive = toggleTriState(filterActive, negative);
     } else if (role === "filter-finished") {
-      filterFinished = filterFinished === "" ? "only" : filterFinished === "only" ? "not" : "";
+      filterFinished = toggleTriState(filterFinished, negative);
     } else {
-      return;
+      return false;
     }
     renderTagFilters();
     renderGrid();
+    return true;
+  }
+
+  el.tagFilterBar.addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-role]");
+    if (chip) activateFilterChip(chip, false);
   });
 
   el.searchInput.addEventListener("input", (e) => {
     searchQuery = e.target.value;
-    if (currentView === "new") renderVideoFeed();
-    else if (currentView === "watchlater") renderWatchLater();
-    else renderGrid();
+    renderCurrentView();
+  });
+  el.searchClear.addEventListener("click", () => {
+    clearSearch();
+    el.searchInput.focus();
+  });
+  el.clearCountBtn.addEventListener("click", clearCountFilter);
+  el.clearAfterBtn.addEventListener("click", () => clearDateFilter("after"));
+  el.clearBeforeBtn.addEventListener("click", () => clearDateFilter("before"));
+  el.clearAllFiltersBtn.addEventListener("click", clearAllFilters);
+
+  // Reloading throws this page away with the rest of the extension — that's the
+  // point: Chrome re-reads an unpacked extension's files from disk on reload.
+  el.updateReloadBtn.addEventListener("click", () => chrome.runtime.reload());
+  el.updateDismissBtn.addEventListener("click", async () => {
+    el.updateBanner.hidden = true;
+    await chrome.storage.local.set({ dismissedUpdateBuild: el.updateBanner.dataset.build || "" });
   });
 
   // View switch + shared video toolbar
@@ -1917,11 +2532,23 @@ function bindEvents() {
     else renderVideoFeed();
   };
 
+  // Same two-button rule as the channel chips: left = unwatched, right = watched.
+  const toggleWatchedChip = (negative) => {
+    if (currentView === "watchlater") {
+      watchLaterWatchedFilter = toggleTriState(watchLaterWatchedFilter, negative, "unwatched", "watched");
+    } else {
+      newWatchedFilter = toggleTriState(newWatchedFilter, negative, "unwatched", "watched");
+    }
+    renderActiveVideoView();
+  };
   el.videoFilters.addEventListener("click", (e) => {
     if (e.target.dataset.role !== "filter-unwatched") return;
-    if (currentView === "watchlater") watchLaterUnwatchedOnly = !watchLaterUnwatchedOnly;
-    else newUnwatchedOnly = !newUnwatchedOnly;
-    renderActiveVideoView();
+    toggleWatchedChip(false);
+  });
+  el.videoFilters.addEventListener("contextmenu", (e) => {
+    if (e.target.dataset.role !== "filter-unwatched") return;
+    e.preventDefault();
+    toggleWatchedChip(true);
   });
 
   // Video sort buttons: click an inactive key to switch to it (defaulting to
@@ -2280,6 +2907,15 @@ function bindEvents() {
         submenu: () => buildFolderSubmenu(channelId, ch),
       },
       {
+        label: "Set language",
+        submenu: () =>
+          languageSubmenuItems(
+            (lang) => setChannelLanguage(channelId, lang),
+            (l) => (ch.language || null) === l,
+            [ch.language]
+          ),
+      },
+      {
         label: ch.trackVideos ? "Stop tracking videos" : "Track videos",
         action: async () => {
           ch.trackVideos = !ch.trackVideos;
@@ -2317,7 +2953,7 @@ function bindEvents() {
       }
       ch.language = value || null;
       await chrome.storage.local.set({ channels: state.channels });
-      renderGrid();
+      render();
       return;
     }
 
@@ -2430,16 +3066,22 @@ function bindEvents() {
     showContextMenu(e.clientX, e.clientY, menuItems);
   });
 
-  // Right-click menu on tag filter chips
+  // Right-click on a filter chip excludes it. Renaming/deleting a tag moved to
+  // **shift**+right-click, since plain right-click is now half the filter UI
+  // (the chip's tooltip says so, and the "+ tag" dropdown still deletes too).
   el.tagFilterBar.addEventListener("contextmenu", (e) => {
-    const chip = e.target.closest('[data-role="filter-tag"]');
+    const chip = e.target.closest("[data-role]");
     if (!chip) return;
-    e.preventDefault();
-    const id = chip.dataset.tagId;
-    showContextMenu(e.clientX, e.clientY, [
-      { label: "Rename…", action: () => openFolderModal("rename-tag", id) },
-      { label: "Delete", danger: true, action: () => deleteTag(id) },
-    ]);
+    const tagId = chip.dataset.role === "filter-tag" ? chip.dataset.tagId : null;
+    if (tagId && e.shiftKey) {
+      e.preventDefault();
+      showContextMenu(e.clientX, e.clientY, [
+        { label: "Rename…", action: () => openFolderModal("rename-tag", tagId) },
+        { label: "Delete", danger: true, action: () => deleteTag(tagId) },
+      ]);
+      return;
+    }
+    if (activateFilterChip(chip, true)) e.preventDefault();
   });
 
   // Context menu dismissal
@@ -2467,7 +3109,7 @@ function bindEvents() {
 
   el.clearDataBtn.addEventListener("click", async () => {
     if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
-    await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt"]);
+    await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt", "lastSyncCheckAt"]);
     // Only the cleared keys are reset — Watch Later (videos/videoFolders) is left
     // alone, so `state` must be spread, not rebuilt (a rebuilt object dropped
     // state.videos entirely and broke every video view).
@@ -2552,9 +3194,11 @@ function bindEvents() {
 
   // Sync diff dialog
   el.syncDiffBody.addEventListener("change", (e) => {
-    if (e.target.dataset.role !== "select-all-removals") return;
+    const role = e.target.dataset.role;
+    if (role !== "select-all-removals" && role !== "select-all-videos") return;
+    const selector = role === "select-all-videos" ? "input[data-video-id]" : "input[data-remove-id]";
     const on = e.target.checked;
-    el.syncDiffBody.querySelectorAll("input[data-remove-id]").forEach((box) => (box.checked = on));
+    el.syncDiffBody.querySelectorAll(selector).forEach((box) => (box.checked = on));
   });
 
   el.syncDiffApply.addEventListener("click", async () => {
@@ -2563,13 +3207,18 @@ function bindEvents() {
     const removeIds = Array.from(
       el.syncDiffBody.querySelectorAll("input[data-remove-id]:checked")
     ).map((box) => box.dataset.removeId);
+    // Video rows are ticked by default, so it's the *unticked* ones that carry a
+    // decision: leave those alone on the target.
+    const skipVideoIds = Array.from(
+      el.syncDiffBody.querySelectorAll("input[data-video-id]:not(:checked)")
+    ).map((box) => box.dataset.videoId);
 
     el.syncDiffApply.disabled = true;
     el.statusText.textContent = direction === "upload" ? "Uploading…" : "Downloading…";
 
     const res = direction === "upload"
-      ? await chrome.runtime.sendMessage({ type: "APPLY_UPLOAD", removeFromGistIds: removeIds })
-      : await chrome.runtime.sendMessage({ type: "APPLY_DOWNLOAD", removeLocalIds: removeIds });
+      ? await chrome.runtime.sendMessage({ type: "APPLY_UPLOAD", removeFromGistIds: removeIds, skipVideoIds })
+      : await chrome.runtime.sendMessage({ type: "APPLY_DOWNLOAD", removeLocalIds: removeIds, skipVideoIds });
 
     el.syncDiffApply.disabled = false;
     el.syncDiffModal.hidden = true;
@@ -2847,6 +3496,47 @@ function buildFolderSubmenu(channelId, ch) {
   return folderSubmenuItems(moveTo, (id) => ch.folderId === id);
 }
 
+// Language picker submenu, shared by the single-channel and bulk context menus.
+// `onPick(langOrNull)` fires on choice, `isActive` marks the current value, and
+// `extra` seeds off-list values (a channel's custom language) so the row it's
+// already on is still pickable. "New language…" both creates the language and
+// assigns it, which is the only way to add one without opening Settings.
+function languageSubmenuItems(onPick, isActive = () => false, extra = []) {
+  const list = [...new Set([...extra.filter(Boolean), ...LANGUAGES])];
+  return [
+    { label: "— none —", active: isActive(null), action: () => onPick(null) },
+    ...list.map((l) => ({ label: langLabel(l), active: isActive(l), action: () => onPick(l) })),
+    {
+      label: "+ New language…",
+      action: async () => {
+        const name = prompt(
+          "New language — added to the picker for every channel.\n" +
+            "A flag is matched from the name; start with an emoji to force one."
+        )?.trim();
+        if (!name) return;
+        await addLanguage(name);
+        onPick(name);
+      },
+    },
+  ];
+}
+
+// Append a language to the curated set and persist it, so it shows up in every
+// picker (and syncs with the other settings). No-op if it's already there.
+async function addLanguage(name) {
+  if (LANGUAGES.includes(name)) return;
+  LANGUAGES = [...LANGUAGES, name];
+  await chrome.storage.local.set({ languages: LANGUAGES });
+}
+
+async function setChannelLanguage(channelId, lang) {
+  const ch = state.channels[channelId];
+  if (!ch) return;
+  ch.language = lang || null;
+  await chrome.storage.local.set({ channels: state.channels });
+  render(); // the filter bar gains/loses a language chip with the last channel using it
+}
+
 // Watch Later "move to list" submenu — the video-list equivalent of the channel
 // folder submenu.
 function buildListSubmenu(videoId, v) {
@@ -2900,8 +3590,7 @@ async function bulkMutate(ids, fn) {
   }
   await chrome.storage.local.set({ channels: state.channels });
   clearSelection();
-  renderFolders();
-  renderGrid();
+  render(); // not just the grid: a language/tag edit also reshapes the filter bar
 }
 
 async function bulkDelete(ids) {
@@ -2923,13 +3612,7 @@ function showBulkContextMenu(x, y, ids) {
     },
     {
       label: "Set language",
-      submenu: () => [
-        { label: "— none —", action: () => bulkMutate(ids, (ch) => (ch.language = null)) },
-        ...LANGUAGES.map((l) => ({
-          label: l,
-          action: () => bulkMutate(ids, (ch) => (ch.language = l)),
-        })),
-      ],
+      submenu: () => languageSubmenuItems((lang) => bulkMutate(ids, (ch) => (ch.language = lang))),
     },
     {
       label: "Add tag",
@@ -3032,8 +3715,8 @@ async function bulkRemoveFromWatchLater(ids) {
   for (const id of ids) {
     const v = state.videos[id];
     if (!v) continue;
-    if (!v.channelId || !state.channels[v.channelId]?.trackVideos) delete state.videos[id];
-    else { v.saved = false; delete v.folderId; }
+    v.saved = false; // kept as a tombstone — see removeFromWatchLater
+    delete v.folderId;
   }
   await saveVideos();
   clearVideoSelection();

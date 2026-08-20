@@ -22,14 +22,20 @@ const YT_CHANNELS_BATCH = 50; // YouTube channels.list max ids per call
 const HANDLE_RESOLVE_CONCURRENCY = 5; // parallel handle->id lookups per batch
 const VIDEO_KEEP_PER_CHANNEL = 60; // cap stored videos per tracked channel
 
-// Settings mirrored into the gist alongside the library — everything the user
-// can set. Three keys stay out on purpose: `gistToken` is the credential used to
-// reach the gist (never store it inside), and `gistId`/`lastSyncedAt` are
-// per-device bookkeeping. `pendingScan`/`pendingPlaylistImport` are excluded for
-// the same reason: they're an in-flight review on one device, not library state.
-const SYNC_SETTING_KEYS = [
-  "apiKey", "languages", "sortDate", "sortCount", "folderSort", "videoSort", "currentView", "colWidths",
-];
+// Settings mirrored into the gist alongside the library: only real
+// configuration, i.e. things you'd have to set up again on a new device. The
+// **view preferences are deliberately not synced** — `sortDate`, `sortCount`,
+// `folderSort`, `videoSort`, `currentView`, `colWidths` describe how one device
+// is being looked at right now, and pushing them across meant a sync silently
+// re-sorted the other device's list and reported "1 setting" every time. Old
+// gists still carry them; every reader filters through this list, so they're
+// ignored and drop out of the payload on the next upload.
+//
+// Three more stay out for their own reasons: `gistToken` is the credential used
+// to reach the gist (never store it inside), and `gistId`/`lastSyncedAt` are
+// per-device bookkeeping. `pendingScan`/`pendingPlaylistImport` are excluded
+// too — an in-flight review on one device isn't library state.
+const SYNC_SETTING_KEYS = ["apiKey", "languages"];
 
 async function readLocalSettings() {
   const data = await chrome.storage.local.get(SYNC_SETTING_KEYS);
@@ -251,6 +257,7 @@ async function saveVideoToWatchLater(videoId) {
     watched: existing?.watched || false,
     saved: true,
     folderId: existing?.folderId || "unsorted",
+    userStateAt: Date.now(), // see USER_VIDEO_FLAGS — sync resolves this last-writer-wins
     addedAt: existing?.addedAt || Date.now(),
   };
   // Fill length + view count immediately if an API key is set (duration isn't
@@ -509,6 +516,7 @@ async function applyPlaylistImport(listName, moveIds) {
       watched: existing?.watched || false,
       saved: true,
       folderId,
+      userStateAt: now,
       addedAt: existing?.addedAt || now,
     };
   }
@@ -620,11 +628,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === "APPLY_UPLOAD") {
-    applyUpload(msg.removeFromGistIds || []).then(sendResponse);
+    applyUpload(msg.removeFromGistIds || [], msg.skipVideoIds || []).then(sendResponse);
     return true;
   }
   if (msg.type === "APPLY_DOWNLOAD") {
-    applyDownload(msg.removeLocalIds || []).then(sendResponse);
+    applyDownload(msg.removeLocalIds || [], msg.skipVideoIds || []).then(sendResponse);
     return true;
   }
 });
@@ -1069,7 +1077,9 @@ function upsertChannelVideos(store, channelId, videos, now) {
 // video watched or dismissing one during a refresh silently undid itself. Read
 // through `readVideoStore` and write through `commitVideos`: the commit re-reads
 // storage and re-applies the fields the user owns, so only our own updates land.
-const USER_VIDEO_FLAGS = ["watched", "saved", "hidden", "folderId"];
+// `userStateAt` travels with the four fields it stamps: it's the epoch ms of the
+// last user change to them, and mergeVideo resolves them last-writer-wins from it.
+const USER_VIDEO_FLAGS = ["watched", "saved", "hidden", "folderId", "userStateAt"];
 
 async function readVideoStore() {
   const { videos = {} } = await chrome.storage.local.get("videos");
@@ -1089,7 +1099,13 @@ async function commitVideos(store, seenIds, extra = {}) {
     }
     const ours = store[id];
     if (!ours) continue;
-    for (const k of USER_VIDEO_FLAGS) if (cur[k] !== undefined) ours[k] = cur[k];
+    // Storage is authoritative for these — including a *cleared* one: un-saving
+    // deletes `folderId`, and re-applying our stale copy would leave a record
+    // that claims a Watch Later list it's no longer in.
+    for (const k of USER_VIDEO_FLAGS) {
+      if (cur[k] === undefined) delete ours[k];
+      else ours[k] = cur[k];
+    }
   }
   await chrome.storage.local.set({ ...extra, videos: store });
   seenIds.clear();
@@ -1315,15 +1331,27 @@ function parseIsoDuration(iso) {
   return Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
 }
 
+// How long a record survives purely because the user recently changed its state.
+// Un-saving a video is expressed as `saved:false` on the record it leaves behind
+// — that record IS the removal, and deleting it outright let the gist's older
+// `saved:true` merge the video back on the next sync. Once every device has had
+// a chance to sync, the tombstone is worth no more than any other stale row.
+const USER_STATE_TOMBSTONE_MS = 90 * 24 * 60 * 60 * 1000;
+
+function isRecentUserState(v) {
+  return typeof v.userStateAt === "number" && Date.now() - v.userStateAt < USER_STATE_TOMBSTONE_MS;
+}
+
 // Keep the video store bounded: drop videos whose channel is gone or no longer
 // tracked, and cap per-channel history. Saved ("watch later") videos are always
-// kept so a manual bookmark never disappears; aging out past the cap spares
-// anything else the user acted on too, since the whole store now syncs and a
+// kept so a manual bookmark never disappears; a recently-changed record is kept
+// too (it may be the tombstone for an un-save), and aging out past the cap
+// spares anything else the user acted on, since the whole store now syncs and a
 // dropped watched/dismissed flag would propagate to every device.
 function pruneVideos(store, channels) {
   for (const [vid, v] of Object.entries(store)) {
     const ch = channels[v.channelId];
-    if (!v.saved && (!ch || !ch.trackVideos)) delete store[vid];
+    if (!v.saved && !isRecentUserState(v) && (!ch || !ch.trackVideos)) delete store[vid];
   }
   const byChannel = {};
   for (const v of Object.values(store)) (byChannel[v.channelId] ||= []).push(v);
@@ -1332,7 +1360,7 @@ function pruneVideos(store, channels) {
     if (list.length <= VIDEO_KEEP_PER_CHANNEL) continue;
     list.sort((a, b) => (a.published < b.published ? 1 : -1)); // newest first
     for (const v of list.slice(VIDEO_KEEP_PER_CHANNEL)) {
-      if (!isUserTouched(v)) delete store[v.id];
+      if (!isUserTouched(v) && !isRecentUserState(v)) delete store[v.id];
     }
   }
 }
@@ -1366,6 +1394,11 @@ async function resolveGistId(gistToken) {
   if (!gistId) gistId = await findExistingGist(gistToken);
   return gistId;
 }
+
+// How many per-video rows the review lists. Everything is still applied — the
+// cap only bounds what's rendered (and reported as `truncated`), because a first
+// sync can legitimately move tens of thousands of videos.
+const VIDEO_DIFF_LIMIT = 500;
 
 async function computeSyncDiff(direction) {
   const { gistToken } = await chrome.storage.local.get("gistToken");
@@ -1424,7 +1457,10 @@ async function computeSyncDiff(direction) {
       if (!srcCh[id]) removed.push({ id, name: tc.name, handle: tc.handle });
     }
 
-    // Folder diff: renames, reparents, emoji changes, and add/remove by id.
+    // Folder diff: renames, reparents, emoji changes, and additions by id.
+    // Nothing is ever *removed*: both directions union folders now, so a folder
+    // only the target has simply stays there and must not be listed as going
+    // away. (The arrays stay in the response shape the dashboard expects.)
     const srcFo = src.folders || {};
     const tgtFo = tgt.folders || {};
     const foAdded = [], foRemoved = [], foModified = [];
@@ -1441,9 +1477,7 @@ async function computeSyncDiff(direction) {
         if (changes.length) foModified.push({ id, name: sf.name, oldName: tf.name, changes });
       }
     }
-    for (const [id, tf] of Object.entries(tgtFo)) {
-      if (!srcFo[id]) foRemoved.push({ id, name: tf.name });
-    }
+
 
     // Watch Later list diff — identical shape/logic to the channel folder diff.
     const srcVf = src.videoFolders || {};
@@ -1462,9 +1496,7 @@ async function computeSyncDiff(direction) {
         if (changes.length) vfModified.push({ id, name: sf.name, oldName: tf.name, changes });
       }
     }
-    for (const [id, tf] of Object.entries(tgtVf)) {
-      if (!srcVf[id]) vfRemoved.push({ id, name: tf.name });
-    }
+
 
     // Video store is too large to review per-item; summarize how many will be
     // added/updated on the target. The count has to come from the *effective*
@@ -1483,13 +1515,38 @@ async function computeSyncDiff(direction) {
     // on every sync, forever.
     const listOf = (v) => (v.folderId && v.folderId !== "unsorted" ? v.folderId : "");
     const userStateKey = (v) => `${!!v.watched}|${!!v.saved}|${!!v.hidden}|${listOf(v)}`;
-    let vidsAdded = 0, vidsModified = 0, vidsRemoved = 0;
+    // Per-video rows for the review's expandable list. The user ticks these to
+    // opt out (the ids come back as `skipVideoIds`), so each row carries the
+    // before/after user state, not just a count. Modified rows come first —
+    // they're the decisions someone actually made — and the list is capped,
+    // since a first sync or a "fetch full history" dump can add thousands.
+    const pickState = (v) => ({
+      watched: !!v.watched, saved: !!v.saved, hidden: !!v.hidden, folderId: v.folderId || "unsorted",
+    });
+    const nameOf = (v) =>
+      v.author || (localState.channels || {})[v.channelId]?.name || (remoteState.channels || {})[v.channelId]?.name || "";
+    const addedItems = [], modifiedItems = [], removedItems = [];
     for (const [id, rv] of Object.entries(resultVids)) {
       const tv = tgtVids[id];
-      if (!tv) vidsAdded++;
-      else if (userStateKey(rv) !== userStateKey(tv)) vidsModified++;
+      if (!tv) addedItems.push({ id, title: rv.title || id, author: nameOf(rv), from: null, to: pickState(rv) });
+      else if (userStateKey(rv) !== userStateKey(tv)) {
+        modifiedItems.push({ id, title: rv.title || tv.title || id, author: nameOf(rv), from: pickState(tv), to: pickState(rv) });
+      }
     }
-    for (const id of Object.keys(tgtVids)) if (!resultVids[id]) vidsRemoved++;
+    // Videos the apply would drop (`to: null`). These are the destructive rows,
+    // so they lead the list — and `reason` says which bound did it, since
+    // "6 dropped" on its own told the user nothing about what they were losing.
+    const effChannels = effectiveSyncChannels(direction, localState, remoteState);
+    for (const [id, tv] of Object.entries(tgtVids)) {
+      if (resultVids[id]) continue;
+      removedItems.push({
+        id, title: tv.title || id, author: nameOf(tv), from: pickState(tv), to: null,
+        reason: effChannels[tv.channelId]?.trackVideos ? "past the per-channel history cap" : "its channel isn't tracked",
+      });
+    }
+    const vidsAdded = addedItems.length, vidsModified = modifiedItems.length, vidsRemoved = removedItems.length;
+    const allItems = [...removedItems, ...modifiedItems, ...addedItems];
+    const items = allItems.slice(0, VIDEO_DIFF_LIMIT);
 
     // Settings diff: compare the CURRENT target value against the value the apply
     // would actually write, so the review matches the real outcome. Upload uses
@@ -1513,7 +1570,11 @@ async function computeSyncDiff(direction) {
       channels: { added, removed, modified },
       folders: { added: foAdded, removed: foRemoved, modified: foModified },
       videoFolders: { added: vfAdded, removed: vfRemoved, modified: vfModified },
-      videos: { added: vidsAdded, modified: vidsModified, removed: vidsRemoved, srcTotal: Object.keys(srcVids).length },
+      videos: {
+        added: vidsAdded, modified: vidsModified, removed: vidsRemoved,
+        srcTotal: Object.keys(srcVids).length,
+        items, truncated: allItems.length - items.length,
+      },
       settings,
     };
   } catch (e) {
@@ -1539,14 +1600,27 @@ function effectiveSyncChannels(direction, localState, remoteState, removeIds = [
 // The video store an apply would actually write: union merge, then bounded by
 // the same pruneVideos pass. Used by computeSyncDiff so the review matches the
 // outcome — keep it in step with applyUpload/applyDownload.
-function effectiveSyncVideos(direction, localState, remoteState, removeIds = []) {
+//
+// `skipVideoIds` are the videos the user unticked in the review: each one is
+// left exactly as the target already has it (and dropped entirely if the target
+// never had it), so unticking means "don't touch this one" in either direction.
+function effectiveSyncVideos(direction, localState, remoteState, removeIds = [], skipVideoIds = []) {
   const channels = effectiveSyncChannels(direction, localState, remoteState, removeIds);
   const videos = mergeVideos(localState.videos || {}, remoteState.videos || {});
   pruneVideos(videos, channels);
+  // Opted-out videos are put back exactly as the target already has them —
+  // *after* the prune, so unticking also rescues a video the prune would drop.
+  // That's what makes the review's "dropped" rows actionable rather than a
+  // notice: the only way to keep one is to leave the store alone for that id.
+  const target = (direction === "upload" ? remoteState.videos : localState.videos) || {};
+  for (const id of skipVideoIds) {
+    if (target[id]) videos[id] = target[id];
+    else delete videos[id];
+  }
   return videos;
 }
 
-async function applyUpload(removeFromGistIds = []) {
+async function applyUpload(removeFromGistIds = [], skipVideoIds = []) {
   const { gistToken } = await chrome.storage.local.get("gistToken");
   if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
 
@@ -1560,7 +1634,7 @@ async function applyUpload(removeFromGistIds = []) {
     // is union-merged with the gist (deletions don't propagate) and then bounded
     // the same way the local store is, so untracked channels don't live on in
     // the gist and come back on the next merge.
-    let remoteState = { channels: {}, videos: {} };
+    let remoteState = { channels: {}, videos: {}, folders: {}, tags: {}, videoFolders: {} };
     let remoteSettings = {};
     if (gistId) {
       const fetched = await fetchGistState(gistToken, gistId);
@@ -1570,13 +1644,19 @@ async function applyUpload(removeFromGistIds = []) {
       }
     }
     const uploadChannels = effectiveSyncChannels("upload", localState, remoteState, removeFromGistIds);
-    const uploadVideos = effectiveSyncVideos("upload", localState, remoteState, removeFromGistIds);
+    const uploadVideos = effectiveSyncVideos("upload", localState, remoteState, removeFromGistIds, skipVideoIds);
 
+    // Folders, lists and tags union the same way the video store does: local
+    // wins on ids both sides have, gist-only ones are kept. Writing the local
+    // set wholesale meant a device that hadn't downloaded yet wiped every folder
+    // or list the other device had just added — while the videos and channels
+    // pointing at them survived the merge, leaving them filed under an id with
+    // no folder behind it.
     const uploadState = {
       channels: uploadChannels,
-      folders: local.folders || {},
-      tags: local.tags || {},
-      videoFolders: local.videoFolders || {},
+      folders: { ...(remoteState.folders || {}), ...(local.folders || {}) },
+      tags: { ...(remoteState.tags || {}), ...(local.tags || {}) },
+      videoFolders: { ...(remoteState.videoFolders || {}), ...(local.videoFolders || {}) },
       videos: uploadVideos,
       settings: mergeSettings(await readLocalSettings(), remoteSettings),
     };
@@ -1600,7 +1680,7 @@ async function applyUpload(removeFromGistIds = []) {
   }
 }
 
-async function applyDownload(removeLocalIds = []) {
+async function applyDownload(removeLocalIds = [], skipVideoIds = []) {
   const { gistToken } = await chrome.storage.local.get("gistToken");
   if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
 
@@ -1611,7 +1691,7 @@ async function applyDownload(removeLocalIds = []) {
     const remoteState = await fetchGistState(gistToken, gistId);
     if (!remoteState) return { ok: false, error: "Gist has no usable state yet." };
 
-    const local = await chrome.storage.local.get(["channels", "folders", "videoFolders", "videos"]);
+    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
     const localState = { channels: local.channels || {}, videos: local.videos || {} };
 
     // Gist channels win; local-only ones the user chose to keep are re-added.
@@ -1622,11 +1702,14 @@ async function applyDownload(removeLocalIds = []) {
     // Watch Later lists: gist wins, local-only lists kept. Video store: union
     // merge, kept within the same bounds as any other write.
     const videoFolders = { ...(local.videoFolders || {}), ...(remoteState.videoFolders || {}) };
-    const videos = effectiveSyncVideos("download", localState, remoteState, removeLocalIds);
+    const videos = effectiveSyncVideos("download", localState, remoteState, removeLocalIds, skipVideoIds);
 
     const lastSyncedAt = Date.now();
     const settings = pickRemoteSettings(remoteState.settings);
-    await chrome.storage.local.set({ channels, folders, tags: remoteState.tags || {}, videoFolders, videos, gistId, lastSyncedAt, ...settings });
+    // Tags union like folders — replacing them wholesale dropped any tag only
+    // this device had, silently unlabelling the local-only channels wearing it.
+    const tags = { ...(local.tags || {}), ...(remoteState.tags || {}) };
+    await chrome.storage.local.set({ channels, folders, tags, videoFolders, videos, gistId, lastSyncedAt, ...settings });
     return { ok: true, gistId, lastSyncedAt };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
@@ -1700,14 +1783,55 @@ function isUserTouched(v) {
 }
 
 // Union-merge two video stores by id — deletions don't propagate. For a video
-// present on both sides, user state is combined (watched/saved/hidden OR-ed, an
-// organized list assignment preferred) and the richer metadata wins.
+// present on both sides the richer metadata wins, and the user state is resolved
+// by mergeUserState (last-writer-wins, see below).
 function mergeVideos(local = {}, remote = {}) {
   const out = { ...remote };
   for (const [id, lv] of Object.entries(local)) {
     out[id] = out[id] ? mergeVideo(lv, out[id]) : lv;
   }
   return out;
+}
+
+// Resolve the four user-owned fields between two copies of a video.
+//
+// They can't be OR-ed: OR only ever turns a flag on, so un-saving, un-watching,
+// un-hiding or moving a video back to Unsorted never reached the other device —
+// worse, the gist's stale `true` merged straight back over the change, so a
+// removal from Watch Later undid itself on the very next sync. Each side instead
+// carries `userStateAt`, stamped whenever the user touches one of these fields,
+// and the newer stamp takes all four (they describe one decision, so mixing
+// halves of two devices' states would invent a third one nobody chose).
+//
+// Records written before this existed have no stamp: two unstamped sides keep
+// the old union so nothing already synced changes meaning, and a stamped side
+// beats an unstamped one — it's a deliberate action versus an unknown age.
+function mergeUserState(a, b) {
+  const stamp = (v) => (typeof v.userStateAt === "number" ? v.userStateAt : null);
+  const aAt = stamp(a), bAt = stamp(b);
+  const winner = aAt !== null && bAt !== null ? (aAt >= bAt ? a : b)
+    : aAt !== null ? a
+    : bAt !== null ? b
+    : null;
+
+  if (winner) {
+    return {
+      watched: !!winner.watched,
+      saved: !!winner.saved,
+      hidden: !!winner.hidden,
+      folderId: winner.folderId || "unsorted",
+      userStateAt: Math.max(aAt ?? 0, bAt ?? 0),
+    };
+  }
+  return {
+    watched: !!(a.watched || b.watched),
+    saved: !!(a.saved || b.saved),
+    hidden: !!(a.hidden || b.hidden),
+    // Prefer a real (non-"unsorted") Watch Later list assignment from either side.
+    folderId: a.folderId && a.folderId !== "unsorted" ? a.folderId
+      : b.folderId && b.folderId !== "unsorted" ? b.folderId
+      : a.folderId || b.folderId || "unsorted",
+  };
 }
 
 function mergeVideo(a, b) {
@@ -1718,13 +1842,7 @@ function mergeVideo(a, b) {
   return {
     ...b,
     ...a,
-    watched: !!(a.watched || b.watched),
-    saved: !!(a.saved || b.saved),
-    hidden: !!(a.hidden || b.hidden),
-    // Prefer a real (non-"unsorted") Watch Later list assignment from either side.
-    folderId: a.folderId && a.folderId !== "unsorted" ? a.folderId
-      : b.folderId && b.folderId !== "unsorted" ? b.folderId
-      : a.folderId || b.folderId || "unsorted",
+    ...mergeUserState(a, b),
     duration: numDuration !== undefined ? numDuration : a.duration ?? b.duration,
     viewCount: views >= 0 ? views : null,
     live: firstSet(a.live, b.live) ?? "none",

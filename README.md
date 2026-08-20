@@ -44,6 +44,30 @@ Works in any Chromium browser — Chrome, Edge, Brave, Vivaldi.
    last-video dates are fetched. This also runs automatically in the background
    every 3 hours (`chrome.alarms`).
 
+## Staying up to date
+
+The extension is loaded unpacked from a git checkout, so updating it is
+`git pull` — an extension can't run git, reach its own folder, or auto-update
+itself outside the Chrome Web Store. What it *can* do is notice and get out of
+your way:
+
+1. Every time you open the dashboard it compares the build stamp in the local
+   `version.json` with the one on `main` at GitHub.
+2. If GitHub is ahead, a banner appears with the latest commit's subject and the
+   command to run.
+3. After `git pull`, click **Reload extension** in the banner — Chrome re-reads
+   the pulled files and restarts the extension. Dismissing the banner keeps it
+   quiet until the *next* push.
+
+The stamp is written automatically by a commit hook. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Without it, `version.json` stops moving and the check simply never reports an
+update (it never reports a false one).
+
 ## How to get an API key
 
 1. Create a new project at https://console.cloud.google.com.
@@ -109,8 +133,16 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
 
 Each row's **Variables** cell holds per-channel attributes alongside its tags:
 
-- **Language** — a dropdown of common languages. Pick **Other…** to type any
-  custom value; it's remembered and shown as its own option afterwards.
+- **Language** — a dropdown of common languages, each shown with its **flag**.
+  Pick **Other…** to type any custom value; it's remembered and shown as its own
+  option afterwards. You can also **right-click a channel → Set language** to
+  pick from the same list without touching the dropdown; that menu's **+ New
+  language…** adds a language to the picker for every channel (the same set you
+  can edit in Settings → Languages). Right-clicking a multi-selection sets the
+  language on all of them at once. Flags are matched from the language name
+  (native name, English name or ISO code — `Nederlands`, `Dutch` and `nl` all
+  give 🇳🇱); an unrecognized name shows 🌐, and starting the name with an emoji
+  forces that emoji instead.
 - **Active** / **Finished** — two independent flags (a channel can be neither,
   either, or both). Click a chip to toggle it; it lights up when on. Use them to
   mark channels you're actively following versus ones you consider done.
@@ -119,10 +151,19 @@ Each row's **Variables** cell holds per-channel attributes alongside its tags:
 - **Tags** — the freeform labels described above.
 
 All of these are **filterable**. The filter bar above the list shows, for the
-current folder: each used tag, each used language, and **Active** / **Finished**
-toggles (when any channel carries them). Click to narrow the view — tags and
-languages each combine as OR within their group, and every group AND's together
-(and with the selected folder). Switching folders clears the filters.
+current folder: each used tag, each used language (with its flag), and **Active** / **Finished**
+toggles (when any channel carries them).
+
+Every chip has two sides: **left-click for "only these", right-click for "not
+these"** — clicking the side it's already on switches it off. An excluded chip
+keeps its color but is struck through. The same rule covers the **Unwatched**
+chip in the video views: left-click for unwatched only, right-click for watched
+only. (Tags are renamed/deleted with **shift**+right-click on their chip, since
+plain right-click now filters.)
+
+Tags and languages each combine as OR within their group, exclusions always win,
+and every group AND's together (and with the selected folder). Switching folders
+clears the filters.
 
 When you **Refresh Stats**, any channel flagged **Active** or **Finished** that
 has a **new video** since the last refresh triggers a desktop **notification**
@@ -136,7 +177,31 @@ The top bar filters the current view (all filters combine):
 - **Search** by channel name or handle.
 - **Min / Max videos** — bound the video count.
 - **Last video after / before** — bound the most recent upload date (inclusive).
-  The **year** is required; day and month are optional (default to the 1st).
+  The **year** is required; day and month are optional (default to the 1st). The
+  year list only offers years your library actually reaches, newest first.
+
+Every number field can be **dragged** left/right to change its value (like a
+Unity inspector) or changed by **pointing at it and scrolling** (like the old
+Football Manager spinners) — the native up/down arrows were a tiny target, so
+they're hidden. Clicking still puts a caret in for typing; a drag only starts
+once the pointer moves. Scrolling over the **year** dropdowns walks their
+options the same way.
+
+Each filter has an **×** to clear just it (the search box, the video-count pair,
+and each date bound), and a **Clear filters** button at the end of the top bar
+wipes every filter in the current view. They appear only while something is
+actually set.
+
+The top bar always says how much survived the filters — **"42 of 380 channels"**,
+or just **"380 channels"** when nothing is filtered. The video views count the
+same way. The total is what the selected folder or list holds, not the whole
+library: picking a folder is navigation, not a filter.
+
+**Last Video** dates are color-coded by how recent they are: **blue** for this
+month and last month, **green** for the rest of the current year, **yellow** for
+the two years before it, **orange** for the two before those, and **red** for
+anything older. The buckets are computed from today's date, so they roll over on
+their own each year; a channel with no known upload date stays uncolored.
 
 Click the **Last Video** or **Videos** column headers to sort; each click
 cycles none → descending → ascending, and the choice is remembered. The list
@@ -254,10 +319,39 @@ the device that happened to sync first won. Now the order is yours to pick —
 **Download first on a device that's behind**, then Upload once it's caught up.
 
 Both directions still *merge* rather than clobber: new channels, folders, tags,
-Watch Later lists and videos flow across; per-video state combines
-(watched/saved/dismissed stay set if either side set them, and an organized list
-assignment wins); variables carry with each channel; and fresher stats win. The
-only things deleted are the ones you tick in the review screen.
+Watch Later lists and videos flow across; variables carry with each channel; and
+fresher stats win. The only channels deleted are the ones you tick in the review
+screen.
+
+The review screen lists the channels, folders, lists and settings that would
+change. The **Videos** section leads with the counts, and a **"Show the N video
+changes"** button expands one row per video — its title, channel, and what the
+sync would do to it ("saved to Watch Later (Music)", "removed from Watch Later",
+"marked watched", "new", or "will be dropped — its channel isn't tracked").
+Every row is ticked; untick one and that video is left exactly as it is on this
+side — for a row that would be *dropped*, unticking is how you keep it. So you
+can take part of a sync and not the rest. (Very large syncs list the first 500
+changes; the rest still apply.)
+
+Only real settings travel with the library: your **API key** and your **language
+set**. How you happen to be sorting or which view is open stays on each device.
+
+**Opening the dashboard checks the gist for you.** If another device pushed
+something up, the same **Review download** screen opens by itself — so a device
+you haven't used in a while tells you there's work waiting instead of quietly
+falling behind. It's only a look: nothing is written until you press *Apply
+download*, and you can close the review and carry on. The check is skipped if
+you haven't set a token, if another review is already open, and for ten minutes
+after the last one, so reopening the dashboard doesn't hammer GitHub. A check
+that fails (offline, bad token) stays quiet — use the Download button in
+Settings to see the actual error.
+
+Per-video state — **watched**, **saved to Watch Later**, **dismissed**, and which
+list a video is in — is resolved by **whichever device changed it last**, so
+*undoing* something travels just like doing it: remove a video from Watch Later
+on one device and it's gone on the other after a sync, instead of reappearing.
+(Removals are remembered for 90 days, which is how long the video keeps a record
+saying it's no longer saved; after that it's simply forgotten.)
 
 Notes: the gist is "secret" (unlisted, but anyone with the URL can read it, and
 it does include your **API key** — but never the GitHub token, which stays only

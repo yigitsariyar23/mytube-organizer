@@ -40,8 +40,17 @@
     </aside>
 
     <main class="main">
+      <div id="updateBanner" class="update-banner" hidden>
+        <span id="updateBannerText" class="update-banner-text"></span>
+        <code class="update-banner-cmd">git pull</code>
+        <button id="updateReloadBtn" class="btn btn-ghost" type="button" title="Restart the extension so Chrome re-reads the pulled files">Reload extension</button>
+        <button id="updateDismissBtn" class="banner-dismiss" type="button" title="Hide until the next update">×</button>
+      </div>
       <div class="topbar">
-        <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
+        <div class="search-wrap">
+          <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
+          <button id="searchClear" class="input-clear" type="button" title="Clear search" hidden>×</button>
+        </div>
         <div id="videoFilters" class="filter-group video-filters">
           <span class="filter-label">Sort</span>
           <button id="videoSortDate" class="video-sort-btn" data-sort="date">Date <span class="vs-arrow"></span></button>
@@ -56,6 +65,7 @@
           <input id="filterMinCount" class="filter-input filter-input-num" type="number" min="0" placeholder="—" />
           <label class="filter-label">Max videos</label>
           <input id="filterMaxCount" class="filter-input filter-input-num" type="number" min="0" placeholder="—" />
+          <button class="filter-clear" type="button" data-clear="count" title="Clear the video-count filter" hidden>×</button>
         </div>
         <div class="filter-group">
           <label class="filter-label">Last video after</label>
@@ -64,6 +74,7 @@
           <input id="filterAfterMonth" class="filter-input filter-input-month" type="number" min="1" max="12" placeholder="MM" />
           <span class="filter-sep">/</span>
           <select id="filterAfterYear" class="filter-select"></select>
+          <button class="filter-clear" type="button" data-clear="after" title="Clear this date filter" hidden>×</button>
         </div>
         <div class="filter-group">
           <label class="filter-label">Last video before</label>
@@ -72,8 +83,13 @@
           <input id="filterBeforeMonth" class="filter-input filter-input-month" type="number" min="1" max="12" placeholder="MM" />
           <span class="filter-sep">/</span>
           <select id="filterBeforeYear" class="filter-select"></select>
+          <button class="filter-clear" type="button" data-clear="before" title="Clear this date filter" hidden>×</button>
         </div>
-        <span id="statusText" class="status-text"></span>
+        <div class="topbar-end">
+          <span id="resultCount" class="result-count"></span>
+          <button id="clearAllFiltersBtn" class="btn btn-ghost" type="button" title="Clear every filter in this view" hidden>Clear filters</button>
+          <span id="statusText" class="status-text"></span>
+        </div>
       </div>
 
       <div id="tagFilterBar" class="tag-filter-bar" hidden></div>
@@ -157,7 +173,7 @@
           <h3 class="settings-section-title">Languages</h3>
           <label class="field-label" for="languagesInput">Dropdown options (one per line)</label>
           <textarea id="languagesInput" class="field-input settings-langs" spellcheck="false"></textarea>
-          <p class="field-hint">The set shown in each channel's language picker. One per line; blank resets to defaults.</p>
+          <p class="field-hint">The set shown in each channel's language picker (right-click a channel &rarr; Set language to add one without coming here). One per line; blank resets to defaults. A flag is matched from the name &mdash; start a line with an emoji to force a different one.</p>
         </section>
       </div>
 
