@@ -101,6 +101,16 @@ case "$(uname -s)" in
     ;;
 esac
 
+# Git Bash rewrites any argument that looks like a Unix path before handing it to
+# a Windows program, which turns reg.exe's /ve /t /d /f switches into
+# "C:/Program Files/Git/ve" and friends — reg answers "Invalid syntax" and the
+# install fails on a machine where everything is actually fine. These two
+# variables are the documented way to turn that off, and they're scoped to the
+# call so nothing else in the script changes behavior.
+reg_cmd() {
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' reg "$@"
+}
+
 # Escape hatch for a browser profile this script doesn't know about: point it at
 # the directory that holds the browser's "Default" profile folder. (Unix only —
 # on Windows the lookup is a registry key, not a path.)
@@ -125,8 +135,8 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   if [[ "$PLATFORM" == "windows" ]]; then
     for vendor in "${WIN_VENDORS[@]}"; do
       key="HKCU\\Software\\$vendor\\NativeMessagingHosts\\$HOST_NAME"
-      if reg query "$key" >/dev/null 2>&1; then
-        reg delete "$key" /f >/dev/null
+      if reg_cmd query "$key" >/dev/null 2>&1; then
+        reg_cmd delete "$key" /f >/dev/null
         echo "removed  $key"
         removed=$((removed + 1))
       fi
@@ -179,7 +189,7 @@ JSON
   manifest_win="$(win_path "$MANIFEST_PATH")"
   for vendor in "${WIN_VENDORS[@]}"; do
     key="HKCU\\Software\\$vendor\\NativeMessagingHosts\\$HOST_NAME"
-    reg add "$key" /ve /t REG_SZ /d "$manifest_win" /f >/dev/null
+    reg_cmd add "$key" /ve /t REG_SZ /d "$manifest_win" /f >/dev/null
     echo "registered  $key"
     installed=$((installed + 1))
   done
