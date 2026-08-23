@@ -265,7 +265,9 @@ Row interactions:
 - **Left-click** a row (anywhere but a tag or dropdown) → opens the channel's
   Videos page in a new tab.
 - **Middle-click** → opens it in a background tab without leaving the dashboard.
-- **Right-click** → Move to folder / Delete channel.
+- **Right-click** → Move to folder, Set language, Mark active / inactive, Track
+  videos, Fetch all videos, Delete channel. The Active entry is the same flag as
+  the row's **Active** chip, so you can set it without aiming at the chip.
 
 ## Videos: New and Watch Later
 

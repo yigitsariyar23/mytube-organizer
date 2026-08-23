@@ -1742,6 +1742,22 @@ function buildChannelRow(ch) {
   return row;
 }
 
+// Flip one of the three per-channel flags (active / finished / trackVideos).
+// The row's chips and the right-click menu both land here, so the one thing
+// that isn't just a boolean — turning Track on has to fetch that channel's
+// uploads right away, or the feed stays empty until the next scheduled refresh
+// — can't be implemented in one place and forgotten in the other. The UI
+// repaints off the storage write, via the onChanged listener in init().
+async function toggleChannelFlag(channelId, key) {
+  const ch = state.channels[channelId];
+  if (!ch) return;
+  ch[key] = !ch[key];
+  await chrome.storage.local.set({ channels: state.channels });
+  if (key === "trackVideos" && ch.trackVideos) {
+    chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
+  }
+}
+
 function thumbHtml(ch) {
   return ch.thumbnail
     ? `<img class="channel-thumb" src="${ch.thumbnail}" alt="" onerror="this.outerHTML='<div class=&quot;channel-thumb&quot;></div>'" />`
@@ -2955,16 +2971,7 @@ function bindEvents() {
 
     const toggleKey = { "toggle-active": "active", "toggle-finished": "finished", "toggle-track": "trackVideos" }[e.target.dataset.role];
     if (toggleKey) {
-      const ch = state.channels[channelId];
-      if (ch) {
-        ch[toggleKey] = !ch[toggleKey];
-        await chrome.storage.local.set({ channels: state.channels });
-        // Enabling tracking: fetch this channel's uploads now so the feed fills
-        // immediately instead of waiting for the next scheduled refresh.
-        if (toggleKey === "trackVideos" && ch.trackVideos) {
-          chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
-        }
-      }
+      await toggleChannelFlag(channelId, toggleKey);
       return;
     }
 
@@ -3016,12 +3023,12 @@ function bindEvents() {
           ),
       },
       {
+        label: ch.active ? "Mark inactive" : "Mark active",
+        action: () => toggleChannelFlag(channelId, "active"),
+      },
+      {
         label: ch.trackVideos ? "Stop tracking videos" : "Track videos",
-        action: async () => {
-          ch.trackVideos = !ch.trackVideos;
-          await chrome.storage.local.set({ channels: state.channels });
-          if (ch.trackVideos) chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
-        },
+        action: () => toggleChannelFlag(channelId, "trackVideos"),
       },
       {
         label: ch.fetchedAll ? "Re-fetch all videos" : "Fetch all videos",
