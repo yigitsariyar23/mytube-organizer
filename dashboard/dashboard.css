@@ -93,6 +93,41 @@ html, body {
   letter-spacing: 0.02em;
 }
 
+/* Upload / download, pushed to the far end of the brand row. Sync is a thing
+   you reach for often and a thing you should never trigger by accident, so:
+   small and out of the way, but not buried in Settings. */
+.brand-sync {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.icon-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.icon-btn:disabled,
+.icon-btn:disabled:hover {
+  opacity: 0.45;
+  cursor: default;
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
 .section-label-row {
   display: flex;
   align-items: center;

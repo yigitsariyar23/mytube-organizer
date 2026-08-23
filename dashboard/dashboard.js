@@ -217,6 +217,8 @@ const el = {
   languagesInput: document.getElementById("languagesInput"),
   syncUploadBtn: document.getElementById("syncUploadBtn"),
   syncDownloadBtn: document.getElementById("syncDownloadBtn"),
+  quickUploadBtn: document.getElementById("quickUploadBtn"),
+  quickDownloadBtn: document.getElementById("quickDownloadBtn"),
   syncStatus: document.getElementById("syncStatus"),
   syncDiffModal: document.getElementById("syncDiffModal"),
   syncDiffTitle: document.getElementById("syncDiffTitle"),
@@ -3097,21 +3099,33 @@ function bindEvents() {
     render();
   });
 
+  // Both ways in run this: the Settings modal's buttons and the sidebar's ↑/↓.
+  // What differs is only where it can talk — the modal's status line exists
+  // while the modal is open, the toolbar's is what's on screen otherwise — and
+  // where the token comes from: inside Settings it may have just been typed and
+  // not saved yet, everywhere else `state` is the only truth there is.
   async function startSyncFlow(direction) {
-    state.gistToken = el.gistTokenInput.value.trim();
-    await chrome.storage.local.set({ gistToken: state.gistToken });
+    const inSettings = !el.settingsModal.hidden;
+    if (inSettings) {
+      state.gistToken = el.gistTokenInput.value.trim();
+      await chrome.storage.local.set({ gistToken: state.gistToken });
+    }
+    const say = (msg) => { (inSettings ? el.syncStatus : el.statusText).textContent = msg; };
+
     if (!state.gistToken) {
-      el.syncStatus.textContent = "Enter a GitHub token first.";
+      say(inSettings ? "Enter a GitHub token first." : "Add a GitHub token in Settings to sync.");
       return;
     }
-    const btn = direction === "upload" ? el.syncUploadBtn : el.syncDownloadBtn;
-    btn.disabled = true;
-    el.syncStatus.textContent = "Fetching diff…";
+    // Disable all four: the two pairs are the same operation, and a second click
+    // during the round trip would open a review computed against stale data.
+    const btns = [el.syncUploadBtn, el.syncDownloadBtn, el.quickUploadBtn, el.quickDownloadBtn];
+    btns.forEach((b) => (b.disabled = true));
+    say("Fetching diff…");
     const diff = await chrome.runtime.sendMessage({ type: "FETCH_SYNC_DIFF", direction });
-    btn.disabled = false;
-    el.syncStatus.textContent = "";
+    btns.forEach((b) => (b.disabled = false));
+    say("");
     if (!diff?.ok) {
-      el.syncStatus.textContent = diff?.error || "Failed to fetch diff.";
+      say(diff?.error || "Failed to fetch diff.");
       return;
     }
     el.settingsModal.hidden = true;
@@ -3120,6 +3134,8 @@ function bindEvents() {
 
   el.syncUploadBtn.addEventListener("click", () => startSyncFlow("upload"));
   el.syncDownloadBtn.addEventListener("click", () => startSyncFlow("download"));
+  el.quickUploadBtn.addEventListener("click", () => startSyncFlow("upload"));
+  el.quickDownloadBtn.addEventListener("click", () => startSyncFlow("download"));
 
   // New folder / rename modal
   el.addFolderBtn.addEventListener("click", () => openFolderModal("create-folder"));
