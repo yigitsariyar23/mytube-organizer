@@ -363,7 +363,8 @@ state and all) — into a **secret GitHub Gist** (free):
    (`mytube-organizer.json`), so that's the whole setup.
 
 **Syncing is always something you ask for.** Nothing is uploaded or downloaded
-in the background — use the small **↑ / ↓** buttons beside the sidebar logo, or
+in the background — use the small **↑ / ↓** buttons beside the sidebar logo
+(hover for what each does), or
 **⬆ Upload / ⬇ Download** in Settings (the same two operations; the sidebar pair
 just saves the trip). Each runs a **directional** sync and shows a review screen
 first: exactly what will be added, overwritten or removed, with removals
