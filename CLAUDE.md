@@ -439,12 +439,16 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     nothing else, non-interactive (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=true`,
     a 90s timeout) so a credential prompt can't hang Chrome's pipe, and Chrome
     only starts it for the id in `allowed_origins`.
-  - **That id is pinned by `manifest.json`'s `key`.** An unpacked extension's id
-    is derived from its directory path, so without the key each device would
-    load under a different id and the installed host would refuse to talk. The
-    key is the public half of a throwaway keypair — nothing secret, and the
-    private half isn't in the repo (it would only matter for packing a `.crx`).
-    Change the key and every device has to re-run `install.sh`.
+  - **Never add a `key` to `manifest.json` to pin that id.** An unpacked
+    extension's id is the hash of the directory path it loads from, so pinning
+    it looks like the tidy way to make one host manifest work everywhere — but
+    adding the key *changes* the id, and the browser then treats the extension
+    as a brand-new one with an empty `chrome.storage.local`. The entire library
+    appears deleted (it isn't: it sits under the old id in the profile's
+    `Local Extension Settings/<id>/`, and removing the extension is what would
+    actually destroy it). This was tried and reverted — don't try it again.
+    `install.sh` computes the path-derived id instead, with `--id` for the cases
+    the hash gets wrong (symlinked checkout, another clone).
   - The stamp is a **timestamp, not a SHA**: at pre-commit time the commit's own
     hash doesn't exist yet. It also has to *order*, so a local commit that hasn't
     been pushed reads as "ahead", not as "an update is available".

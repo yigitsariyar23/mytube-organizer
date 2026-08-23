@@ -82,11 +82,17 @@ Details worth knowing:
 - It needs `python3` and `git` on the machine, and it pulls **the checkout it
   lives in** — re-run the installer if you move the folder, since the registered
   manifest stores an absolute path.
+- It registers with every Chromium-family browser it finds (Chrome, Chromium,
+  Vivaldi, Brave, Edge, Opera, Arc, Yandex). If yours isn't found, the installer
+  prints where it looked — point it at the directory holding your browser's
+  `Default` profile folder: `bash native-host/install.sh --dir "/path/to/dir"`.
 - `--ff-only` means it never merges: local commits or conflicting edits make it
   stop and show git's own message in the banner instead of leaving a half-merged
   tree behind.
 - It never prompts for credentials (a private remote fails fast rather than
-  hanging), and Chrome will only start it for this extension's id.
+  hanging), and the browser will only start it for this extension's id — which
+  the installer computes from the checkout path and prints, so you can compare
+  it with `chrome://extensions` and re-run with `--id <id>` if it differs.
 - `bash native-host/install.sh --uninstall` removes it. On Windows the host
   manifest lives in the registry instead — see Chrome's native messaging docs.
 
