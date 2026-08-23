@@ -3027,6 +3027,10 @@ function bindEvents() {
         action: () => toggleChannelFlag(channelId, "active"),
       },
       {
+        label: ch.finished ? "Mark unfinished" : "Mark finished",
+        action: () => toggleChannelFlag(channelId, "finished"),
+      },
+      {
         label: ch.trackVideos ? "Stop tracking videos" : "Track videos",
         action: () => toggleChannelFlag(channelId, "trackVideos"),
       },
