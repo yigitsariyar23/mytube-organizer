@@ -2032,6 +2032,15 @@ async function offerNativePull() {
   el.updateBannerCmd.hidden = !!res.ok;
 }
 
+// Restart the extension so Chrome re-reads the folder from disk. This page goes
+// with it — it *is* part of the extension — so the last thing it does is leave a
+// stamp the service worker picks up on the way back up, which reopens the
+// dashboard. Without it the button looks like it merely closed the extension.
+async function reloadExtension() {
+  await chrome.storage.local.set({ reopenDashboardAt: Date.now() });
+  chrome.runtime.reload();
+}
+
 async function runNativePull() {
   el.updatePullBtn.disabled = true;
   const label = el.updatePullBtn.textContent;
@@ -2040,7 +2049,8 @@ async function runNativePull() {
   if (res.ok) {
     // Reloading throws this page away along with the rest of the extension —
     // which is the point: the pulled files only take effect on a restart.
-    chrome.runtime.reload();
+    // reloadExtension leaves the note that brings this page back afterwards.
+    await reloadExtension();
     return;
   }
   // Failed pulls are the interesting ones (local commits, a conflict, no
@@ -2632,7 +2642,7 @@ function bindEvents() {
 
   // Reloading throws this page away with the rest of the extension — that's the
   // point: Chrome re-reads an unpacked extension's files from disk on reload.
-  el.updateReloadBtn.addEventListener("click", () => chrome.runtime.reload());
+  el.updateReloadBtn.addEventListener("click", reloadExtension);
   el.updatePullBtn.addEventListener("click", runNativePull);
   el.updateDismissBtn.addEventListener("click", async () => {
     el.updateBanner.hidden = true;

@@ -56,8 +56,9 @@ your way:
 2. If GitHub is ahead, a banner appears with the latest commit's subject and the
    command to run.
 3. After `git pull`, click **Reload extension** in the banner — Chrome re-reads
-   the pulled files and restarts the extension. Dismissing the banner keeps it
-   quiet until the *next* push.
+   the pulled files and restarts the extension, then the dashboard reopens by
+   itself (it's part of the extension, so the restart closes it). Dismissing the
+   banner keeps it quiet until the *next* push.
 
 ### One-click updates (optional)
 

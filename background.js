@@ -590,6 +590,26 @@ async function openDashboard() {
   }
 }
 
+// ---------- Coming back from a self-reload ----------
+
+// The update banner's Reload / Pull & reload buttons restart the extension so
+// Chrome re-reads the pulled files — and the dashboard, being an extension page,
+// dies with it, leaving the user staring at a dead tab. It can't reopen itself
+// after that, so it leaves this stamp behind and the worker finishes the job on
+// the way back up: this runs at the top level, which is where Chrome
+// re-evaluates the worker after a reload.
+//
+// It's a timestamp rather than a boolean because the worker also starts for
+// alarms, messages and clicks. A flag that somehow outlived its reload would
+// then open a tab nobody asked for, at 3am, on the wrong device.
+const REOPEN_AFTER_RELOAD_MS = 60_000;
+
+chrome.storage.local.get("reopenDashboardAt").then(({ reopenDashboardAt }) => {
+  if (!reopenDashboardAt) return;
+  chrome.storage.local.remove("reopenDashboardAt");
+  if (Date.now() - reopenDashboardAt < REOPEN_AFTER_RELOAD_MS) openDashboard();
+});
+
 // ---------- Message routing ----------
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

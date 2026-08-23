@@ -91,6 +91,9 @@ videos:  { [videoId]: {
 apiKey, gistToken, gistId, lastSyncedAt                        // settings + sync bookkeeping
 dismissedUpdateBuild                                          // the version.json build the user dismissed
                                                               //   in the update banner (per-device)
+reopenDashboardAt                                             // epoch ms stamped just before the dashboard
+                                                              //   restarts the extension, so the worker can
+                                                              //   reopen it on the way back up (per-device)
 lastSyncCheckAt                                               // epoch ms of the last on-open gist check
                                                               //   (throttle only; per-device, never synced)
 languages                                                     // string[] — editable language dropdown set (Settings, or
@@ -449,6 +452,13 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     actually destroy it). This was tried and reverted — don't try it again.
     `install.sh` computes the path-derived id instead, with `--id` for the cases
     the hash gets wrong (symlinked checkout, another clone).
+  - **Reloading kills the page that asked for it**, dashboard included — so the
+    button used to look like it had merely closed the extension. `reloadExtension()`
+    stamps `reopenDashboardAt` first, and a top-level block in `background.js`
+    (top level because that's what Chrome re-evaluates on the way back up) reads
+    it and calls `openDashboard()`. The stamp is a time, not a flag: the worker
+    also starts for alarms and messages, and one that outlived its reload would
+    open a tab nobody asked for.
   - The stamp is a **timestamp, not a SHA**: at pre-commit time the commit's own
     hash doesn't exist yet. It also has to *order*, so a local commit that hasn't
     been pushed reads as "ahead", not as "an update is available".

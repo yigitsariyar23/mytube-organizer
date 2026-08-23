@@ -103,6 +103,10 @@ html, body {
 }
 
 .icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   width: 22px;
   height: 22px;
   padding: 0;
@@ -112,12 +116,28 @@ html, body {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
 }
 
+/* Hovering names the button rather than waiting on the OS tooltip. The pair is
+   pinned to the right end of the brand row, so a button that grows extends
+   leftward into empty space — the logo never moves, and neither does whichever
+   button sits to the right of the one being hovered. */
+.icon-btn-label {
+  display: none;
+  font-size: 11px;
+}
+
 .icon-btn:hover {
+  width: auto;
+  padding: 0 8px;
   border-color: var(--accent);
   color: var(--text);
+}
+
+.icon-btn:hover .icon-btn-label {
+  display: inline;
 }
 
 .icon-btn:disabled,
