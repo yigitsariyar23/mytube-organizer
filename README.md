@@ -102,6 +102,13 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
 
 - Each channel lives in a single **folder**. Move it via the folder dropdown on
   its row, or right-click the row → **Move to folder**.
+- The folder sidebar starts with two entries that aren't folders: **All**
+  (everything) and **Filed** — the mirror image of **Unfiled**, showing every
+  channel that *is* in a folder. Both sit alongside the real folders, count like
+  them, and are just as usable in the New feed; in Watch Later the same pair
+  scopes your saved videos to the ones already in a list.
+  (**Unfiled** is the pinned home folder, named **Unsorted** in earlier
+  versions — same folder, same contents, new label.)
 - **Folders** support:
   - **Nesting** one level deep (a top-level folder can hold subfolders). Create
     a subfolder from the "New folder" dialog's parent selector or by
@@ -116,7 +123,7 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
   - **Collapse/expand** of parents (click anywhere on the parent row — the
     caret shows the state), and a channel **count** that includes subfolders.
   - Rename / delete via right-click. Deleting a folder moves its channels to
-    **Unsorted** and promotes any subfolders to top-level. "Unsorted" is pinned
+    **Unfiled** and promotes any subfolders to top-level. "Unfiled" is pinned
     and can't be renamed, moved or deleted.
 - **Tags** are freeform and multiple per channel. Click the **"+ tag"** chip on
   a row to open a dropdown of your existing tags (each with its color) — click
@@ -281,7 +288,7 @@ rename/delete). Independent of the New feed.
   choose whether to move it in. If it captured fewer videos than the playlist lists
   (a very long playlist that didn’t finish loading), it warns you to re-run.
   Confirm, and every video lands in a fresh list named after the playlist.
-- **Organize into lists.** Saved videos start in **Unsorted**. Create lists with
+- **Organize into lists.** Saved videos start in **Unfiled**. Create lists with
   **+ New list**, nest them one level deep, and right-click a video → **Move to
   list**. Right-click a list to rename, set an emoji, add a sub-list, or delete.
 - **Watch & clean up.** Click a video to open it on YouTube (marked **watched**);

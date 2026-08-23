@@ -52,7 +52,8 @@ channels: { [channelId]: {
   subscriberCount,          // number | null (null if hidden or not yet fetched); shown in the list
   lastFetched,              // epoch ms of the last stats refresh (drives merge freshness)
 } }
-folders: { [folderId]: { name, order, parentId?, emoji? } }   // channel folders; "unsorted" pinned
+folders: { [folderId]: { name, order, parentId?, emoji? } }   // channel folders; "unsorted" (shown as
+                                                              //   "Unfiled") is the pinned home
 tags:    { [tagId]: { name, color } }
 videoFolders: { [folderId]: { name, order, parentId?, emoji? } }  // Watch Later lists; same shape/rules as folders
 videos:  { [videoId]: {
@@ -100,8 +101,8 @@ pendingPlaylistImport: { playlistId, title, fetchedAt, statedCount, scrapedCount
 ```
 
 - **Folder nesting is one level deep.** A folder with children is a "parent";
-  channels only live in leaf folders. `unsorted` is the fixed home and can't be
-  renamed, reparented or deleted.
+  channels only live in leaf folders. `unsorted` (labelled "Unfiled") is the
+  fixed home and can't be renamed, reparented or deleted.
 - **`folderSort` "custom"** is the only mode where folder drag-and-drop is
   active; the other modes are computed sorts.
 
@@ -239,6 +240,21 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   `folders` + `currentFolderId` for Channels/New, `videoFolders` + `currentListId`
   for Watch Later) — folders/counts/selection/persist. Channel behavior is the
   default, so it's unchanged.
+- **Two virtual sidebar entries, not one.** `"all"` (no scoping) and `FILED_ID`
+  (`"filed"` — everything *not* in the home folder, its mirror image)
+  are selections, never folders: they're absent from `folders`/`videoFolders`,
+  so they can't be renamed, dragged, dropped onto or deleted (the folder
+  right-click guard is `isVirtualFolderId(id) || id === "unsorted"`, and
+  `computeFolderDropIntent` already refuses an id it can't find). A real folder
+  id is always `slug + "-" + suffix`, so neither can collide.
+  **Every view scopes through `folderScopeTest(selectedId, folders)`** — it
+  returns `null` for "all", `isFiledFolderId` for "filed", else a
+  descendant-set test — so `channelsInCurrentFolder`, `newFeedUniverse` and
+  `watchLaterUniverse` behave identically. Add a scoped surface by calling it,
+  not by comparing ids. "Filed" holds no items of its own, so `renderFolders`
+  counts it as `d.total() - directCount.unsorted`; that only stays honest
+  because both sides normalize a missing `folderId` to `"unsorted"` (RSS videos
+  carry none) — the same normalization `isFiledFolderId` does.
 - **Adding to Watch Later (context menu).** `contextMenus` permission: right-click
   a YouTube video link or a watch/shorts page → "Save to MyTube Watch Later"
   (`setupContextMenus`, created on install *and* `onStartup`). `background.js`
@@ -332,7 +348,7 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   set; a *changed* pref propagates only through an explicit Download.
 - **User state resolves last-writer-wins, not by union.** `watched`/`saved`/
   `hidden`/`folderId` used to be OR-ed on merge. OR only ever turns a flag *on*,
-  so un-saving, un-watching, un-hiding and moving back to Unsorted never reached
+  so un-saving, un-watching, un-hiding and moving back to Unfiled never reached
   the other device — and the gist's stale `true` merged back over the local
   change, so removing something from Watch Later undid itself on the next sync.
   Now every user change stamps `userStateAt` and `mergeUserState` gives all four
@@ -382,8 +398,15 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   sync); the dashboard writes for direct user edits (move folder, add tag,
   rename). Both persist by writing whole objects back to
   `chrome.storage.local`.
-- Migrations run in `onInstalled` (`repairDoubledNames`, the Turkish
-  "Klasörsüz" → "Unsorted" rename) — add one-off data fixes there.
+- Migrations run in `onInstalled` (`repairDoubledNames`, `renameHomeFolder`) —
+  add one-off data fixes there. **The pinned home folder's id is `unsorted` but
+  its label is `HOME_FOLDER_NAME` ("Unfiled")** — the id is a storage key every
+  channel and video points at, so only the name ever moves; `renameHomeFolder`
+  migrates the earlier names (`OLD_HOME_FOLDER_NAMES`: the Turkish "Klasörsüz",
+  then "Unsorted") for both folder trees. It also runs inside `fetchGistState`,
+  so every reader of a gist written by an older build sees one name: the remote
+  side wins the folder overlap on download, so without it the review would
+  report a home-folder rename that the apply undoes — on every single sync.
 
 ## Known gaps / gotchas
 

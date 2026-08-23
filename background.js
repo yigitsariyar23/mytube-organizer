@@ -92,23 +92,37 @@ function notifyTrackedUpdates(updated) {
 
 // ---------- Setup ----------
 
+// The pinned home folder's label. The *id* stays "unsorted" — it's a storage
+// key, and renaming it would orphan every channel and video pointing at it.
+// Only the display name moves, so past names have to be migrated (below).
+const HOME_FOLDER_NAME = "Unfiled";
+const OLD_HOME_FOLDER_NAMES = ["Klasörsüz", "Unsorted"];
+
+// Bring a folder set's pinned home name up to date. Returns whether it changed,
+// so the caller only writes when there's something to write. The user can't
+// rename this folder, so any of the old names is ours to replace.
+function renameHomeFolder(folders) {
+  const home = folders?.unsorted;
+  if (!home || !OLD_HOME_FOLDER_NAMES.includes(home.name)) return false;
+  home.name = HOME_FOLDER_NAME;
+  return true;
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const data = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
   if (!data.channels) await chrome.storage.local.set({ channels: {} });
   else await repairDoubledNames(data.channels);
   if (!data.folders) {
-    await chrome.storage.local.set({
-      folders: { unsorted: { name: "Unsorted", order: 0 } },
-    });
-  } else if (data.folders.unsorted?.name === "Klasörsüz") {
-    // migrate the default folder name from the old Turkish UI
-    data.folders.unsorted.name = "Unsorted";
+    await chrome.storage.local.set({ folders: { unsorted: { name: HOME_FOLDER_NAME, order: 0 } } });
+  } else if (renameHomeFolder(data.folders)) {
     await chrome.storage.local.set({ folders: data.folders });
   }
   if (!data.tags) await chrome.storage.local.set({ tags: {} });
   // Watch Later lists mirror channel folders: a pinned "unsorted" home list.
   if (!data.videoFolders) {
-    await chrome.storage.local.set({ videoFolders: { unsorted: { name: "Unsorted", order: 0 } } });
+    await chrome.storage.local.set({ videoFolders: { unsorted: { name: HOME_FOLDER_NAME, order: 0 } } });
+  } else if (renameHomeFolder(data.videoFolders)) {
+    await chrome.storage.local.set({ videoFolders: data.videoFolders });
   }
   // Backfill folderId on any pre-existing saved videos so they land in a list.
   if (data.videos) {
@@ -217,7 +231,7 @@ function extractPlaylistId(url) {
 // oEmbed endpoint (no API key, no quota); the thumbnail is derived from the id.
 async function saveVideoToWatchLater(videoId) {
   const { videos = {}, videoFolders = {} } = await chrome.storage.local.get(["videos", "videoFolders"]);
-  if (!videoFolders.unsorted) videoFolders.unsorted = { name: "Unsorted", order: 0 };
+  if (!videoFolders.unsorted) videoFolders.unsorted = { name: HOME_FOLDER_NAME, order: 0 };
 
   const existing = videos[videoId];
   if (existing && existing.saved) {
@@ -481,7 +495,7 @@ async function applyPlaylistImport(listName, moveIds) {
   const { pendingPlaylistImport, videos = {}, videoFolders = {}, apiKey } =
     await chrome.storage.local.get(["pendingPlaylistImport", "videos", "videoFolders", "apiKey"]);
   if (!pendingPlaylistImport) return { ok: false, error: "No pending playlist import." };
-  if (!videoFolders.unsorted) videoFolders.unsorted = { name: "Unsorted", order: 0 };
+  if (!videoFolders.unsorted) videoFolders.unsorted = { name: HOME_FOLDER_NAME, order: 0 };
 
   const name = (listName || pendingPlaylistImport.title || "Imported playlist").trim() || "Imported playlist";
   const listId = slugify(name) + "-" + Date.now().toString(36).slice(-4);
@@ -1739,7 +1753,14 @@ async function fetchGistState(token, gistId) {
   }
   try {
     const state = JSON.parse(content);
-    return state && typeof state === "object" ? state : null;
+    if (!state || typeof state !== "object") return null;
+    // A gist written by an older build carries the home folder's old name. Fix
+    // it here, on the way in, so *every* reader sees one name: otherwise the
+    // download diff reports a rename the apply immediately undoes (it re-runs
+    // the migration) — a row that would come back on every single sync.
+    renameHomeFolder(state.folders);
+    renameHomeFolder(state.videoFolders);
+    return state;
   } catch (e) {
     return null;
   }
@@ -1796,7 +1817,7 @@ function mergeVideos(local = {}, remote = {}) {
 // Resolve the four user-owned fields between two copies of a video.
 //
 // They can't be OR-ed: OR only ever turns a flag on, so un-saving, un-watching,
-// un-hiding or moving a video back to Unsorted never reached the other device —
+// un-hiding or moving a video back to Unfiled never reached the other device —
 // worse, the gist's stale `true` merged straight back over the change, so a
 // removal from Watch Later undid itself on the very next sync. Each side instead
 // carries `userStateAt`, stamped whenever the user touches one of these fields,

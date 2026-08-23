@@ -367,9 +367,12 @@ async function init() {
   })();
 }
 
-// The seed library: a single pinned "Unsorted" folder. A factory (not a shared
+// The seed library: a single pinned home folder. A factory (not a shared
 // constant) so each caller gets a fresh object — state.folders is mutated in place.
-const defaultFolders = () => ({ unsorted: { name: "Unsorted", order: 0 } });
+// Its id stays "unsorted" (a storage key every channel and video points at);
+// only the label is "Unfiled", the name it pairs with the sidebar's "Filed".
+// background.js owns the same constant and migrates older stored names.
+const defaultFolders = () => ({ unsorted: { name: "Unfiled", order: 0 } });
 
 async function loadState() {
   const data = await chrome.storage.local.get([
@@ -439,7 +442,8 @@ function fdom() {
       const m = {};
       for (const c of Object.values(state.channels)) {
         if (trackedOnly && !c.trackVideos) continue;
-        m[c.folderId] = (m[c.folderId] || 0) + 1;
+        const f = c.folderId || "unsorted";
+        m[f] = (m[f] || 0) + 1;
       }
       return m;
     },
@@ -526,13 +530,13 @@ function anyTrackedChannel() {
 // narrow this down — keeping the two steps apart is what lets the toolbar say
 // "12 of 240" without walking the store twice.
 function newFeedUniverse() {
-  const inFolder = currentFolderId === "all" ? null : getFolderAndDescendantIds(currentFolderId);
+  const inFolder = folderScopeTest(currentFolderId);
   return Object.values(state.videos).filter((v) => {
     const ch = state.channels[v.channelId];
     if (!ch || !ch.trackVideos) return false;
     if (v.hidden) return false;              // user-dismissed from the feed
     if (isUpcomingOrLive(v)) return false;   // live streams / scheduled premieres
-    if (inFolder && !inFolder.has(ch.folderId)) return false;
+    if (inFolder && !inFolder(ch.folderId)) return false;
     return true;
   });
 }
@@ -707,10 +711,10 @@ function formatViews(n) {
 // Every saved video in the selected list (+ its sub-lists), before the search
 // box and watched chip — the New feed's `newFeedUniverse` for Watch Later.
 function watchLaterUniverse() {
-  const inList = currentListId === "all" ? null : getFolderAndDescendantIds(currentListId, state.videoFolders);
+  const inList = folderScopeTest(currentListId, state.videoFolders);
   return Object.values(state.videos).filter((v) => {
     if (!v.saved) return false;
-    return !inList || inList.has(v.folderId || "unsorted");
+    return !inList || inList(v.folderId);
   });
 }
 
@@ -933,6 +937,28 @@ function getFolderAndDescendantIds(folderId, folders = state.folders) {
   return new Set([folderId, ...getChildFolderIds(folderId, folders)]);
 }
 
+// The sidebar's two virtual entries. Neither is a real folder — they hold no
+// items of their own, can't be renamed, dragged, or dropped onto: "all" scopes
+// nothing, and "filed" is the exact opposite of the pinned Unfiled folder,
+// i.e. everything that *has* been filed away. Folder ids are always
+// slug + "-" + suffix (see the new-folder handler), so neither can collide.
+const FILED_ID = "filed";
+const isVirtualFolderId = (id) => id === "all" || id === FILED_ID;
+// An absent folderId means Unfiled (RSS videos carry none) — normalize before
+// asking anything about it.
+const isFiledFolderId = (folderId) => (folderId || "unsorted") !== "unsorted";
+
+// "Does this item belong to the current sidebar selection?" as a predicate over
+// an item's folderId, or null when nothing is scoped ("All"). Every view's
+// universe function goes through this, so the virtual entries behave the same
+// in the channel grid, the New feed and Watch Later.
+function folderScopeTest(selectedId, folders = state.folders) {
+  if (selectedId === "all") return null;
+  if (selectedId === FILED_ID) return isFiledFolderId;
+  const ids = getFolderAndDescendantIds(selectedId, folders);
+  return (folderId) => ids.has(folderId || "unsorted");
+}
+
 // Count channels in a folder and all its children
 function getFolderChannelCount(folderId) {
   const allIds = getFolderAndDescendantIds(folderId);
@@ -980,6 +1006,22 @@ function renderFolders() {
   const unsorted = visibleTop.find((f) => f.id === "unsorted");
   let rest = visibleTop.filter((f) => f.id !== "unsorted");
 
+  // The "Filed" virtual item — the Unfiled folder's mirror image: everything
+  // that *is* in a folder. It holds no items of its own, so its count is simply
+  // whatever the sidebar's total isn't in Unfiled (both already respect the New
+  // view's tracked-only restriction). It renders right under Unfiled, the entry
+  // it pairs with, or under "All" when Unfiled itself is hidden.
+  const filedCount = d.total() - (directCount["unsorted"] || 0);
+  const appendFiledItem = () => {
+    if (hideEmpty && filedCount === 0) return;
+    const li = document.createElement("li");
+    li.className = "folder-item" + (selected === FILED_ID ? " active" : "");
+    li.dataset.folderId = FILED_ID;
+    li.innerHTML = `<span class="folder-name">Filed</span><span class="folder-count">${filedCount}</span>`;
+    el.folderList.appendChild(li);
+  };
+  if (!unsorted) appendFiledItem();
+
   if (folderSort === "alpha") {
     rest.sort((a, b) => a.name.localeCompare(b.name));
   } else if (folderSort === "count-desc") {
@@ -1006,6 +1048,7 @@ function renderFolders() {
     const caret = hasChildren ? `<span class="folder-caret" aria-hidden="true">▸</span>` : "";
     li.innerHTML = `${caret}${folderEmojiSlotHtml(f.id, emoji)}<span class="folder-name">${escapeHtml(f.name)}</span><span class="folder-count">${f.count}</span>`;
     el.folderList.appendChild(li);
+    if (f.id === "unsorted") appendFiledItem();
 
     // Render children under this parent
     if (f.id !== "unsorted") {
@@ -1199,7 +1242,8 @@ function renderTagFilters() {
 
   // Only offer variables actually present on channels in the current folder.
   const channelsInFolder = Object.values(state.channels).filter(
-    (c) => currentFolderId === "all" || c.folderId === currentFolderId
+    (c) => currentFolderId === "all" ||
+      (currentFolderId === FILED_ID ? isFiledFolderId(c.folderId) : c.folderId === currentFolderId)
   );
   const usedTagIds = new Set(channelsInFolder.flatMap((c) => c.tags || []));
   const tagEntries = Object.entries(state.tags).filter(([id]) => usedTagIds.has(id));
@@ -1581,9 +1625,8 @@ function clearAllFilters() {
 // The denominator of the toolbar's count, and the starting point of the filters.
 function channelsInCurrentFolder() {
   const list = Object.values(state.channels);
-  if (currentFolderId === "all") return list;
-  const allIds = getFolderAndDescendantIds(currentFolderId);
-  return list.filter((c) => allIds.has(c.folderId));
+  const inFolder = folderScopeTest(currentFolderId);
+  return inFolder ? list.filter((c) => inFolder(c.folderId)) : list;
 }
 
 function getFilteredChannels() {
@@ -2078,7 +2121,7 @@ function buildPlaylistSection(title, kind, items, movable) {
 
 // Resolve a Watch Later list id to its display name (falls back to the id).
 function listName(id) {
-  return state.videoFolders[id]?.name || id || "Unsorted";
+  return state.videoFolders[id]?.name || id || "Unfiled";
 }
 
 // ---------- Sync review dialog ----------
@@ -2430,7 +2473,7 @@ function bindEvents() {
   el.folderList.addEventListener("dragstart", (e) => {
     if (folderSort !== "custom") return; // manual drag is only meaningful in custom order
     const li = e.target.closest(".folder-item");
-    if (!li || !li.draggable) return; // skip "All" and "Unsorted"
+    if (!li || !li.draggable) return; // skip the virtual entries and "Unfiled"
     folderDragSrcId = li.dataset.folderId;
     li.classList.add("dragging");
     e.dataTransfer.effectAllowed = "move";
@@ -3045,7 +3088,7 @@ function bindEvents() {
     if (!li) return;
     e.preventDefault();
     const id = li.dataset.folderId;
-    if (id === "all" || id === "unsorted") return; // virtual / pinned home — no actions
+    if (isVirtualFolderId(id) || id === "unsorted") return; // virtual / pinned home — no actions
     const folder = fdom().folders[id];
     const isChild = !!folder?.parentId;
     const menuItems = [
@@ -3292,7 +3335,7 @@ function openFolderModal(type, id = null, defaultParentId = null) {
   el.folderNameInput.select();
 }
 
-// Delete a folder/list from the active domain: its items move to Unsorted and
+// Delete a folder/list from the active domain: its items move to Unfiled and
 // its subfolders are promoted to top-level.
 async function deleteFolder(id) {
   const d = fdom();
@@ -3312,7 +3355,7 @@ async function deleteFolder(id) {
   }
   if (totalCount) {
     const itemNoun = isList ? "video" : "channel";
-    msg += ` ${totalCount} ${itemNoun}${totalCount === 1 ? "" : "s"} will move to Unsorted.`;
+    msg += ` ${totalCount} ${itemNoun}${totalCount === 1 ? "" : "s"} will move to Unfiled.`;
   }
   if (!confirm(msg)) return;
 
