@@ -496,6 +496,16 @@ html, body {
   align-items: center;
   gap: 10px;
   margin-left: auto;
+  flex: none;        /* never shrink: the count is the one thing that must stay */
+}
+
+/* Sized like the chips it sits beside — a full-size button here would make the
+   row taller the moment a filter turned on, which is the shove this layout is
+   built to avoid. */
+#clearAllFiltersBtn {
+  padding: 3px 10px;
+  font-size: 11.5px;
+  border-radius: 999px;
 }
 
 /* "12 of 240 videos" — its own element so a count and a transient status
@@ -537,12 +547,27 @@ html, body {
 }
 
 
+/* The chips and the result count share one line. The count and "Clear filters"
+   used to live in the topbar, where turning a filter on added exactly the width
+   that made the topbar wrap — so filtering pushed the whole list down a row, and
+   clearing pulled it back up. Here that can't happen: this row never wraps (the
+   chip bar takes the slack and wraps inside itself), and the count stays pinned
+   right whether or not there are any chips to sit beside. */
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: -6px 0 16px;
+  min-height: 26px; /* one chip tall, so an empty row is the same height as a full one */
+}
+
 .tag-filter-bar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin: -6px 0 16px;
+  flex: 1;
+  min-width: 0; /* wrap the chips rather than shove the count off the edge */
 }
 
 /* The `display: flex` above outranks the `hidden` attribute's UA display:none,

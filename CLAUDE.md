@@ -467,6 +467,15 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   the renderers compute the universe once and filter it, so the count costs no
   extra pass. It lives in its own element, **not** `#statusText`, because the
   two used to overwrite each other ("Refreshing…" vs "240 videos").
+  - It sits in `.filter-row` — the same line as the chip bar — and not in the
+    `.topbar`, where it started. The topbar wraps, and the count plus a
+    **Clear filters** button was exactly the width that made it wrap: turning any
+    filter on pushed the whole list down a row, and clearing pulled it back up.
+    `.filter-row` doesn't wrap (the chip bar takes the slack with `flex:1;
+    min-width:0` and wraps *inside itself*), has a `min-height` of one chip, and
+    the Clear button is styled chip-sized — so the row is the same height empty,
+    filtered, or in a video view with no chips at all. Anything added here has to
+    keep that true.
 - **Filter chips are two-sided.** Left click = "only these", right click = "not
   these", and clicking the side a chip already holds clears it (`toggleChipFilter`
   for the set-backed tag/language chips, `toggleTriState` for the string-backed
