@@ -42,7 +42,8 @@
     <main class="main">
       <div id="updateBanner" class="update-banner" hidden>
         <span id="updateBannerText" class="update-banner-text"></span>
-        <code class="update-banner-cmd">git pull</code>
+        <code id="updateBannerCmd" class="update-banner-cmd">git pull</code>
+        <button id="updatePullBtn" class="btn btn-ghost" type="button" title="Run git pull in this checkout, then restart the extension" hidden>Pull &amp; reload</button>
         <button id="updateReloadBtn" class="btn btn-ghost" type="button" title="Restart the extension so Chrome re-reads the pulled files">Reload extension</button>
         <button id="updateDismissBtn" class="banner-dismiss" type="button" title="Hide until the next update">×</button>
       </div>

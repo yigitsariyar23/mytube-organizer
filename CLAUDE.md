@@ -20,6 +20,10 @@ dashboard/
   dashboard.js                        UI logic: render, filter/sort, folders/tags, dialogs, events
 content-scripts/
   scrape-subscriptions.js             runs only on youtube.com/feed/channels; scrapes channel links
+native-host/
+  mytube-updater.py                   OPTIONAL, runs OUTSIDE the browser: native messaging host
+                                        that git-pulls this checkout for the update banner
+  install.sh                          registers it per browser profile (per device, one-time)
 version.json                          build stamp (UTC), rewritten by .githooks/pre-commit
 .githooks/pre-commit                  stamps version.json; enable with `git config core.hooksPath .githooks`
 icons/                                EMPTY — no packaged icon (manifest icon keys commented out)
@@ -30,7 +34,10 @@ check-missing.sh, csv-ids.txt,        one-off dev utilities / personal data dump
 There are three independent surfaces — the service worker, the dashboard page,
 and the content script — that only talk through `chrome.runtime` messages and
 shared `chrome.storage.local`. Keep that boundary: the dashboard never touches
-YouTube's DOM, and the content script never touches storage.
+YouTube's DOM, and the content script never touches storage. (`native-host/` is
+a fourth thing entirely: not part of the extension, optional, installed per
+device, and reached only through `sendNativeMessage` — see the update-banner
+note under "Known gaps".)
 
 ## Storage schema (`chrome.storage.local`)
 
@@ -410,15 +417,34 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 
 ## Known gaps / gotchas
 
-- **The update banner can't update anything.** `checkForAppUpdate()` (dashboard
-  `init`) compares the local `version.json` build against the one on GitHub and,
-  when the remote is newer, shows a banner with the last commit's subject, the
-  `git pull` to run, and a **Reload extension** button. That button is the only
-  part the extension can actually do — `chrome.runtime.reload()` makes Chrome
-  re-read an unpacked extension from disk. There is **no way** to pull from in
-  here: an MV3 worker has no shell and no filesystem (not even to its own
-  folder), and Chrome's auto-update only covers Web Store installs. Don't
-  "improve" this into a self-updater; it can't exist.
+- **The update banner can't pull by itself — a native host does it.**
+  `checkForAppUpdate()` (dashboard `init`) compares the local `version.json`
+  build against the one on GitHub and, when the remote is newer, shows a banner
+  with the last commit's subject, the `git pull` to run, and a **Reload
+  extension** button (`chrome.runtime.reload()` makes Chrome re-read an unpacked
+  extension from disk). Nothing *inside* the extension can run git: an MV3
+  worker has no shell and no filesystem, not even to its own folder, and Chrome's
+  auto-update only covers Web Store installs. Don't try to write a self-updater
+  in here; it can't exist.
+  - What can: **`native-host/mytube-updater.py`**, a Chrome native messaging
+    host — a plain process outside the browser, so it has the shell the worker
+    doesn't. `offerNativePull()` pings it whenever the banner shows and only
+    then reveals **Pull & reload** (`runNativePull` → `{cmd:"pull"}` →
+    `chrome.runtime.reload()`); an unanswered ping leaves the old copyable
+    command exactly as it was. It's optional and **per device**
+    (`native-host/install.sh` writes a host manifest into each browser profile),
+    so every path here must survive it being absent — that's the whole reason
+    the button starts hidden instead of erroring on click.
+  - The host is not a general runner: `git pull --ff-only` in its own repo and
+    nothing else, non-interactive (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=true`,
+    a 90s timeout) so a credential prompt can't hang Chrome's pipe, and Chrome
+    only starts it for the id in `allowed_origins`.
+  - **That id is pinned by `manifest.json`'s `key`.** An unpacked extension's id
+    is derived from its directory path, so without the key each device would
+    load under a different id and the installed host would refuse to talk. The
+    key is the public half of a throwaway keypair — nothing secret, and the
+    private half isn't in the repo (it would only matter for packing a `.crx`).
+    Change the key and every device has to re-run `install.sh`.
   - The stamp is a **timestamp, not a SHA**: at pre-commit time the commit's own
     hash doesn't exist yet. It also has to *order*, so a local commit that hasn't
     been pushed reads as "ahead", not as "an update is available".

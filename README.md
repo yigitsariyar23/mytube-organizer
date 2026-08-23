@@ -59,6 +59,37 @@ your way:
    the pulled files and restarts the extension. Dismissing the banner keeps it
    quiet until the *next* push.
 
+### One-click updates (optional)
+
+Step 3 can be a single button instead of a trip to the terminal. The extension
+still can't run git — but it can ask a small helper on your machine to, which is
+what `native-host/` is: a Chrome **native messaging host** that runs
+`git pull --ff-only` in this checkout and nothing else. Install it once per
+device:
+
+```bash
+bash native-host/install.sh
+```
+
+Then restart the browser (host manifests are read at startup) and reload the
+extension. The update banner now shows **Pull & reload**, which pulls and
+restarts in one click. Nothing else changes: without the helper the banner keeps
+showing the copyable `git pull`, so devices you never set up keep working
+exactly as before.
+
+Details worth knowing:
+
+- It needs `python3` and `git` on the machine, and it pulls **the checkout it
+  lives in** — re-run the installer if you move the folder, since the registered
+  manifest stores an absolute path.
+- `--ff-only` means it never merges: local commits or conflicting edits make it
+  stop and show git's own message in the banner instead of leaving a half-merged
+  tree behind.
+- It never prompts for credentials (a private remote fails fast rather than
+  hanging), and Chrome will only start it for this extension's id.
+- `bash native-host/install.sh --uninstall` removes it. On Windows the host
+  manifest lives in the registry instead — see Chrome's native messaging docs.
+
 The stamp is written automatically by a commit hook. Enable it once per clone:
 
 ```bash

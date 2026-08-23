@@ -194,6 +194,8 @@ const el = {
   statusText: document.getElementById("statusText"),
   updateBanner: document.getElementById("updateBanner"),
   updateBannerText: document.getElementById("updateBannerText"),
+  updateBannerCmd: document.getElementById("updateBannerCmd"),
+  updatePullBtn: document.getElementById("updatePullBtn"),
   updateReloadBtn: document.getElementById("updateReloadBtn"),
   updateDismissBtn: document.getElementById("updateDismissBtn"),
   resultCount: document.getElementById("resultCount"),
@@ -1975,6 +1977,60 @@ function showUpdateBanner(build, head) {
     : "A newer version is on GitHub. Pull it, then reload:";
   el.updateBanner.dataset.build = build;
   el.updateBanner.hidden = false;
+  offerNativePull();
+}
+
+// ---------- The updater's native host ----------
+
+// The extension still can't pull — nothing inside an MV3 worker can. What it
+// can do is ask a *native host* to, and that host is the one in `native-host/`:
+// Chrome starts it, it runs `git pull --ff-only` in this checkout, and the only
+// thing left for the extension is the restart it could already do. Installing
+// it (`native-host/install.sh`) is a per-device step, so everything here has to
+// degrade to the old copy-the-command banner when it isn't there.
+const UPDATER_HOST = "com.mytube.organizer.updater";
+
+// sendNativeMessage's callback reports a missing/broken host through
+// runtime.lastError, which throws if left unread — resolve it as a value.
+function sendToUpdater(message) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendNativeMessage(UPDATER_HOST, message, (res) => {
+        if (chrome.runtime.lastError) resolve({ ok: false, missing: true, error: chrome.runtime.lastError.message });
+        else resolve(res || { ok: false, error: "The updater sent no answer." });
+      });
+    } catch (e) {
+      resolve({ ok: false, missing: true, error: e.message });
+    }
+  });
+}
+
+// Show "Pull & reload" only once the host has actually answered. A button that
+// errors on click would be worse than the command it replaces, and a host that
+// isn't installed is the normal case on a device nobody has set up yet.
+async function offerNativePull() {
+  const res = await sendToUpdater({ cmd: "ping" });
+  el.updatePullBtn.hidden = !res.ok;
+  el.updateBannerCmd.hidden = !!res.ok;
+}
+
+async function runNativePull() {
+  el.updatePullBtn.disabled = true;
+  const label = el.updatePullBtn.textContent;
+  el.updatePullBtn.textContent = "Pulling…";
+  const res = await sendToUpdater({ cmd: "pull" });
+  if (res.ok) {
+    // Reloading throws this page away along with the rest of the extension —
+    // which is the point: the pulled files only take effect on a restart.
+    chrome.runtime.reload();
+    return;
+  }
+  // Failed pulls are the interesting ones (local commits, a conflict, no
+  // network), so show git's own words rather than a summary of them.
+  el.updateBannerText.textContent = [res.error, res.output].filter(Boolean).join(" ").slice(0, 300);
+  el.updateBannerCmd.hidden = false;
+  el.updatePullBtn.disabled = false;
+  el.updatePullBtn.textContent = label;
 }
 
 // Nothing syncs by itself — but *looking* is free, and a device that sat closed
@@ -2559,6 +2615,7 @@ function bindEvents() {
   // Reloading throws this page away with the rest of the extension — that's the
   // point: Chrome re-reads an unpacked extension's files from disk on reload.
   el.updateReloadBtn.addEventListener("click", () => chrome.runtime.reload());
+  el.updatePullBtn.addEventListener("click", runNativePull);
   el.updateDismissBtn.addEventListener("click", async () => {
     el.updateBanner.hidden = true;
     await chrome.storage.local.set({ dismissedUpdateBuild: el.updateBanner.dataset.build || "" });

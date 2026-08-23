@@ -4,7 +4,8 @@
   "short_name": "MyTube",
   "version": "0.1.0",
   "description": "Organize your YouTube subscriptions into folders and tags; track last video date and video count.",
-  "permissions": ["storage", "alarms", "unlimitedStorage", "notifications", "contextMenus", "scripting"],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjgXGA1fijBEaVS1x951QgZ6eJycCYptrmH9kprzo0EGpJ5/+xMahxGbjDQRB39mKG2lYUx2Qtp6pKPxix+imczf3cKeg0vw94LoQNSMsdlM99jijNfqGeqlmXpbvIvLtlx4uLFCUsCreg4ti13FopAgUi88f0cjHWIBzj/n6D1b4lrCXWGMsUsPNbpDK2nbxTnZs6I/sVgNGT9Fdl/wfQ12fckNgl/1Swc+CJSEoR4zpoaWxnQPN+d84iYRmMiWRNpuoJ3m1ED7U6wZ8dVCNL2RXdxPJUxHhSPPVPl1AMpKUQGaDMepwbGKZsUJPeztTm5jUPyn/ULxQ05ozpqTkiQIDAQAB",
+  "permissions": ["storage", "alarms", "unlimitedStorage", "notifications", "contextMenus", "scripting", "nativeMessaging"],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://www.googleapis.com/*",
