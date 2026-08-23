@@ -34,6 +34,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 GIT_SEARCH_PATH = os.pathsep.join([
     os.environ.get("PATH", ""),
     "/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin",
+    r"C:\Program Files\Git\cmd", r"C:\Program Files (x86)\Git\cmd",
 ])
 
 PULL_TIMEOUT_S = 90
@@ -76,8 +77,13 @@ def run_git(args):
     for credentials would otherwise hang Chrome's connection to this host until
     the timeout, with nowhere to type them."""
     env = dict(os.environ)
+    # Non-interactive: fail instead of asking. Three variables because there are
+    # three ways to be asked — the terminal we don't have, an askpass helper, and
+    # (on Windows) Git Credential Manager's GUI, which the first two don't cover.
     env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_ASKPASS"] = "true"       # non-interactive: fail instead of asking
+    env["GCM_INTERACTIVE"] = "Never"
+    if os.name != "nt":
+        env["GIT_ASKPASS"] = "true"
     env.setdefault("PATH", GIT_SEARCH_PATH)
     proc = subprocess.run(
         [git_bin(), "-C", REPO_DIR] + args,

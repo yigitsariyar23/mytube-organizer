@@ -93,8 +93,16 @@ Details worth knowing:
   hanging), and the browser will only start it for this extension's id — which
   the installer computes from the checkout path and prints, so you can compare
   it with `chrome://extensions` and re-run with `--id <id>` if it differs.
-- `bash native-host/install.sh --uninstall` removes it. On Windows the host
-  manifest lives in the registry instead — see Chrome's native messaging docs.
+- `bash native-host/install.sh --uninstall` removes it.
+- **On Windows**, run the same command from **Git Bash** (not WSL — it has to
+  reach the Windows registry and the Windows browser install). Windows browsers
+  look a host up in `HKCU\Software\<vendor>\NativeMessagingHosts` rather than in
+  a profile directory, and they can't launch a `.py` on their own, so the
+  installer also writes a small `.bat` next to the host and points the
+  registration at that. Both files are generated per machine and gitignored.
+  Compare the printed extension id with `chrome://extensions` here especially:
+  the Windows id is hashed from the path in a different encoding, so if it
+  doesn't match, re-run with `--id`.
 
 The stamp is written automatically by a commit hook. Enable it once per clone:
 

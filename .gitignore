@@ -4,6 +4,11 @@ scraped-ids.txt
 csv-ids.txt
 check-missing.sh
 
+# Written by native-host/install.sh on Windows: which Python launcher exists and
+# where this checkout sits are per-machine facts, so neither file is shared.
+native-host/mytube-updater.bat
+native-host/com.mytube.organizer.updater.json
+
 # OS / editor noise
 .DS_Store
 
