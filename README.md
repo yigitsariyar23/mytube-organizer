@@ -200,12 +200,15 @@ Each row's **Variables** cell holds per-channel attributes alongside its tags:
   either, or both). Click a chip to toggle it; it lights up when on. Use them to
   mark channels you're actively following versus ones you consider done.
 - **Track** — feeds this channel's new uploads into the **Videos** view (see
-  below). Toggling it on fetches that channel's recent videos right away.
+  below). Toggling it on fetches that channel's recent videos right away. It has
+  a filter chip of its own (**Tracked** / **Untracked**).
 - **Tags** — the freeform labels described above.
 
 All of these are **filterable**. The filter bar above the list shows, for the
-current folder: each used tag, each used language (with its flag), and **Active** / **Finished**
-toggles (when any channel carries them).
+current folder: each used tag, each used language (with its flag), and
+**Active** / **Finished** / **Tracked** toggles (when any channel carries them).
+**Tracked** is the quickest way to see which channels actually feed the Videos
+view — right-click it for **Untracked** to find the ones being left out.
 
 Every chip has two sides: **left-click for "only these", right-click for "not
 these"** — clicking the side it's already on switches it off. An excluded chip
@@ -256,9 +259,27 @@ the two years before it, **orange** for the two before those, and **red** for
 anything older. The buckets are computed from today's date, so they roll over on
 their own each year; a channel with no known upload date stays uncolored.
 
-Click the **Last Video** or **Videos** column headers to sort; each click
-cycles none → descending → ascending, and the choice is remembered. The list
-uses infinite scroll, rendering channels in batches of 40 as you scroll.
+Four column headers sort: **Last Video**, **Videos**, **Subs** and **Folder**.
+Each click cycles off → the column's natural first direction → the other one →
+off. For the three numeric ones that first direction is "most/newest first"; for
+**Folder** it's the sidebar's own top-to-bottom order (your custom folder order
+included, not alphabetical).
+
+Sorts **stack, and the column you clicked last becomes the primary key** — so a
+click always visibly reorders the list, and the columns you set earlier fall in
+behind it as tiebreakers. To get channels grouped by folder with the newest
+upload at the top of each group, click **Last Video** first and **Folder**
+second. When more than one column is sorting, each active header shows a rank
+digit next to its arrow (`↑1`, `↓2`) so you can see which column is doing the
+grouping. Every choice is remembered per device — sorting is never synced across
+devices.
+
+**Subs** shows the full subscriber count (`2,300`, not `2.3K`), so sorting by it
+is meaningful down to the last subscriber. Channels that hide their count, or
+that haven't been fetched with an API key yet, show `—` and sort last.
+
+The list uses infinite scroll, rendering channels in batches of 40 as you
+scroll.
 
 **Resize columns** by dragging the divider on the right edge of any column
 header. Each column has a minimum width, and your widths are remembered. When
@@ -311,7 +332,11 @@ too many channels to keep up with YouTube's own subscriptions feed.
   history, right-click it → **Fetch all videos** (or select several), or use
   **Fetch full history** in the New toolbar for every tracked channel. This needs
   an API key and can use notable quota for very large channels, but it isn't
-  capped afterward — the full history stays.
+  capped afterward — the full history stays. Channels that can't be read are
+  **named** in the result — a deleted or terminated channel reads "channel not
+  found on YouTube", one with nothing public reads "no public uploads" — and
+  they're skipped rather than marked as fetched, so a later retry still tries
+  them.
 - **RSS-powered, no quota.** Roughly the 15 latest per channel, no API key.
 - **Why not YouTube's algorithm?** No API exposes YouTube's personalized ranking
   for a subset of channels, so this feed is **chronological**. Every video opens

@@ -25,7 +25,8 @@ const VIDEO_KEEP_PER_CHANNEL = 60; // cap stored videos per tracked channel
 // Settings mirrored into the gist alongside the library: only real
 // configuration, i.e. things you'd have to set up again on a new device. The
 // **view preferences are deliberately not synced** — `sortDate`, `sortCount`,
-// `folderSort`, `videoSort`, `currentView`, `colWidths` describe how one device
+// `sortSubs`, `sortFolder`, `sortPriority`, `folderSort`, `videoSort`,
+// `currentView`, `colWidths` describe how one device
 // is being looked at right now, and pushing them across meant a sync silently
 // re-sorted the other device's list and reported "1 setting" every time. Old
 // gists still carry them; every reader filters through this list, so they're
@@ -1273,23 +1274,39 @@ function uploadsPlaylistId(channelId) {
 
 // Look up each channel's real uploads-playlist id via channels.list
 // (contentDetails.relatedPlaylists.uploads) — the reliable source. 1 unit / 50.
+//
+// Returns `{ map, gone, error }`. The distinction between the two failure modes
+// matters, because guessing wrong here is what produced the useless "The
+// playlist identified with the request's playlistId parameter cannot be found"
+// message: an id channels.list *answers about but doesn't list* is a channel
+// that no longer exists (deleted, terminated, or a bad id from an old scan), so
+// there is no playlist to page and the UU shortcut can only 404 — those go in
+// `gone` and are never requested. An id we simply couldn't ask about (the batch
+// call itself failed: bad key, quota, network) is merely unresolved, and still
+// deserves the shortcut.
 async function resolveUploadsPlaylists(channelIds, apiKey) {
   const map = {};
+  const gone = new Set();
+  let error = null;
   for (const group of chunk(channelIds, YT_CHANNELS_BATCH)) {
     try {
       const url = `${API_BASE}/channels?part=contentDetails&id=${group.join(",")}&key=${apiKey}`;
       const res = await fetch(url);
-      if (!res.ok) continue;
+      if (!res.ok) { error = error || describeApiError(res, await res.text()); continue; }
       const data = await res.json();
+      const seen = new Set();
       for (const item of data.items || []) {
+        seen.add(item.id);
         const up = item.contentDetails?.relatedPlaylists?.uploads;
         if (up) map[item.id] = up;
       }
+      // Answered, but this id wasn't among the items: the channel is gone.
+      for (const id of group) if (!seen.has(id)) gone.add(id);
     } catch (e) {
-      /* fall back to the UU shortcut per-channel */
+      error = error || String(e?.message || e);
     }
   }
-  return map;
+  return { map, gone, error };
 }
 
 // Page through a channel's entire uploads playlist (50/page) to get ALL its
@@ -1305,8 +1322,12 @@ async function fetchAllUploads(playlistId, apiKey) {
     try { res = await fetch(url); } catch (e) { error = String(e?.message || e); break; }
     if (!res.ok) {
       const body = await res.text();
-      // A 404 here usually means the channel has no public uploads playlist.
-      error = describeApiError(res, body);
+      // A 404 means there is no such uploads playlist — the channel has no
+      // public uploads, or it's gone. The API's own wording for this ("The
+      // playlist identified with the request's playlistId parameter cannot be
+      // found") names a playlist id the user never chose and can't act on, so
+      // say it in terms of the channel instead.
+      error = res.status === 404 ? "no public uploads" : describeApiError(res, body);
       break;
     }
     const data = await res.json();
@@ -1333,13 +1354,28 @@ async function fetchAllVideosForChannels(channelIds) {
   const { channels = {} } = await chrome.storage.local.get("channels");
   const { store, seenIds } = await readVideoStore();
   const now = Date.now();
-  const result = { ok: true, hasApiKey: true, channels: 0, added: 0, total: 0, apiFailures: 0, lastError: null };
+  // `failures` is what the dashboard reports: one row per channel that came back
+  // with nothing, named, so "some requests failed" can say *which* channel and
+  // why. `apiFailures`/`lastError` stay for callers that only want a count.
+  const result = { ok: true, hasApiKey: true, channels: 0, added: 0, total: 0, apiFailures: 0, lastError: null, failures: [] };
   // Resolve real uploads-playlist ids up front (falls back to the UU shortcut).
-  const uploads = await resolveUploadsPlaylists(channelIds.filter((id) => channels[id]), apiKey);
+  const { map: uploads, gone, error: lookupError } = await resolveUploadsPlaylists(channelIds.filter((id) => channels[id]), apiKey);
+  if (lookupError) { result.apiFailures++; result.lastError = lookupError; }
   for (const id of channelIds) {
     if (!channels[id]) continue;
-    const { videos, error } = await fetchAllUploads(uploads[id] || uploadsPlaylistId(id), apiKey);
-    if (error) { result.apiFailures++; result.lastError = error; }
+    // A channel the lookup says doesn't exist has no playlist to page; asking
+    // anyway just spends quota on a guaranteed 404.
+    const { videos, error } = gone.has(id)
+      ? { videos: [], error: "channel not found on YouTube" }
+      : await fetchAllUploads(uploads[id] || uploadsPlaylistId(id), apiKey);
+    if (error) {
+      result.apiFailures++;
+      result.lastError = error;
+      result.failures.push({ id, name: channels[id].name || id, error });
+      // Don't claim the history is complete for a channel we couldn't read —
+      // `fetchedAll` exempts it from the prune cap and hides it from a retry.
+      continue;
+    }
     const before = Object.keys(store).length;
     upsertChannelVideos(store, id, videos, now);
     channels[id].fetchedAll = true;

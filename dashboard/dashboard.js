@@ -150,9 +150,27 @@ const selectedVideoIds = new Set();   // video multi-select (New / Watch Later)
 let videoSelectionAnchor = null;      // shift-range pivot for video cards
 let filterActive = "";             // "" = off, "only" = active, "not" = inactive (active:false)
 let filterFinished = "";           // "" = off, "only" = finished, "not" = unfinished
+let filterTracked = "";            // "" = off, "only" = tracked, "not" = untracked
 let searchQuery = "";
 let sortDate = "desc"; // "desc" (newest first) | "asc" (oldest first) | "none"
 let sortCount = "none"; // "none" | "desc" (most first) | "asc" (fewest first)
+let sortSubs = "none"; // "none" | "desc" (most subscribers first) | "asc"
+let sortFolder = "none"; // "none" | "asc" (sidebar order, top first) | "desc" (reversed)
+
+// Which sort key wins when several are on. The list is **click order, most
+// recent first** — with four sortable columns a fixed priority makes the lower
+// ones useless (grouping by folder is only worth anything if folder can be the
+// *primary* key and date the tiebreaker within it). Clicking a header on moves
+// it to the front; keys sitting on "none" are skipped, so turning one off
+// leaves the rest in the order the user built. Persisted so a reload doesn't
+// silently reshuffle the same four columns into a different arrangement.
+const SORT_KEYS = ["date", "count", "subs", "folder"];
+let sortPriority = [...SORT_KEYS];
+
+// The direction each column takes on its *first* click. "Most/newest first" is
+// what a click on a number or a date means everywhere; for Folder the useful
+// first click is the sidebar's own top-to-bottom order, which is ascending.
+const SORT_FIRST_DIR = { date: "desc", count: "desc", subs: "desc", folder: "asc" };
 let folderSort = "custom"; // "custom" | "alpha" | "count"
 const collapsedFolders = new Set();    // collapsed parent channel folders
 const collapsedVideoLists = new Set(); // collapsed parent Watch Later lists
@@ -176,7 +194,9 @@ let scrollObserver = null;
 // no horizontal scroll. Widths persist as `colWidths`; null means "use the
 // default fluid template" until the user first drags a divider.
 let colWidths = null;                         // [c1..c5] px, or null
-const COL_MINS = [160, 84, 52, 52, 180];      // min px for the five sized columns
+const COL_MINS = [160, 84, 52, 78, 180];      // min px for the five sized columns
+                                              // (Subs holds a full grouped number, so it needs
+                                              //  more than the compact "2.3K" it used to show)
 const COL_FLEX_MIN = 110;                     // min px for the flexible Folder column
 const COL_GAP = 16;                           // must match the grid `gap`
 const COL_PAD_X = 28;                         // .list-table-header horizontal padding (14*2)
@@ -382,7 +402,8 @@ async function loadState() {
   const data = await chrome.storage.local.get([
     "channels", "folders", "tags", "videos", "videoFolders", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
     "pendingPlaylistImport",
-    "sortDate", "sortCount", "folderSort", "languages", "currentView", "colWidths", "videoSort",
+    "sortDate", "sortCount", "sortSubs", "sortFolder", "sortPriority",
+    "folderSort", "languages", "currentView", "colWidths", "videoSort",
   ]);
   state.channels = data.channels || {};
   state.folders = data.folders || defaultFolders();
@@ -401,6 +422,13 @@ async function loadState() {
   state.pendingPlaylistImport = data.pendingPlaylistImport || null;
   sortDate = data.sortDate === "asc" || data.sortDate === "none" ? data.sortDate : "desc";
   sortCount = data.sortCount === "desc" || data.sortCount === "asc" ? data.sortCount : "none";
+  sortSubs = data.sortSubs === "desc" || data.sortSubs === "asc" ? data.sortSubs : "none";
+  sortFolder = data.sortFolder === "desc" || data.sortFolder === "asc" ? data.sortFolder : "none";
+  // Keep only known keys, then append any the stored list predates — an older
+  // build's `sortPriority` has no "subs"/"folder" in it, and a key missing from
+  // the priority list would never be compared at all.
+  const storedPriority = Array.isArray(data.sortPriority) ? data.sortPriority.filter((k) => SORT_KEYS.includes(k)) : [];
+  sortPriority = [...new Set([...storedPriority, ...SORT_KEYS])];
   folderSort = ["alpha", "count-desc", "count-asc"].includes(data.folderSort) ? data.folderSort : "custom";
   LANGUAGES = Array.isArray(data.languages) && data.languages.length ? data.languages : [...DEFAULT_LANGUAGES];
   colWidths = Array.isArray(data.colWidths) && data.colWidths.length === COL_MINS.length
@@ -861,12 +889,30 @@ async function fetchAllVideos(channelIds) {
   if (res?.ok) {
     el.statusText.textContent =
       `Fetched ${res.total} video${res.total === 1 ? "" : "s"} from ${res.channels} channel${res.channels === 1 ? "" : "s"}` +
-      (res.lastError ? ` — some requests failed: ${res.lastError}` : ".");
+      (res.failures?.length ? ` — ${describeFetchFailures(res.failures)}`
+        : res.lastError ? ` — some requests failed: ${res.lastError}` : ".");
   } else if (res && res.hasApiKey === false) {
     el.statusText.textContent = "Fetching all videos needs an API key (set one in Settings).";
   } else {
     el.statusText.textContent = "Fetch failed.";
   }
+}
+
+// Name the channels a deep fetch couldn't read. The API's own wording for the
+// common case points at a playlist id the user never chose ("The playlist
+// identified with the request's playlistId parameter cannot be found"), which
+// says nothing about which of the channels being fetched is the problem — so
+// report it per channel, and list only the first few to keep the status line
+// one line long.
+const FETCH_FAILURE_NAMES = 3;
+
+function describeFetchFailures(failures) {
+  const shown = failures.slice(0, FETCH_FAILURE_NAMES)
+    .map((f) => `“${f.name}” (${f.error})`)
+    .join(", ");
+  const rest = failures.length - FETCH_FAILURE_NAMES;
+  return `skipped ${failures.length} channel${failures.length === 1 ? "" : "s"}: ` +
+    shown + (rest > 0 ? `, and ${rest} more` : "") + ".";
 }
 
 // ---------- Resizable table columns ----------
@@ -1254,8 +1300,9 @@ function renderTagFilters() {
   const langs = [...new Set(channelsInFolder.map((c) => c.language).filter(Boolean))].sort();
   const hasActive = channelsInFolder.some((c) => c.active);
   const hasFinished = channelsInFolder.some((c) => c.finished);
+  const hasTracked = channelsInFolder.some((c) => c.trackVideos);
 
-  bar.hidden = tagEntries.length === 0 && langs.length === 0 && !hasActive && !hasFinished;
+  bar.hidden = tagEntries.length === 0 && langs.length === 0 && !hasActive && !hasFinished && !hasTracked;
   if (bar.hidden) return;
 
   const label = document.createElement("span");
@@ -1312,6 +1359,18 @@ function renderTagFilters() {
     chip.textContent = filterFinished === "not" ? "Unfinished" : "Finished";
     chip.title = "Left click: only finished channels · right click: only unfinished ones";
     chip.dataset.role = "filter-finished";
+    bar.appendChild(chip);
+  }
+  // Tracked: the same two-sided chip for the flag that decides which channels
+  // feed the New tab. Its "not" side is the useful one — it's how you find the
+  // channels a full-history fetch or the feed is silently skipping.
+  if (hasTracked) {
+    const chip = document.createElement("span");
+    const cls = filterTracked === "only" ? " on-track" : filterTracked === "not" ? " off-track" : "";
+    chip.className = "tag-chip var-toggle" + cls;
+    chip.textContent = filterTracked === "not" ? "Untracked" : "Tracked";
+    chip.title = "Left click: only tracked channels · right click: only untracked ones";
+    chip.dataset.role = "filter-tracked";
     bar.appendChild(chip);
   }
 }
@@ -1398,6 +1457,7 @@ function resetVariableFilters() {
   excludedLangFilters.clear();
   filterActive = "";
   filterFinished = "";
+  filterTracked = "";
 }
 
 // The one rule every filter chip follows: **left click means "only these",
@@ -1593,6 +1653,7 @@ function anyFilterActive() {
     excludedLangFilters.size > 0 ||
     filterActive !== "" ||
     filterFinished !== "" ||
+    filterTracked !== "" ||
     filterMinCount !== null ||
     filterMaxCount !== null ||
     !!filterAfterDate ||
@@ -1657,6 +1718,11 @@ function getFilteredChannels() {
   } else if (filterFinished === "not") {
     list = list.filter((c) => !c.finished);
   }
+  if (filterTracked === "only") {
+    list = list.filter((c) => c.trackVideos);
+  } else if (filterTracked === "not") {
+    list = list.filter((c) => !c.trackVideos);
+  }
   const q = searchQuery.trim().toLowerCase();
   if (q) {
     list = list.filter(
@@ -1675,37 +1741,77 @@ function getFilteredChannels() {
   if (filterBeforeDate) {
     list = list.filter((c) => c.lastVideoDate && c.lastVideoDate <= filterBeforeDate);
   }
+  folderOrderIndex = buildFolderOrderIndex();
   list.sort(compareChannels);
   return list;
 }
 
-// When enabled, last video date is the primary key; video count is applied
-// next (as the sole key if date sorting is off, otherwise as a tiebreaker).
-function compareChannels(a, b) {
-  if (sortDate !== "none") {
-    const dateDir = sortDate === "asc" ? 1 : -1;
+function sortDirOf(key) {
+  return key === "date" ? sortDate : key === "count" ? sortCount : key === "subs" ? sortSubs : sortFolder;
+}
+
+function setSortDirOf(key, dir) {
+  if (key === "date") sortDate = dir;
+  else if (key === "count") sortCount = dir;
+  else if (key === "subs") sortSubs = dir;
+  else sortFolder = dir;
+}
+
+// Folder id → its position in the sidebar, so "sort by folder" reproduces the
+// order the sidebar and the row's dropdown already show (custom order included)
+// instead of inventing an alphabetical one that matches neither. Rebuilt per
+// filter pass, since a rename or a drag changes it.
+let folderOrderIndex = {};
+
+function buildFolderOrderIndex() {
+  const index = {};
+  buildOrderedFolderList().forEach(({ id }, i) => (index[id] = i));
+  return index;
+}
+
+// The per-key comparators. Each returns a negative/positive number in ASCENDING
+// order; `compareChannels` applies the direction. A missing value sorts as -1 /
+// last-in-the-sidebar so "no data" never lands in the middle of real numbers.
+const SORT_COMPARATORS = {
+  date: (a, b) => {
     const da = a.lastVideoDate || "";
     const db = b.lastVideoDate || "";
-    const dateCmp = da < db ? -1 : da > db ? 1 : 0;
-    if (dateCmp !== 0) return dateDir * dateCmp;
-  }
+    return da < db ? -1 : da > db ? 1 : 0;
+  },
+  count: (a, b) => (a.videoCount ?? -1) - (b.videoCount ?? -1),
+  subs: (a, b) => (a.subscriberCount ?? -1) - (b.subscriberCount ?? -1),
+  folder: (a, b) => folderRank(a) - folderRank(b),
+};
 
-  if (sortCount !== "none") {
-    const countDir = sortCount === "asc" ? 1 : -1;
-    const ca = a.videoCount ?? -1;
-    const cb = b.videoCount ?? -1;
-    if (ca !== cb) return countDir * (ca - cb);
+function folderRank(ch) {
+  const idx = folderOrderIndex[ch.folderId || "unsorted"];
+  return idx === undefined ? Number.MAX_SAFE_INTEGER : idx;
+}
+
+// Apply every enabled sort key in `sortPriority` order (most recently clicked
+// header first), falling through to the next one on a tie.
+function compareChannels(a, b) {
+  for (const key of sortPriority) {
+    const dir = sortDirOf(key);
+    if (dir === "none") continue;
+    const cmp = SORT_COMPARATORS[key](a, b);
+    if (cmp !== 0) return (dir === "asc" ? 1 : -1) * cmp;
   }
   return 0;
 }
 
+// Each active header shows its direction, plus its rank (1, 2, …) whenever more
+// than one column is sorting — with click-order priority, an arrow alone can't
+// say which column is actually grouping the list.
 function updateSortHeaders() {
   const ARROWS = { none: "", desc: " ↓", asc: " ↑" };
+  const active = sortPriority.filter((k) => sortDirOf(k) !== "none");
   for (const col of el.listTableHeader.querySelectorAll(".lth-sort-col")) {
     const key = col.dataset.sort;
-    const val = key === "date" ? sortDate : sortCount;
+    const val = sortDirOf(key);
+    const rank = active.indexOf(key);
     const arrow = col.querySelector(".lth-arrow");
-    arrow.textContent = ARROWS[val] || "";
+    arrow.textContent = (ARROWS[val] || "") + (active.length > 1 && rank >= 0 ? String(rank + 1) : "");
     col.classList.toggle("lth-active", val !== "none");
   }
 }
@@ -1887,11 +1993,12 @@ function formatDateTime(iso) {
 
 // Compact subscriber count for the list, e.g. 1.2M / 45.3K / 812. null means
 // hidden or not-yet-fetched (needs an API key) and shows as an em dash.
+// The full number, grouped ("2,300", not "2.3K"). Rounding to one decimal made
+// every channel in a band read the same — "2.3K" covers a 50-subscriber spread
+// — which is useless in a column you can now sort by.
 function formatSubscribers(n) {
   if (n === null || n === undefined) return "—";
-  if (n >= 1_000_000) return trimZero(n / 1_000_000) + "M";
-  if (n >= 1_000) return trimZero(n / 1_000) + "K";
-  return String(n);
+  return n.toLocaleString();
 }
 
 function trimZero(x) {
@@ -2614,6 +2721,8 @@ function bindEvents() {
       filterActive = toggleTriState(filterActive, negative);
     } else if (role === "filter-finished") {
       filterFinished = toggleTriState(filterFinished, negative);
+    } else if (role === "filter-tracked") {
+      filterTracked = toggleTriState(filterTracked, negative);
     } else {
       return false;
     }
@@ -2865,14 +2974,16 @@ function bindEvents() {
     const col = e.target.closest(".lth-sort-col");
     if (!col) return;
     const key = col.dataset.sort;
-    const CYCLE = { none: "desc", desc: "asc", asc: "none" };
-    if (key === "date") {
-      sortDate = CYCLE[sortDate];
-      chrome.storage.local.set({ sortDate });
-    } else {
-      sortCount = CYCLE[sortCount];
-      chrome.storage.local.set({ sortCount });
-    }
+    // off → the column's natural first direction → the other one → off.
+    const first = SORT_FIRST_DIR[key];
+    const other = first === "desc" ? "asc" : "desc";
+    const current = sortDirOf(key);
+    const next = current === "none" ? first : current === first ? other : "none";
+    setSortDirOf(key, next);
+    // Turning a column on makes it the primary key; turning it off leaves the
+    // remaining columns in the order they were already in.
+    if (next !== "none") sortPriority = [key, ...sortPriority.filter((k) => k !== key)];
+    chrome.storage.local.set({ sortDate, sortCount, sortSubs, sortFolder, sortPriority });
     renderGrid();
   });
 

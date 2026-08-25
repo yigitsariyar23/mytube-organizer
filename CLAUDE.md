@@ -98,8 +98,11 @@ lastSyncCheckAt                                               // epoch ms of the
                                                               //   (throttle only; per-device, never synced)
 languages                                                     // string[] — editable language dropdown set (Settings, or
                                                               //   "+ New language…" in the right-click language submenu)
-sortDate, sortCount, folderSort, currentView                  // persisted UI prefs ("channels"|"new"|"watchlater");
-                                                              //   per-device — deliberately NOT synced
+sortDate, sortCount, sortSubs, sortFolder, sortPriority,       // one direction per sortable channel-list
+  folderSort, currentView                                     //   column ("none"|"asc"|"desc") plus their
+                                                              //   click-order priority; and the other
+                                                              //   persisted UI prefs ("channels"|"new"|
+                                                              //   "watchlater"). Per-device — NOT synced
 colWidths                                                    // number[5] | absent — resized px widths of the 5 sized table columns
 pendingScan: { scannedAt, scannedCount, unresolved, added[], modified[], removed[] }
               // a scan awaiting review; never applied to `channels` until confirmed, never synced
@@ -130,7 +133,7 @@ and reply through `sendResponse` (async, so each returns `true`).
 | `REFRESH_SINGLE` | `{ channelId }` | `{ ok }` |
 | `FILL_MISSING_AVATARS` | — | `{ ok, hasApiKey, missingBefore, thumbsFilled, missingAfter, apiFailures, lastError }` |
 | `FILL_VIDEO_DETAILS` | — | `{ ok, hasApiKey, queried, filled, apiFailures, lastError }` (fills video length/views) |
-| `FETCH_ALL_VIDEOS` | `{ channelIds }` | `{ ok, hasApiKey, channels, total, added, apiFailures, lastError }` (deep-fetch full upload history) |
+| `FETCH_ALL_VIDEOS` | `{ channelIds }` | `{ ok, hasApiKey, channels, total, added, apiFailures, lastError, failures[] }` (deep-fetch full upload history; `failures` = `{ id, name, error }` per skipped channel) |
 | `PLAYLIST_SCAN_RESULT` | `{ playlistId, title, videos, statedCount, scrapedCount }` (from the injected scraper) | `{ ok, count }`; stashes `pendingPlaylistImport`, opens dashboard |
 | `APPLY_PLAYLIST_IMPORT` | `{ listName, moveIds }` | `{ ok, listId, added, moved }` (creates a Watch Later list, saves the reviewed playlist into it) |
 | `DISCARD_PLAYLIST_IMPORT` | — | `{ ok }` (clears `pendingPlaylistImport`) |
@@ -239,6 +242,20 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     job survives a worker restart), then runs `fillVideoDetails`. Triggered
     per-channel/bulk (channel right-click → "Fetch all videos") or globally
     ("Fetch full history" in the New toolbar, over all tracked channels).
+    **A channel that can't be read is named, not blamed on a playlist id.**
+    `resolveUploadsPlaylists` returns `{ map, gone, error }`: an id the lookup
+    *answered about but didn't list* is a channel that no longer exists
+    (deleted, terminated, or a stale id from an old scan), so it goes in `gone`
+    and is never requested — the `UU` shortcut could only 404 there, and the
+    API's reply ("The playlist identified with the request's `playlistId`
+    parameter cannot be found") names an id the user never chose and can't act
+    on. An id the lookup *couldn't ask about* (the batch call itself failed) is
+    merely unresolved and still gets the shortcut; that batch error surfaces as
+    `error`. A 404 from `playlistItems` is reported as "no public uploads".
+    Each skipped channel lands in `result.failures` as `{ id, name, error }`,
+    which the dashboard's `describeFetchFailures` renders by name. A failed
+    channel is **not** marked `fetchedAll` — claiming a history is complete
+    when it wasn't read exempts it from the prune cap and hides it from a retry.
   - **Watch Later.** Saved videos (`saved:true`) organized into `videoFolders`
     (a second, independent folder tree with the *same* nesting/drag/emoji/rename
     rules as channel folders). Its own list sidebar; a video's `folderId` is its
@@ -342,8 +359,8 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   full-history dumps included, not just the user-touched subset), and a `settings`
   blob — `SYNC_SETTING_KEYS`, which is now just `apiKey` and `languages`: real
   configuration you'd otherwise re-enter on a new device. The **view preferences
-  are not synced** (`sortDate`, `sortCount`, `folderSort`, `videoSort`,
-  `currentView`, `colWidths`) — they say how one device is being looked at right
+  are not synced** (`sortDate`, `sortCount`, `sortSubs`, `sortFolder`,
+  `sortPriority`, `folderSort`, `videoSort`, `currentView`, `colWidths`) — they say how one device is being looked at right
   now, and syncing them re-sorted the other device's list and put a pointless
   "1 setting" row in every review. Old gists still carry them; readers filter
   through `SYNC_SETTING_KEYS`, so they're ignored and drop out on the next
@@ -493,7 +510,13 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   into the same place). Tags and languages therefore keep **two** sets each
   (`activeTagFilters`/`excludedTagFilters`, `activeLangFilters`/
   `excludedLangFilters`) and every one of them has to be reset in
-  `resetVariableFilters` and counted in `anyFilterActive`. This replaced a
+  `resetVariableFilters` and counted in `anyFilterActive`. The string-backed set
+  is `filterActive`/`filterFinished`/`filterTracked` (Tracked = the
+  `trackVideos` flag), and each one is five edits, not one: the `let`, the
+  `has*` guard + chip in `renderTagFilters`, the `activateFilterChip` branch,
+  the `.filter()` in the grid, `resetVariableFilters`, and `anyFilterActive` —
+  miss either of the last two and the chip survives a folder switch or keeps
+  "Clear filters" hidden while it's still hiding rows. This replaced a
   one-button cycle (off → only → not) that could only be reversed by clicking
   through, and that tags/languages never had at all. Because right-click is now
   filter UI, the tag rename/delete menu moved to **shift**+right-click.
@@ -516,6 +539,35 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   current folder + filters match nothing — with a **Clear filters** button
   (`clearAllFilters()`) shown only when `anyFilterActive()`. An empty folder with
   no filters shows the same panel with a "folder is empty" message and no button.
+- **The channel list sorts on four columns, by click order.** Last Video,
+  Videos, Subs and Folder each cycle off → their natural first direction →
+  the other → off (`SORT_FIRST_DIR`: newest/most first for the three numeric
+  ones, sidebar order first for Folder). Priority is **not fixed** — turning a
+  column on moves it to the front of `sortPriority` (so "group by folder, newest
+  first inside each" is Last Video *then* Folder — the later click wins). Newest
+  click first, rather than appending as a tiebreaker, because appending makes a
+  click on an already-outranked column do nothing visible; this way every click
+  reorders the list. A fixed priority list was the old behavior
+  (date, then count) and it makes every column but the first useless: grouping by
+  folder is only worth anything when folder can be the *primary* key. The header
+  arrow therefore carries a rank digit whenever more than one column is active,
+  since an arrow alone can't say which column is doing the grouping. Adding a
+  fifth sortable column means: a `let`, an entry in `SORT_KEYS`, `SORT_FIRST_DIR`
+  and `SORT_COMPARATORS`, a branch in `sortDirOf`/`setSortDirOf`, the
+  `data-sort` attribute in `dashboard.html`, and the `chrome.storage.local.set`
+  in the header click handler. `sortPriority` is filtered against `SORT_KEYS` on
+  load and any missing key appended — a key absent from the priority list would
+  never be compared at all, which is exactly what an older build's stored list
+  would have done to the new columns.
+  - **Folder sorts by sidebar position, not name.** `buildFolderOrderIndex()`
+    ranks folders by `buildOrderedFolderList()`, the same order the sidebar and
+    the row's dropdown already show — so a custom drag order is respected.
+    Alphabetical would match neither. The index is rebuilt each filter pass
+    (a rename or a drag changes it), and an unknown `folderId` sorts last.
+- **Subs shows the whole number.** `formatSubscribers` used to compact to one
+  decimal ("2.3K"), which collapsed a ~50-subscriber spread into one string —
+  fine as a glance, useless in a column you can sort by. It's `toLocaleString()`
+  now, which is why the Subs column's default width and `COL_MINS[3]` went up.
 - **Single view only.** The grid renders one way (the list/table view in
   `buildChannelRow`); there's no card/grid alternative. `renderGrid()` still
   hard-wires the `list-view` class, so reintroducing a toggle later is cheap.
