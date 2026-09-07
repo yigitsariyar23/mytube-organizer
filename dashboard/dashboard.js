@@ -835,16 +835,11 @@ async function saveVideos() {
   await chrome.storage.local.set({ videos: state.videos });
 }
 
-// Open a video on YouTube (where its own algorithm drives autoplay / up-next)
-// and mark it watched. The storage write re-renders the feed via onChanged.
+// Open a video on YouTube without changing its watched state.
 function openVideo(videoId, background) {
   const v = state.videos[videoId];
   if (!v) return;
   chrome.tabs.create({ url: `https://www.youtube.com/watch?v=${videoId}`, active: !background });
-  if (!v.watched) {
-    v.watched = true;
-    saveVideos();
-  }
 }
 
 // Remove a video from Watch Later: clear `saved` and its list. A tracked

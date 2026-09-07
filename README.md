@@ -302,6 +302,9 @@ Row interactions:
 
 ## Videos: New and Watch Later
 
+Opening a video in either view (left-click or middle-click) keeps its watched
+status unchanged. Use **Mark watched** or **Mark all watched** to update it manually.
+
 Two tabs at the top of the sidebar list videos, each for a different job.
 
 ### New
@@ -365,7 +368,7 @@ rename/delete). Independent of the New feed.
 - **Organize into lists.** Saved videos start in **Unfiled**. Create lists with
   **+ New list**, nest them one level deep, and right-click a video → **Move to
   list**. Right-click a list to rename, set an emoji, add a sub-list, or delete.
-- **Watch & clean up.** Click a video to open it on YouTube (marked **watched**);
+- **Watch & clean up.** Click a video to open it on YouTube;
   **Remove** takes it out of Watch Later. The **Sort** (date/length), **Unwatched**
   chip, and **Mark all watched** controls work here too. View count shows on each
   card; duration shows when an API key is set.
