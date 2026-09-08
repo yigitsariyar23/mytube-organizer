@@ -1,3 +1,5 @@
+import { RECORD_KEYS, VIDEO_FLAGS, isPlaylistOverlayTitle, applyRecordPatch, same, clone, validateBackup, makeBackup, backupCounts, stableStringify } from "./shared/library.js";
+
 // background.js — MV3 service worker (module)
 // Storage schema:
 //   channels: { [channelId]: { id, name, handle, thumbnail, folderId, tags:[tagId,...],
@@ -37,13 +39,6 @@ const VIDEO_KEEP_PER_CHANNEL = 60; // cap stored videos per tracked channel
 // per-device bookkeeping. `pendingScan`/`pendingPlaylistImport` are excluded
 // too — an in-flight review on one device isn't library state.
 const SYNC_SETTING_KEYS = ["apiKey", "languages"];
-
-async function readLocalSettings() {
-  const data = await chrome.storage.local.get(SYNC_SETTING_KEYS);
-  const out = {};
-  for (const k of SYNC_SETTING_KEYS) if (data[k] !== undefined) out[k] = data[k];
-  return out;
-}
 
 // Non-empty local values win; otherwise adopt remote. Lets a fresh device pull
 // the apiKey and language set while an actively-edited device keeps its own.
@@ -91,6 +86,104 @@ function notifyTrackedUpdates(updated) {
   }
 }
 
+// All library writes pass through this queue. Network enrichment runs outside it.
+let libraryWrites = Promise.resolve();
+function withLibraryWrite(work) {
+  const job = libraryWrites.then(work);
+  libraryWrites = job.catch(() => {});
+  return job;
+}
+
+async function patchLibrary(patches) {
+  return withLibraryWrite(async () => {
+    const keys = Object.keys(patches).filter(k => RECORD_KEYS.includes(k));
+    const data = await chrome.storage.local.get(keys);
+    for (const key of keys) {
+      data[key] ||= {};
+      applyRecordPatch(data[key], patches[key], { videos: key === 'videos' });
+    }
+    await chrome.storage.local.set(data);
+    const videoStates = Object.fromEntries((patches.videos || []).filter(change => data.videos?.[change.id]).map(change =>
+      [change.id, Object.fromEntries(VIDEO_FLAGS.map(key => [key, data.videos[change.id][key] ?? null]))]));
+    return { ok: true, videoStates };
+  });
+}
+
+async function undoVideos(changes) {
+  return withLibraryWrite(async () => {
+    const { videos = {} } = await chrome.storage.local.get('videos');
+    const fields = VIDEO_FLAGS.filter(k => k !== 'userStateAt');
+    const expectedFields = VIDEO_FLAGS;
+    for (const change of changes) {
+      const current = videos[change.id];
+      if (!current || expectedFields.some(k => !same(current[k] ?? null, change.after[k] ?? null))) {
+        throw new Error('These videos changed again. Use Removed videos or their current controls to make a new change.');
+      }
+    }
+    for (const change of changes) {
+      const current = videos[change.id];
+      for (const key of fields) {
+        if (change.before[key] == null) delete current[key]; else current[key] = change.before[key];
+      }
+      current.userStateAt = Math.max(Date.now(), (current.userStateAt || 0) + 1);
+    }
+    await chrome.storage.local.set({ videos });
+    return { ok: true };
+  });
+}
+
+async function snapshotLibrary(reason, data) {
+  data ||= await chrome.storage.local.get([...RECORD_KEYS, 'languages', 'apiKey']);
+  const { libraryBackups = [] } = await chrome.storage.local.get('libraryBackups');
+  const backup = { ...makeBackup(data, reason), id: crypto.randomUUID(), apiKey: data.apiKey ?? '' };
+  await chrome.storage.local.set({ libraryBackups: [backup, ...libraryBackups].slice(0, 5) });
+  return backup;
+}
+
+async function exportBackup() {
+  const data = await chrome.storage.local.get([...RECORD_KEYS, 'languages']);
+  return { ok: true, backup: makeBackup(data) };
+}
+
+async function listBackups() {
+  const { libraryBackups = [] } = await chrome.storage.local.get('libraryBackups');
+  return { ok: true, backups: libraryBackups.map(b => ({ id: b.id, createdAt: b.createdAt, reason: b.reason, counts: backupCounts(b) })) };
+}
+
+async function restoreBackup(input, backupId) {
+  return withLibraryWrite(async () => {
+    let saved;
+    if (backupId) {
+      const { libraryBackups = [] } = await chrome.storage.local.get('libraryBackups');
+      saved = libraryBackups.find(b => b.id === backupId);
+      if (!saved) throw new Error('This snapshot is no longer available. Refresh the snapshot list.');
+      input = saved;
+    }
+    const backup = validateBackup(input);
+    await snapshotLibrary('Before restoring a backup');
+    const { libraryEpoch = 0 } = await chrome.storage.local.get('libraryEpoch');
+    // A restore is an explicit local decision, so it also survives the next video sync.
+    const now = Date.now();
+    const { videos: current = {} } = await chrome.storage.local.get('videos');
+    for (const v of Object.values(backup.library.videos)) v.userStateAt = Math.max(now, (current[v.id]?.userStateAt || 0) + 1);
+    await chrome.storage.local.set({ ...backup.library, ...backup.settings,
+      ...(saved ? { apiKey: saved.apiKey } : {}), libraryEpoch: libraryEpoch + 1 });
+    await chrome.storage.local.remove(['pendingScan', 'pendingPlaylistImport', 'lastSyncCheckAt']);
+    return { ok: true };
+  });
+}
+
+async function clearLibrary() {
+  return withLibraryWrite(async () => {
+    await snapshotLibrary('Before clearing the library');
+    const { libraryEpoch = 0 } = await chrome.storage.local.get('libraryEpoch');
+    await chrome.storage.local.set({ channels: {}, folders: { unsorted: { name: HOME_FOLDER_NAME, order: 0 } },
+      tags: {}, videos: {}, videoFolders: { unsorted: { name: HOME_FOLDER_NAME, order: 0 } }, libraryEpoch: libraryEpoch + 1 });
+    await chrome.storage.local.remove(['pendingScan', 'pendingPlaylistImport', 'lastSyncedAt', 'lastSyncCheckAt']);
+    return { ok: true };
+  });
+}
+
 // ---------- Setup ----------
 
 // The pinned home folder's label. The *id* stays "unsorted" — it's a storage
@@ -109,7 +202,7 @@ function renameHomeFolder(folders) {
   return true;
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
+chrome.runtime.onInstalled.addListener(() => withLibraryWrite(async () => {
   const data = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
   if (!data.channels) await chrome.storage.local.set({ channels: {} });
   else await repairDoubledNames(data.channels);
@@ -135,7 +228,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: REFRESH_PERIOD_MIN });
   setupContextMenus();
-});
+}));
 
 // The context menus also need (re)creating when the worker cold-starts, not only
 // on install — onInstalled doesn't fire on browser restart / worker wake.
@@ -231,58 +324,37 @@ function extractPlaylistId(url) {
 // Add a video to the Watch Later store. Title/author come from YouTube's public
 // oEmbed endpoint (no API key, no quota); the thumbnail is derived from the id.
 async function saveVideoToWatchLater(videoId) {
-  const { videos = {}, videoFolders = {} } = await chrome.storage.local.get(["videos", "videoFolders"]);
-  if (!videoFolders.unsorted) videoFolders.unsorted = { name: HOME_FOLDER_NAME, order: 0 };
-
-  const existing = videos[videoId];
-  if (existing && existing.saved) {
-    notify("mytube-save", "Already saved", existing.title || "This video is already in Watch Later.");
-    return;
-  }
-
-  let title = existing?.title || `Video ${videoId}`;
-  let author = existing?.author || null;
-  let channelId = existing?.channelId || null;
+  const result = await withLibraryWrite(async () => {
+    const { videos = {}, videoFolders = {} } = await chrome.storage.local.get(['videos', 'videoFolders']);
+    if (videos[videoId]?.saved) return { already: true, title: videos[videoId].title };
+    videoFolders.unsorted ||= { name: HOME_FOLDER_NAME, order: 0 };
+    const existing = videos[videoId] || {};
+    videos[videoId] = { ...existing, id: videoId, title: existing.title || `Video ${videoId}`,
+      thumbnail: existing.thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      watched: !!existing.watched, saved: true, folderId: existing.folderId || 'unsorted',
+      userStateAt: Math.max(Date.now(), (existing.userStateAt || 0) + 1), addedAt: existing.addedAt || Date.now() };
+    await chrome.storage.local.set({ videos, videoFolders });
+    return { title: videos[videoId].title };
+  });
+  if (result.already) { notify('mytube-save', 'Already saved', result.title); return; }
+  notify('mytube-save', 'Saved to Watch Later', result.title);
+  const { store, seenIds } = await readVideoStore();
+  const video = store[videoId];
+  if (!video) return;
   try {
-    const res = await fetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
-    );
+    const res = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, { signal: AbortSignal.timeout(15000) });
     if (res.ok) {
       const meta = await res.json();
-      if (meta.title) title = meta.title;
-      if (meta.author_name) author = meta.author_name;
-      // author_url is sometimes the /channel/UC… form (else a /@handle we can't
-      // resolve without the API); grab the id when it's there.
-      const idm = (meta.author_url || "").match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
-      if (idm && !channelId) channelId = idm[1];
+      if (meta.title) video.title = meta.title;
+      if (meta.author_name) video.author = meta.author_name;
+      if (meta.author_url) video.channelUrl = meta.author_url;
+      const match = (meta.author_url || '').match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
+      if (match && !video.channelId) video.channelId = match[1];
     }
-  } catch (e) {
-    // Keep the fallback title; the save still succeeds offline.
-  }
-
-  videos[videoId] = {
-    ...(existing || {}),
-    id: videoId,
-    channelId,
-    title,
-    author,
-    published: existing?.published || null,
-    thumbnail: existing?.thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-    viewCount: existing?.viewCount ?? null,
-    watched: existing?.watched || false,
-    saved: true,
-    folderId: existing?.folderId || "unsorted",
-    userStateAt: Date.now(), // see USER_VIDEO_FLAGS — sync resolves this last-writer-wins
-    addedAt: existing?.addedAt || Date.now(),
-  };
-  // Fill length + view count immediately if an API key is set (duration isn't
-  // available any other way); otherwise the card just shows no length.
-  const { apiKey } = await chrome.storage.local.get("apiKey");
-  if (apiKey && videos[videoId].duration === undefined) {
-    await fillVideoDetails(videos, apiKey, [videoId]);
-  }
-  await chrome.storage.local.set({ videos, videoFolders });
-  notify("mytube-save", "Saved to Watch Later", title);
+  } catch { /* The save has already succeeded, including offline. */ }
+  const { apiKey } = await chrome.storage.local.get('apiKey');
+  if (apiKey) await fillVideoDetails(store, apiKey, [videoId]);
+  await commitVideos(store, seenIds);
 }
 
 // ---------- Import a whole playlist into Watch Later ----------
@@ -374,23 +446,38 @@ async function scrapePlaylistInPage(playlistId) {
     return null;
   }
 
-  // Climb from a video anchor to its row and read the channel byline (name +
-  // id). The smallest ancestor that contains a channel anchor is the row, so
-  // walking up and returning at the first hit keeps us on this video's channel.
-  // Not tied to renderer tag names — matches any /channel/UC… or /@handle link.
+  // Stop at the video row: never borrow a neighboring video's byline or the
+  // playlist owner's link. Unknown identity is safer than a plausible wrong one.
   function channelFromRow(anchor) {
+    const empty = { channelId: null, channelUrl: null, author: null };
+    const videoId = (anchor.getAttribute("href") || "").match(/[?&]v=([0-9A-Za-z_-]{11})/)?.[1];
+    const row = anchor.closest('ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, yt-lockup-view-model');
     for (let node = anchor.parentElement, depth = 0; node && depth < 10; node = node.parentElement, depth++) {
-      const ch = node.querySelector('a[href^="/channel/"], a[href^="/@"], a[href^="/c/"], a[href^="/user/"]');
-      if (!ch) continue;
-      const href = ch.getAttribute("href") || "";
-      const idm = href.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
-      const name = (ch.textContent || "").replace(/\s+/g, " ").trim();
-      return { channelId: idm ? idm[1] : null, author: name || null };
+      if (node === document.body || node === document.documentElement) break;
+      const videoIds = new Set([...node.querySelectorAll('a[href*="watch?v="]')]
+        .map(a => (a.getAttribute("href") || "").match(/[?&]v=([0-9A-Za-z_-]{11})/)?.[1]).filter(Boolean));
+      if ([...videoIds].some(id => id !== videoId)) break;
+      const candidates = [...node.querySelectorAll('a[href]')].flatMap(link => {
+        try {
+          const url = new URL(link.getAttribute("href"), "https://www.youtube.com");
+          if (!["www.youtube.com", "youtube.com", "m.youtube.com"].includes(url.hostname)) return [];
+          const path = url.pathname.match(/^\/(channel\/UC[0-9A-Za-z_-]{22}|@[^/]+|c\/[^/]+|user\/[^/]+)\/?$/);
+          if (!path) return [];
+          const name = (link.textContent || "").replace(/\s+/g, " ").trim();
+          if (!name) return [];
+          return [{ channelId: path[1].startsWith("channel/") ? path[1].slice(8) : null,
+            channelUrl: "https://www.youtube.com/" + path[1], author: name }];
+        } catch { return []; }
+      });
+      const identities = new Map(candidates.map(ch => [ch.channelUrl, ch]));
+      if (identities.size === 1) return [...identities.values()][0];
+      if (identities.size > 1 || node === row) break;
     }
-    return { channelId: null, author: null };
+    return empty;
   }
 
   const byId = new Map();
+  const titleRanks = new Map();
   function collect() {
     // Not tied to renderer tag names (YouTube changes them): any anchor whose
     // href is a /watch?v=… video inside the playlist page.
@@ -399,15 +486,23 @@ async function scrapePlaylistInPage(playlistId) {
       const m = href.match(/[?&]v=([0-9A-Za-z_-]{11})/);
       if (!m) continue;
       const id = m[1];
-      const title = (a.getAttribute("title") || a.textContent || "").replace(/\s+/g, " ").trim();
+      // Thumbnail anchors contain watched badges and duration overlays, not titles.
+      // Prefer explicit title metadata or the dedicated title link. Never rank
+      // competing anchors by text length: overlays can be longer than the title.
+      const titleAttribute = a.getAttribute("title");
+      const isTitle = a.matches('a#video-title, a.yt-lockup-metadata-view-model__title, h3 a, a:has(h3)');
+      const title = ((titleAttribute || (isTitle ? a.textContent : "")) || "").replace(/\s+/g, " ").trim();
+      const titleRank = title ? (isTitle ? 2 : 1) : 0;
       const ch = channelFromRow(a);
       const cur = byId.get(id);
-      if (!cur) byId.set(id, { videoId: id, title, channelId: ch.channelId, author: ch.author });
+      if (!cur) byId.set(id, { videoId: id, title, channelId: ch.channelId, channelUrl: ch.channelUrl, author: ch.author });
       else {
-        if (title && title.length > (cur.title || "").length) cur.title = title;
+        if (titleRank > (titleRanks.get(id) || 0)) cur.title = title;
         if (!cur.channelId && ch.channelId) cur.channelId = ch.channelId;
         if (!cur.author && ch.author) cur.author = ch.author;
+        if (!cur.channelUrl && ch.channelUrl) cur.channelUrl = ch.channelUrl;
       }
+      titleRanks.set(id, Math.max(titleRanks.get(id) || 0, titleRank));
     }
   }
 
@@ -470,6 +565,7 @@ async function handlePlaylistScanResult(msg) {
       thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
       channelId: existing?.channelId || v.channelId || null,
       author: existing?.author || v.author || null,
+      channelUrl: existing?.channelUrl || v.channelUrl || null,
       status: savedElsewhere ? "savedElsewhere" : "new",
       currentFolderId: savedElsewhere ? (existing.folderId || "unsorted") : null,
     };
@@ -493,6 +589,7 @@ async function handlePlaylistScanResult(msg) {
 // playlist's videos into it. New videos always land in the new list; a video
 // already in Watch Later moves only if the user ticked it (`moveIds`).
 async function applyPlaylistImport(listName, moveIds) {
+  const result = await withLibraryWrite(async () => {
   const { pendingPlaylistImport, videos = {}, videoFolders = {}, apiKey } =
     await chrome.storage.local.get(["pendingPlaylistImport", "videos", "videoFolders", "apiKey"]);
   if (!pendingPlaylistImport) return { ok: false, error: "No pending playlist import." };
@@ -518,13 +615,14 @@ async function applyPlaylistImport(listName, moveIds) {
       folderId = listId;
       added++;
     }
-    if (existing?.duration === undefined) newIds.push(v.id);
+    newIds.push(v.id); // Recheck imported identity even when duration was already cached.
     videos[v.id] = {
       ...(existing || {}),
       id: v.id,
       channelId: existing?.channelId ?? v.channelId ?? null,
-      title: existing?.title || v.title || `Video ${v.id}`,
+      title: (isPlaylistOverlayTitle(existing?.title) ? v.title : existing?.title) || v.title || `Video ${v.id}`,
       author: existing?.author ?? v.author ?? null,
+      channelUrl: existing?.channelUrl || v.channelUrl || null,
       published: existing?.published ?? v.published ?? null,
       thumbnail: existing?.thumbnail || v.thumbnail || `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
       viewCount: existing?.viewCount ?? null,
@@ -537,14 +635,17 @@ async function applyPlaylistImport(listName, moveIds) {
   }
 
   await chrome.storage.local.set({ videos, videoFolders });
-  // Backfill lengths/views for the newly-saved videos if a key is set.
-  if (apiKey && newIds.length) {
-    await fillVideoDetails(videos, apiKey, newIds);
-    await chrome.storage.local.set({ videos });
-  }
   await chrome.storage.local.remove("pendingPlaylistImport");
-  notify("mytube-import", "Playlist imported", `${added + moved} video${added + moved === 1 ? "" : "s"} → “${name}”`);
-  return { ok: true, listId, added, moved };
+  return { ok: true, listId, added, moved, newIds, apiKey };
+  });
+  if (!result.ok) return result;
+  if (result.apiKey && result.newIds.length) {
+    const { store, seenIds } = await readVideoStore();
+    await fillVideoDetails(store, result.apiKey, result.newIds.filter(id => store[id]));
+    await commitVideos(store, seenIds);
+  }
+  notify('mytube-import', 'Playlist imported', `${result.added + result.moved} videos imported`);
+  return { ok: true, listId: result.listId, added: result.added, moved: result.moved };
 }
 
 // Minimal slugify mirroring the dashboard's, for building list ids here.
@@ -613,63 +714,39 @@ chrome.storage.local.get("reopenDashboardAt").then(({ reopenDashboardAt }) => {
 
 // ---------- Message routing ----------
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "SCAN_RESULT") {
-    handleScanResult(msg.channels).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "APPLY_SCAN") {
-    applyScan(msg.removeIds || []).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "DISCARD_SCAN") {
-    chrome.storage.local.remove("pendingScan").then(() => sendResponse({ ok: true }));
-    return true;
-  }
-  if (msg.type === "REFRESH_STATS") {
-    refreshAllChannelStats().then((r) => sendResponse(r || { ok: true }));
-    return true;
-  }
-  if (msg.type === "REFRESH_SINGLE") {
-    refreshChannelStats([msg.channelId]).then(() => sendResponse({ ok: true }));
-    return true;
-  }
-  if (msg.type === "FILL_MISSING_AVATARS") {
-    fillMissingAvatars().then((r) => sendResponse(r || { ok: true }));
-    return true;
-  }
-  if (msg.type === "FILL_VIDEO_DETAILS") {
-    fillMissingVideoDetails().then((r) => sendResponse(r || { ok: true }));
-    return true;
-  }
-  if (msg.type === "FETCH_ALL_VIDEOS") {
-    fetchAllVideosForChannels(msg.channelIds || []).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "PLAYLIST_SCAN_RESULT") {
-    handlePlaylistScanResult(msg).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "APPLY_PLAYLIST_IMPORT") {
-    applyPlaylistImport(msg.listName, msg.moveIds || []).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "DISCARD_PLAYLIST_IMPORT") {
-    chrome.storage.local.remove("pendingPlaylistImport").then(() => sendResponse({ ok: true }));
-    return true;
-  }
-  if (msg.type === "FETCH_SYNC_DIFF") {
-    computeSyncDiff(msg.direction).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "APPLY_UPLOAD") {
-    applyUpload(msg.removeFromGistIds || [], msg.skipVideoIds || []).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "APPLY_DOWNLOAD") {
-    applyDownload(msg.removeLocalIds || [], msg.skipVideoIds || []).then(sendResponse);
-    return true;
-  }
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (sender.id && sender.id !== chrome.runtime.id) return;
+  const handlers = {
+    PATCH_LIBRARY: () => patchLibrary(msg.patches || {}),
+    SET_SETTINGS: () => withLibraryWrite(async () => {
+      const values = Object.fromEntries(Object.entries(msg.values || {}).filter(([key]) => [...SYNC_SETTING_KEYS, 'gistToken'].includes(key)));
+      await chrome.storage.local.set(values); return { ok: true };
+    }),
+    UNDO_VIDEOS: () => undoVideos(msg.changes || []),
+    EXPORT_BACKUP: exportBackup,
+    LIST_BACKUPS: listBackups,
+    CREATE_BACKUP: () => withLibraryWrite(async () => { await snapshotLibrary('Manual snapshot'); return { ok: true }; }),
+    PREVIEW_BACKUP: () => ({ ok: true, counts: backupCounts(validateBackup(msg.backup)) }),
+    RESTORE_BACKUP: () => restoreBackup(msg.backup, msg.backupId),
+    CLEAR_LIBRARY: clearLibrary,
+    SCAN_RESULT: () => handleScanResult(msg.channels),
+    APPLY_SCAN: () => applyScan(msg.removeIds || []),
+    DISCARD_SCAN: async () => { await chrome.storage.local.remove('pendingScan'); return { ok: true }; },
+    REFRESH_STATS: () => msg.channelIds ? refreshChannelStats(msg.channelIds) : refreshAllChannelStats(),
+    REFRESH_SINGLE: () => refreshChannelStats([msg.channelId]),
+    FILL_MISSING_AVATARS: fillMissingAvatars,
+    FILL_VIDEO_DETAILS: fillMissingVideoDetails,
+    FETCH_ALL_VIDEOS: () => fetchAllVideosForChannels(msg.channelIds || []),
+    PLAYLIST_SCAN_RESULT: () => handlePlaylistScanResult(msg),
+    APPLY_PLAYLIST_IMPORT: () => applyPlaylistImport(msg.listName, msg.moveIds || []),
+    DISCARD_PLAYLIST_IMPORT: async () => { await chrome.storage.local.remove('pendingPlaylistImport'); return { ok: true }; },
+    FETCH_SYNC_DIFF: () => computeSyncDiff(msg.direction, msg.removeIds),
+    APPLY_UPLOAD: () => applyUpload(msg.removeFromGistIds || [], msg.skipVideoIds || [], msg.reviewToken, msg.skipAllVideos),
+    APPLY_DOWNLOAD: () => applyDownload(msg.removeLocalIds || [], msg.skipVideoIds || [], msg.reviewToken, msg.skipAllVideos),
+  };
+  if (!handlers[msg.type]) return;
+  Promise.resolve().then(handlers[msg.type]).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message || String(error) }));
+  return true;
 });
 
 // A scraper bug (fixed) saved every channel name doubled ("Zach Star Zach
@@ -807,6 +884,7 @@ function addScraped(map, id, c) {
 // on modification and only lost when a channel is deliberately removed.
 
 async function applyScan(removeIds = []) {
+  return withLibraryWrite(async () => {
   const { pendingScan, channels = {} } = await chrome.storage.local.get(["pendingScan", "channels"]);
   if (!pendingScan) return { ok: false, error: "No pending scan to apply." };
 
@@ -855,6 +933,7 @@ async function applyScan(removeIds = []) {
   await chrome.storage.local.set({ channels });
   await chrome.storage.local.remove("pendingScan");
   return { ok: true, added, modified, removed };
+  });
 }
 
 // ---------- Resolve a handle (@channel) to its channelId ----------
@@ -864,7 +943,7 @@ async function applyScan(removeIds = []) {
 async function resolveHandleViaApi(handle, apiKey) {
   try {
     const url = `${API_BASE}/channels?part=id&forHandle=${encodeURIComponent(handle)}&key=${apiKey}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
     if (!res.ok) return null;
     const data = await res.json();
     return data.items?.[0]?.id || null;
@@ -895,7 +974,7 @@ async function resolveHandleViaPage(handle) {
 
 async function refreshAllChannelStats() {
   const { channels = {} } = await chrome.storage.local.get("channels");
-  return refreshChannelStats(Object.keys(channels), channels);
+  return refreshChannelStats(Object.keys(channels));
 }
 
 // Cheap, targeted avatar backfill: query snippet only for channels that are
@@ -905,6 +984,8 @@ async function refreshAllChannelStats() {
 async function fillMissingAvatars() {
   const { apiKey, channels = {} } = await chrome.storage.local.get(["apiKey", "channels"]);
 
+  const channelBaseline = clone(channels);
+  const { libraryEpoch = 0 } = await chrome.storage.local.get("libraryEpoch");
   const missing = Object.keys(channels).filter((id) => !channels[id].thumbnail);
   const stats = { ok: true, hasApiKey: !!apiKey, missingBefore: missing.length, thumbsFilled: 0, apiCalls: 0, apiFailures: 0, lastError: null };
   if (!apiKey || !missing.length) {
@@ -916,7 +997,7 @@ async function fillMissingAvatars() {
     stats.apiCalls++;
     try {
       const url = `${API_BASE}/channels?part=snippet&id=${group.join(",")}&key=${apiKey}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
       if (!res.ok) {
         const body = await res.text();
         console.warn("channels.list (avatars) failed:", res.status, body);
@@ -938,36 +1019,47 @@ async function fillMissingAvatars() {
     }
   }
 
-  await chrome.storage.local.set({ channels });
+  await withLibraryWrite(() => commitChannelMetadata(channels, channelBaseline, libraryEpoch));
   stats.missingAfter = Object.keys(channels).filter((id) => !channels[id].thumbnail).length;
   return stats;
 }
 
-async function refreshChannelStats(channelIds, preloaded) {
+async function refreshChannelStats(channelIds) {
   if (!channelIds.length) return { ok: true, queried: 0 };
   const { apiKey } = await chrome.storage.local.get("apiKey");
-  const channels = preloaded ?? (await chrome.storage.local.get("channels")).channels ?? {};
+  const data = await chrome.storage.local.get(["channels", "libraryEpoch"]);
+  const channels = data.channels || {};
+  const channelBaseline = clone(channels);
+  const libraryEpoch = data.libraryEpoch || 0;
 
   // Diagnostics so a refresh can explain itself (why avatars/counts didn't fill).
-  const stats = { ok: true, hasApiKey: !!apiKey, queried: channelIds.length, apiItems: 0, apiFailures: 0, thumbsFilled: 0, lastError: null };
+  const stats = { ok: true, failures: [], hasApiKey: !!apiKey, queried: channelIds.length, apiItems: 0, apiFailures: 0, rssFailures: 0, thumbsFilled: 0, lastError: null };
 
+  const apiFailedIds = new Map();
+  // Keep this response separate from cached channel fields: only a fresh API
+  // answer can establish that a missing RSS feed belongs to an empty channel.
+  const channelDetails = new Map();
   // 1) Video count / subscriber count / avatar: with an API key, batches of 50 (1 unit/call)
   if (apiKey) {
     for (const group of chunk(channelIds, YT_CHANNELS_BATCH)) {
       try {
-        const url = `${API_BASE}/channels?part=snippet,statistics&id=${group.join(",")}&key=${apiKey}`;
-        const res = await fetch(url);
+        const url = `${API_BASE}/channels?part=snippet,statistics,contentDetails&id=${group.join(",")}&key=${apiKey}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
         if (!res.ok) {
           const body = await res.text();
           console.warn("channels.list failed:", res.status, body);
           stats.apiFailures++;
           stats.lastError = describeApiError(res, body);
+          for (const id of group) apiFailedIds.set(id, stats.lastError);
           continue;
         }
         const data = await res.json();
-        for (const item of data.items || []) {
+        if (!Array.isArray(data.items)) throw new Error("YouTube returned invalid channel details.");
+        for (const id of group) channelDetails.set(id, null);
+        for (const item of data.items) {
           const ch = channels[item.id];
           if (!ch) continue;
+          channelDetails.set(item.id, item);
           stats.apiItems++;
           // A missing statistics/snippet on one channel must not abort the rest
           // of the batch, so guard each field independently.
@@ -986,6 +1078,7 @@ async function refreshChannelStats(channelIds, preloaded) {
         console.warn("channels.list error:", e);
         stats.apiFailures++;
         stats.lastError = String(e?.message || e);
+        for (const id of group) apiFailedIds.set(id, stats.lastError);
       }
     }
   }
@@ -993,34 +1086,53 @@ async function refreshChannelStats(channelIds, preloaded) {
   // 2) Last video date + tracked-channel video feed: via RSS, without spending
   // quota. Track which active/finished channels gained a newer video so we can
   // notify about them, and stash the recent uploads of `trackVideos` channels.
+  for (const [id, error] of apiFailedIds) stats.failures.push({ id, name: channels[id]?.name || id, error });
   const trackedUpdates = [];
   const { store: videoStore, seenIds } = await readVideoStore();
+  seenIds.epoch = libraryEpoch;
   const now = Date.now();
-  await Promise.allSettled(
-    channelIds.map(async (id) => {
-      const ch = channels[id];
-      const prevDate = ch?.lastVideoDate || null;
-      const { lastVideoDate, videos } = await fetchChannelVideos(id);
-      if (ch) {
-        if (lastVideoDate) ch.lastVideoDate = lastVideoDate;
-        ch.lastFetched = now;
-        if (lastVideoDate && lastVideoDate !== prevDate && (ch.active || ch.finished)) {
-          trackedUpdates.push({ name: ch.name, active: !!ch.active, finished: !!ch.finished });
-        }
-        if (ch.trackVideos) upsertChannelVideos(videoStore, id, videos, now);
+  // Bound simultaneous RSS requests and report each failed channel.
+  for (const group of chunk(channelIds, 6)) await Promise.all(group.map(async (id) => {
+    const ch = channels[id];
+    if (!ch) return;
+    const prevDate = ch.lastVideoDate || null;
+    let feed = await fetchChannelVideos(id);
+    if (feed.status === 404 && !apiFailedIds.has(id)) {
+      feed = await recoverMissingChannelFeed(channelDetails.get(id), apiKey);
+      if (feed.apiFailure) {
+        stats.apiFailures++;
+        stats.lastError = feed.error;
       }
-    })
-  );
-  pruneVideos(videoStore, channels);
+    }
+    ch.lastFetchAttempt = Date.now();
+    if (!feed.ok) {
+      stats.rssFailures++;
+      ch.lastFetchError = feed.error;
+      stats.failures.push({ id, name: ch.name || id, error: feed.error });
+      return;
+    }
+    if (!apiFailedIds.has(id)) { delete ch.lastFetchError; ch.lastFetched = Date.now(); }
+    else ch.lastFetchError = apiFailedIds.get(id);
+    if (feed.lastVideoDate) ch.lastVideoDate = feed.lastVideoDate;
+    if (feed.lastVideoDate && feed.lastVideoDate > (prevDate || '') && (ch.active || ch.finished)) {
+      trackedUpdates.push({ name: ch.name, active: !!ch.active, finished: !!ch.finished });
+    }
+    if (ch.trackVideos) upsertChannelVideos(videoStore, id, feed.videos, now);
+  }));
   // Duration isn't in RSS — backfill it (and fresher view counts) via the API
   // when a key is set. Only newly-seen videos are queried, so this is cheap.
   if (apiKey) {
     const vd = await fillVideoDetails(videoStore, apiKey);
     stats.videoDetailsFilled = vd.filled;
+    stats.apiFailures += vd.apiFailures;
+    if (vd.apiFailures) for (const id of channelIds) {
+      if (!stats.failures.some(f => f.id === id)) stats.failures.push({ id, name: channels[id]?.name || id, error: vd.lastError || "Video details request failed." });
+    }
     if (vd.lastError && !stats.lastError) stats.lastError = vd.lastError;
   }
 
-  await commitVideos(videoStore, seenIds, { channels });
+  await commitVideos(videoStore, seenIds, { channels, channelBaseline, libraryEpoch, prune: true });
+  stats.ok = stats.failures.length === 0 && stats.apiFailures === 0;
   notifyTrackedUpdates(trackedUpdates);
 
   stats.missingThumbs = channelIds.filter((id) => !channels[id]?.thumbnail).length;
@@ -1034,11 +1146,12 @@ async function refreshChannelStats(channelIds, preloaded) {
 // live inside <entry> elements. No DOMParser in a service worker, so each
 // <entry>…</entry> block is sliced out and scanned with regexes.
 async function fetchChannelVideos(channelId) {
-  const empty = { lastVideoDate: null, videos: [] };
+  const empty = { ok: true, lastVideoDate: null, videos: [] };
   try {
-    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`);
-    if (!res.ok) return empty;
+    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) return { ...empty, ok: false, status: res.status, error: `YouTube feed: HTTP ${res.status}` };
     const text = await res.text();
+    if (!/<feed[\s>]/.test(text)) return { ...empty, ok: false, error: "YouTube returned an invalid feed." };
     const videos = [];
     for (const part of text.split("<entry>").slice(1)) {
       const block = part.slice(0, part.indexOf("</entry>"));
@@ -1060,9 +1173,44 @@ async function fetchChannelVideos(channelId) {
     }
     if (!videos.length) return empty;
     const lastVideoDate = videos.reduce((a, v) => (v.published > a ? v.published : a), videos[0].published);
-    return { lastVideoDate, videos };
+    return { ok: true, lastVideoDate, videos };
   } catch (e) {
-    return empty;
+    return { ...empty, ok: false, error: e.name === "TimeoutError" ? "YouTube feed timed out." : "Could not reach the YouTube feed." };
+  }
+}
+
+// A feed 404 alone cannot distinguish a channel with no public videos from a
+// broken feed or an unavailable channel. Use the fresh channels.list response
+// from this refresh, then read recent uploads only when necessary. Never guess
+// an empty result from cached videoCount or mark this as a full-history fetch.
+async function recoverMissingChannelFeed(channel, apiKey) {
+  const empty = { lastVideoDate: null, videos: [] };
+  const failed = error => ({ ...empty, ok: false, error });
+  if (!apiKey) return failed("YouTube feed is unavailable (HTTP 404). Add a YouTube API key in Settings to check the channel and fetch its uploads.");
+  if (channel === null) return failed("Channel not found on YouTube. Open the channel to check whether it is still available, or rescan your subscriptions.");
+  const count = channel?.statistics?.videoCount;
+  if (count === "0" || count === 0) return { ...empty, ok: true };
+  const playlistId = channel?.contentDetails?.relatedPlaylists?.uploads;
+  if (!playlistId) return failed("YouTube feed is unavailable (HTTP 404), and YouTube did not return an uploads playlist for this channel.");
+  try {
+    // One bounded page replaces the RSS window; do not download the whole
+    // catalog on an ordinary refresh. Extra entries allow for private videos.
+    const url = `${API_BASE}/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=${encodeURIComponent(playlistId)}&key=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) {
+      const error = res.status === 404
+        ? "YouTube's uploads playlist is also unavailable (HTTP 404). Try again later or check the channel on YouTube."
+        : `YouTube uploads fallback: ${describeApiError(res, await res.text())}`;
+      return { ...failed(error), apiFailure: true };
+    }
+    const data = await res.json();
+    if (!Array.isArray(data.items)) throw new Error("YouTube returned invalid upload details.");
+    const videos = parseUploadItems(data.items).slice(0, 15);
+    if (!videos.length && data.nextPageToken) return failed("YouTube's recent uploads contain no readable videos. Use Fetch full history to check older uploads.");
+    const lastVideoDate = videos.reduce((latest, v) => v.published > (latest || "") ? v.published : latest, null);
+    return { ok: true, lastVideoDate, videos };
+  } catch (e) {
+    return { ...failed(e.name === "TimeoutError" ? "YouTube uploads fallback timed out." : `YouTube uploads fallback: ${e.message || "request failed"}`), apiFailure: true };
   }
 }
 
@@ -1114,37 +1262,60 @@ function upsertChannelVideos(store, channelId, videos, now) {
 // storage and re-applies the fields the user owns, so only our own updates land.
 // `userStateAt` travels with the four fields it stamps: it's the epoch ms of the
 // last user change to them, and mergeVideo resolves them last-writer-wins from it.
-const USER_VIDEO_FLAGS = ["watched", "saved", "hidden", "folderId", "userStateAt"];
+const CHANNEL_METADATA = ['videoCount', 'subscriberCount', 'thumbnail', 'lastVideoDate', 'lastFetched', 'lastFetchAttempt', 'lastFetchError', 'fetchedAll', 'trackVideos'];
 
-async function readVideoStore() {
-  const { videos = {} } = await chrome.storage.local.get("videos");
-  return { store: videos, seenIds: new Set(Object.keys(videos)) };
-}
-
-// `seenIds` is the set of ids the store held when we read it. An id in storage
-// that isn't in it appeared while we worked (a context-menu save, a playlist
-// import) and is kept; one we've since dropped was pruned on purpose and stays
-// dropped. After the write, the set is re-baselined for the next commit.
-async function commitVideos(store, seenIds, extra = {}) {
-  const { videos: current = {} } = await chrome.storage.local.get("videos");
-  for (const [id, cur] of Object.entries(current)) {
-    if (!seenIds.has(id)) {
-      store[id] = cur;
-      continue;
-    }
-    const ours = store[id];
-    if (!ours) continue;
-    // Storage is authoritative for these — including a *cleared* one: un-saving
-    // deletes `folderId`, and re-applying our stale copy would leave a record
-    // that claims a Watch Later list it's no longer in.
-    for (const k of USER_VIDEO_FLAGS) {
-      if (cur[k] === undefined) delete ours[k];
-      else ours[k] = cur[k];
+async function commitChannelMetadata(channels, baseline, epoch) {
+  const data = await chrome.storage.local.get(['channels', 'libraryEpoch']);
+  if ((data.libraryEpoch || 0) !== epoch) return data.channels || {};
+  const current = data.channels || {};
+  for (const [id, next] of Object.entries(channels)) {
+    const cur = current[id], before = baseline[id];
+    if (!cur || !before) continue;
+    for (const key of CHANNEL_METADATA) {
+      if (!same(next[key], before[key]) && same(cur[key], before[key])) {
+        if (next[key] === undefined) delete cur[key]; else cur[key] = next[key];
+      }
     }
   }
-  await chrome.storage.local.set({ ...extra, videos: store });
-  seenIds.clear();
-  for (const id of Object.keys(store)) seenIds.add(id);
+  await chrome.storage.local.set({ channels: current });
+  return current;
+}
+
+async function readVideoStore() {
+  const { videos = {}, libraryEpoch = 0 } = await chrome.storage.local.get(['videos', 'libraryEpoch']);
+  const seenIds = new Set(Object.keys(videos));
+  seenIds.baseline = clone(videos);
+  seenIds.epoch = libraryEpoch;
+  return { store: videos, seenIds };
+}
+
+async function commitVideos(store, seenIds, extra = {}) {
+  return withLibraryWrite(async () => {
+    const data = await chrome.storage.local.get(['videos', 'channels', 'libraryEpoch']);
+    if ((data.libraryEpoch || 0) !== seenIds.epoch) return;
+    let channels = data.channels || {};
+    if (extra.channels) channels = await commitChannelMetadata(extra.channels, extra.channelBaseline, extra.libraryEpoch);
+    const current = data.videos || {};
+    for (const [id, next] of Object.entries(store)) {
+      const cur = current[id], before = seenIds.baseline[id];
+      if (!cur) {
+        if (!seenIds.has(id) && (!next.channelId || channels[next.channelId]?.trackVideos || next.saved)) current[id] = clone(next);
+        continue;
+      }
+      for (const key of Object.keys(next)) {
+        if (VIDEO_FLAGS.includes(key)) continue;
+        if ((!before || !same(next[key], before[key])) && (!before || same(cur[key], before[key]) || cur[key] == null)) cur[key] = clone(next[key]);
+      }
+    }
+    // Prune only after merging into current user state, never an old snapshot.
+    if (extra.prune) pruneVideos(current, channels);
+    await chrome.storage.local.set({ videos: current });
+    for (const id of Object.keys(store)) delete store[id];
+    Object.assign(store, clone(current));
+    seenIds.clear();
+    for (const id of Object.keys(current)) seenIds.add(id);
+    seenIds.baseline = clone(current);
+  });
 }
 
 // A video still needs an API detail fetch if its length is unknown, or it was
@@ -1160,7 +1331,7 @@ function videoNeedsDetails(v) {
 // Self-limiting: once all are set the predicate goes false. Only saved videos
 // qualify (New-feed cards come from RSS with a date and a subscription avatar).
 function videoNeedsChannel(v) {
-  return v.saved === true && (!v.channelId || !v.channelThumbnail || !v.published);
+  return v.saved === true && (!v.channelId || !v.channelThumbnail || !v.published || !v.author || !v.channelUrl || isPlaylistOverlayTitle(v.title));
 }
 
 // Fill video duration + view count + live status via the Data API — none of
@@ -1173,7 +1344,7 @@ async function fillVideoDetails(store, apiKey, ids) {
   for (const group of chunk(pending, YT_CHANNELS_BATCH)) {
     try {
       const url = `${API_BASE}/videos?part=contentDetails,statistics,snippet&id=${group.join(",")}&key=${apiKey}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
       if (!res.ok) {
         const body = await res.text();
         console.warn("videos.list failed:", res.status, body);
@@ -1194,11 +1365,22 @@ async function fillVideoDetails(store, apiKey, ids) {
         v.duration = duration;
         v.live = live;
         v.viewCount = views;
-        // Backfill channel identity + upload date for manual/imported saves
-        // (oEmbed and the playlist scrape give neither) so their cards can group,
-        // show a date, and show an avatar.
-        if (item.snippet?.channelId && !v.channelId) { v.channelId = item.snippet.channelId; out.changed = true; }
-        if (item.snippet?.channelTitle && !v.author) { v.author = item.snippet.channelTitle; out.changed = true; }
+        if (item.snippet?.title && v.title !== item.snippet.title) {
+          v.title = item.snippet.title;
+          out.changed = true;
+        }
+        // The API owns verified channel identity: correct scraped guesses too.
+        // Discard a wrong-channel avatar before the thumbnail backfill.
+        if (item.snippet?.channelId) {
+          if (v.channelId !== item.snippet.channelId) {
+            v.channelId = item.snippet.channelId;
+            v.channelThumbnail = null;
+            out.changed = true;
+          }
+          const channelUrl = "https://www.youtube.com/channel/" + item.snippet.channelId;
+          if (v.channelUrl !== channelUrl) { v.channelUrl = channelUrl; out.changed = true; }
+        }
+        if (item.snippet?.channelTitle && v.author !== item.snippet.channelTitle) { v.author = item.snippet.channelTitle; out.changed = true; }
         if (item.snippet?.publishedAt && !v.published) { v.published = item.snippet.publishedAt; out.changed = true; }
         out.filled++;
       }
@@ -1291,7 +1473,7 @@ async function resolveUploadsPlaylists(channelIds, apiKey) {
   for (const group of chunk(channelIds, YT_CHANNELS_BATCH)) {
     try {
       const url = `${API_BASE}/channels?part=contentDetails&id=${group.join(",")}&key=${apiKey}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
       if (!res.ok) { error = error || describeApiError(res, await res.text()); continue; }
       const data = await res.json();
       const seen = new Set();
@@ -1319,7 +1501,7 @@ async function fetchAllUploads(playlistId, apiKey) {
   for (let page = 0; page < 400; page++) { // safety cap: 400*50 = 20k videos
     const url = `${API_BASE}/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=${playlistId}${pageToken ? `&pageToken=${pageToken}` : ""}&key=${apiKey}`;
     let res;
-    try { res = await fetch(url); } catch (e) { error = String(e?.message || e); break; }
+    try { res = await fetch(url, { signal: AbortSignal.timeout(20000) }); } catch (e) { error = String(e?.message || e); break; }
     if (!res.ok) {
       const body = await res.text();
       // A 404 means there is no such uploads playlist — the channel has no
@@ -1331,18 +1513,26 @@ async function fetchAllUploads(playlistId, apiKey) {
       break;
     }
     const data = await res.json();
-    for (const item of data.items || []) {
-      const videoId = item.contentDetails?.videoId;
-      const published = item.contentDetails?.videoPublishedAt || item.snippet?.publishedAt;
-      const title = (item.snippet?.title || "").replace(/\s+/g, " ").trim();
-      if (!videoId || !published) continue;
-      if (title === "Private video" || title === "Deleted video") continue;
-      videos.push({ videoId, title, published, viewCount: null, thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg` });
-    }
+    videos.push(...parseUploadItems(data.items || []));
     pageToken = data.nextPageToken || "";
     if (!pageToken) break;
   }
   return { videos, error };
+}
+
+// Shared by the RSS fallback and full-history fetch so both import the same
+// video dates/titles and skip unavailable playlist placeholders.
+function parseUploadItems(items) {
+  const videos = [];
+  for (const item of items) {
+    const videoId = item.contentDetails?.videoId;
+    const published = item.contentDetails?.videoPublishedAt || item.snippet?.publishedAt;
+    const title = (item.snippet?.title || "").replace(/\s+/g, " ").trim();
+    if (!videoId || !published) continue;
+    if (title === "Private video" || title === "Deleted video") continue;
+    videos.push({ videoId, title, published, viewCount: null, thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg` });
+  }
+  return videos;
 }
 
 // Deep-fetch every upload for the given channels via the API, exempt them from
@@ -1351,8 +1541,10 @@ async function fetchAllUploads(playlistId, apiKey) {
 async function fetchAllVideosForChannels(channelIds) {
   const { apiKey } = await chrome.storage.local.get("apiKey");
   if (!apiKey) return { ok: false, hasApiKey: false };
-  const { channels = {} } = await chrome.storage.local.get("channels");
+  const { channels = {}, libraryEpoch = 0 } = await chrome.storage.local.get(["channels", "libraryEpoch"]);
+  let channelBaseline = clone(channels);
   const { store, seenIds } = await readVideoStore();
+  seenIds.epoch = libraryEpoch;
   const now = Date.now();
   // `failures` is what the dashboard reports: one row per channel that came back
   // with nothing, named, so "some requests failed" can say *which* channel and
@@ -1385,7 +1577,8 @@ async function fetchAllVideosForChannels(channelIds) {
     result.channels++;
     // Persist after each channel so a long job's progress survives a worker
     // restart (and the dashboard shows videos accumulating live).
-    await commitVideos(store, seenIds, { channels });
+    await commitVideos(store, seenIds, { channels, channelBaseline, libraryEpoch });
+    channelBaseline = clone(channels);
   }
   // Fill duration/views/live for everything still missing them.
   await fillVideoDetails(store, apiKey);
@@ -1465,38 +1658,31 @@ async function resolveGistId(gistToken) {
   return gistId;
 }
 
-// How many per-video rows the review lists. Everything is still applied — the
-// cap only bounds what's rendered (and reported as `truncated`), because a first
-// sync can legitimately move tens of thousands of videos.
-const VIDEO_DIFF_LIMIT = 500;
+async function loadSyncContext(direction) {
+  if (!['upload', 'download'].includes(direction)) throw new Error('Choose Upload or Download.');
+  const { gistToken } = await chrome.storage.local.get('gistToken');
+  if (!gistToken) throw new Error('No GitHub token set in Settings.');
+  const gistId = await resolveGistId(gistToken);
+  const local = await chrome.storage.local.get([...RECORD_KEYS, ...SYNC_SETTING_KEYS, 'libraryEpoch']);
+  const localState = Object.fromEntries(RECORD_KEYS.map(k => [k, local[k] || {}]));
+  let remoteState = gistId ? await fetchGistState(gistToken, gistId) : null;
+  if (direction === 'download' && !remoteState) throw new Error('No usable Gist found — upload first.');
+  remoteState ||= Object.fromEntries(RECORD_KEYS.map(k => [k, {}]));
+  const localSettings = pickRemoteSettings(local);
+  const remoteSettings = pickRemoteSettings(remoteState.settings);
+  const bytes = new TextEncoder().encode(stableStringify({ direction, gistId, localState, remoteState, localSettings, epoch: local.libraryEpoch || 0 }));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const fingerprint = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+  return { gistToken, gistId, local, localState, remoteState, localSettings, remoteSettings, fingerprint };
+}
 
-async function computeSyncDiff(direction) {
-  const { gistToken } = await chrome.storage.local.get("gistToken");
-  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
+async function computeSyncDiff(direction, removeIds) {
+  try { return buildSyncDiff(direction, await loadSyncContext(direction), removeIds); }
+  catch (error) { return { ok: false, error: error.message || String(error) }; }
+}
 
-  try {
-    const gistId = await resolveGistId(gistToken);
-
-    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
-    const localState = {
-      channels: local.channels || {},
-      folders: local.folders || {},
-      tags: local.tags || {},
-      videoFolders: local.videoFolders || {},
-      videos: local.videos || {},
-    };
-
-    let remoteState = null;
-    if (gistId) remoteState = await fetchGistState(gistToken, gistId);
-
-    if (direction === "download" && !remoteState) {
-      return { ok: false, error: gistId ? "Gist has no usable state yet." : "No Gist found — upload first to create one." };
-    }
-    if (!remoteState) remoteState = { channels: {}, folders: {}, tags: {}, videoFolders: {}, videos: {} };
-
-    const localSettings = await readLocalSettings();
-    const remoteSettings = pickRemoteSettings(remoteState.settings);
-
+function buildSyncDiff(direction, context, removeIds) {
+  const { localState, remoteState, localSettings, remoteSettings } = context;
     const src = direction === "upload" ? localState : remoteState;
     const tgt = direction === "upload" ? remoteState : localState;
     const srcCh = src.channels || {};
@@ -1525,6 +1711,16 @@ async function computeSyncDiff(direction) {
 
     for (const [id, tc] of Object.entries(tgtCh)) {
       if (!srcCh[id]) removed.push({ id, name: tc.name, handle: tc.handle });
+    }
+
+    const selectedRemovals = (removeIds ?? (direction === 'upload' ? removed.map(c => c.id) : []))
+      .filter(id => removed.some(c => c.id === id));
+    const tagDiff = { added: [], modified: [], removed: [] };
+    for (const [id, tag] of Object.entries(src.tags || {})) {
+      const previous = tgt.tags?.[id];
+      if (!previous) tagDiff.added.push({ id, name: tag.name });
+      else if (!same(tag, previous)) tagDiff.modified.push({ id, name: tag.name, oldName: previous.name,
+        changes: ['name', 'color'].filter(k => tag[k] !== previous[k]) });
     }
 
     // Folder diff: renames, reparents, emoji changes, and additions by id.
@@ -1577,7 +1773,7 @@ async function computeSyncDiff(direction) {
     // and still be missing afterwards, so the same diff came back forever.
     const srcVids = src.videos || {};
     const tgtVids = tgt.videos || {};
-    const resultVids = effectiveSyncVideos(direction, localState, remoteState);
+    const resultVids = effectiveSyncVideos(direction, localState, remoteState, selectedRemovals);
     // An absent folderId and "unsorted" are the same state — the default list.
     // They must compare equal: RSS-created videos carry no folderId at all, but
     // mergeVideo stamps "unsorted" on anything it merges, so treating them as
@@ -1606,7 +1802,7 @@ async function computeSyncDiff(direction) {
     // Videos the apply would drop (`to: null`). These are the destructive rows,
     // so they lead the list — and `reason` says which bound did it, since
     // "6 dropped" on its own told the user nothing about what they were losing.
-    const effChannels = effectiveSyncChannels(direction, localState, remoteState);
+    const effChannels = effectiveSyncChannels(direction, localState, remoteState, selectedRemovals);
     for (const [id, tv] of Object.entries(tgtVids)) {
       if (resultVids[id]) continue;
       removedItems.push({
@@ -1616,7 +1812,7 @@ async function computeSyncDiff(direction) {
     }
     const vidsAdded = addedItems.length, vidsModified = modifiedItems.length, vidsRemoved = removedItems.length;
     const allItems = [...removedItems, ...modifiedItems, ...addedItems];
-    const items = allItems.slice(0, VIDEO_DIFF_LIMIT);
+    const items = allItems;
 
     // Settings diff: compare the CURRENT target value against the value the apply
     // would actually write, so the review matches the real outcome. Upload uses
@@ -1637,6 +1833,9 @@ async function computeSyncDiff(direction) {
     return {
       ok: true,
       direction,
+      reviewToken: context.fingerprint + ':' + JSON.stringify([...selectedRemovals].sort()),
+      removeIds: selectedRemovals,
+      tags: tagDiff,
       channels: { added, removed, modified },
       folders: { added: foAdded, removed: foRemoved, modified: foModified },
       videoFolders: { added: vfAdded, removed: vfRemoved, modified: vfModified },
@@ -1647,9 +1846,6 @@ async function computeSyncDiff(direction) {
       },
       settings,
     };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
 }
 
 // The channel set an apply ends up with: on upload local wins and Gist-only
@@ -1664,7 +1860,18 @@ function effectiveSyncChannels(direction, localState, remoteState, removeIds = [
   for (const [id, c] of Object.entries(direction === "upload" ? remoteCh : localCh)) {
     if (!removeSet.has(id)) kept[id] = c;
   }
-  return direction === "upload" ? { ...kept, ...localCh } : { ...kept, ...remoteCh };
+  const result = direction === "upload" ? { ...kept, ...localCh } : { ...kept, ...remoteCh };
+  // Direction chooses organization; newer successful fetches choose cached stats.
+  for (const [id, picked] of Object.entries(result)) {
+    const a = localCh[id], b = remoteCh[id];
+    if (!a || !b) continue;
+    const fresher = (a.lastFetched || 0) >= (b.lastFetched || 0) ? a : b;
+    result[id] = { ...picked };
+    for (const key of ['videoCount', 'subscriberCount', 'thumbnail', 'lastVideoDate', 'lastFetched']) {
+      if (fresher[key] !== undefined) result[id][key] = fresher[key];
+    }
+  }
+  return result;
 }
 
 // The video store an apply would actually write: union merge, then bounded by
@@ -1690,100 +1897,45 @@ function effectiveSyncVideos(direction, localState, remoteState, removeIds = [],
   return videos;
 }
 
-async function applyUpload(removeFromGistIds = [], skipVideoIds = []) {
-  const { gistToken } = await chrome.storage.local.get("gistToken");
-  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
-
-  try {
-    let gistId = await resolveGistId(gistToken);
-
-    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
-    const localState = { channels: local.channels || {}, videos: local.videos || {} };
-
-    // Gist-only channels the user chose to keep are re-included; the video store
-    // is union-merged with the gist (deletions don't propagate) and then bounded
-    // the same way the local store is, so untracked channels don't live on in
-    // the gist and come back on the next merge.
-    let remoteState = { channels: {}, videos: {}, folders: {}, tags: {}, videoFolders: {} };
-    let remoteSettings = {};
-    if (gistId) {
-      const fetched = await fetchGistState(gistToken, gistId);
-      if (fetched) {
-        remoteState = fetched;
-        remoteSettings = fetched.settings || {};
-      }
-    }
-    const uploadChannels = effectiveSyncChannels("upload", localState, remoteState, removeFromGistIds);
-    const uploadVideos = effectiveSyncVideos("upload", localState, remoteState, removeFromGistIds, skipVideoIds);
-
-    // Folders, lists and tags union the same way the video store does: local
-    // wins on ids both sides have, gist-only ones are kept. Writing the local
-    // set wholesale meant a device that hadn't downloaded yet wiped every folder
-    // or list the other device had just added — while the videos and channels
-    // pointing at them survived the merge, leaving them filed under an id with
-    // no folder behind it.
-    const uploadState = {
-      channels: uploadChannels,
-      folders: { ...(remoteState.folders || {}), ...(local.folders || {}) },
-      tags: { ...(remoteState.tags || {}), ...(local.tags || {}) },
-      videoFolders: { ...(remoteState.videoFolders || {}), ...(local.videoFolders || {}) },
-      videos: uploadVideos,
-      settings: mergeSettings(await readLocalSettings(), remoteSettings),
-    };
-    const body = {
-      description: "MyTube Organizer sync data",
-      files: { [GIST_FILENAME]: { content: serializeGistPayload(uploadState) } },
-    };
-
-    if (gistId) {
-      await ghApi(gistToken, `${GIST_API}/${gistId}`, "PATCH", body);
-    } else {
-      const created = await ghApi(gistToken, GIST_API, "POST", { ...body, public: false });
-      gistId = created.id;
-    }
-
-    const lastSyncedAt = Date.now();
-    await chrome.storage.local.set({ gistId, lastSyncedAt });
-    return { ok: true, gistId, lastSyncedAt };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
+async function applyUpload(removeIds = [], skipVideoIds = [], reviewToken, skipAllVideos = false) {
+  return applySync('upload', removeIds, skipVideoIds, reviewToken, skipAllVideos);
 }
 
-async function applyDownload(removeLocalIds = [], skipVideoIds = []) {
-  const { gistToken } = await chrome.storage.local.get("gistToken");
-  if (!gistToken) return { ok: false, error: "No GitHub token set in Settings." };
+async function applyDownload(removeIds = [], skipVideoIds = [], reviewToken, skipAllVideos = false) {
+  return applySync('download', removeIds, skipVideoIds, reviewToken, skipAllVideos);
+}
 
+async function applySync(direction, removeIds, skipVideoIds, reviewToken, skipAllVideos) {
   try {
-    const gistId = await resolveGistId(gistToken);
-    if (!gistId) return { ok: false, error: "No Gist found to download from." };
-
-    const remoteState = await fetchGistState(gistToken, gistId);
-    if (!remoteState) return { ok: false, error: "Gist has no usable state yet." };
-
-    const local = await chrome.storage.local.get(["channels", "folders", "tags", "videoFolders", "videos"]);
-    const localState = { channels: local.channels || {}, videos: local.videos || {} };
-
-    // Gist channels win; local-only ones the user chose to keep are re-added.
-    const channels = effectiveSyncChannels("download", localState, remoteState, removeLocalIds);
-
-    // Gist folders win, but keep local folders referenced by preserved local-only channels
-    const folders = { ...(local.folders || {}), ...remoteState.folders };
-    // Watch Later lists: gist wins, local-only lists kept. Video store: union
-    // merge, kept within the same bounds as any other write.
-    const videoFolders = { ...(local.videoFolders || {}), ...(remoteState.videoFolders || {}) };
-    const videos = effectiveSyncVideos("download", localState, remoteState, removeLocalIds, skipVideoIds);
-
-    const lastSyncedAt = Date.now();
-    const settings = pickRemoteSettings(remoteState.settings);
-    // Tags union like folders — replacing them wholesale dropped any tag only
-    // this device had, silently unlabelling the local-only channels wearing it.
-    const tags = { ...(local.tags || {}), ...(remoteState.tags || {}) };
-    await chrome.storage.local.set({ channels, folders, tags, videoFolders, videos, gistId, lastSyncedAt, ...settings });
-    return { ok: true, gistId, lastSyncedAt };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
+    return await withLibraryWrite(async () => {
+      const context = await loadSyncContext(direction);
+      const diff = buildSyncDiff(direction, context, removeIds);
+      if (!reviewToken || reviewToken !== diff.reviewToken) {
+        return { ok: false, stale: true, error: 'The library changed since this review. Review the updated changes before applying.', diff };
+      }
+      let { gistId } = context;
+      const { gistToken, local, localState, remoteState, localSettings, remoteSettings } = context;
+      const source = direction === 'upload' ? localState : remoteState;
+      const target = direction === 'upload' ? remoteState : localState;
+      const channels = effectiveSyncChannels(direction, localState, remoteState, diff.removeIds);
+      const videos = skipAllVideos ? clone(target.videos || {})
+        : effectiveSyncVideos(direction, localState, remoteState, diff.removeIds, skipVideoIds);
+      const result = { channels, videos };
+      for (const key of ['folders', 'tags', 'videoFolders']) result[key] = { ...(target[key] || {}), ...(source[key] || {}) };
+      const lastSyncedAt = Date.now();
+      if (direction === 'upload') {
+        const payload = { ...result, settings: mergeSettings(localSettings, remoteSettings) };
+        const body = { description: 'MyTube Organizer sync data', files: { [GIST_FILENAME]: { content: serializeGistPayload(payload) } } };
+        if (gistId) await ghApi(gistToken, `${GIST_API}/${gistId}`, 'PATCH', body);
+        else gistId = (await ghApi(gistToken, GIST_API, 'POST', { ...body, public: false })).id;
+        await chrome.storage.local.set({ gistId, lastSyncedAt });
+      } else {
+        await snapshotLibrary('Before sync download', local);
+        await chrome.storage.local.set({ ...result, ...remoteSettings, gistId, lastSyncedAt });
+      }
+      return { ok: true, gistId, lastSyncedAt };
+    });
+  } catch (error) { return { ok: false, error: error.message || String(error) }; }
 }
 
 // ---------- Cross-device sync via a secret GitHub Gist ----------
@@ -1795,7 +1947,7 @@ async function applyDownload(removeLocalIds = [], skipVideoIds = []) {
 
 // undefined = gist gone (recreate), null = gist exists but has no usable state yet
 async function fetchGistState(token, gistId) {
-  const res = await fetch(`${GIST_API}/${gistId}`, { headers: ghHeaders(token) });
+  const res = await fetch(`${GIST_API}/${gistId}`, { headers: ghHeaders(token), signal: AbortSignal.timeout(20000) });
   if (res.status === 404) return undefined;
   if (!res.ok) throw new Error(`GitHub: ${res.status} ${res.statusText}`);
   const gist = await res.json();
@@ -1803,7 +1955,7 @@ async function fetchGistState(token, gistId) {
   if (!file) return null;
   let content = file.content;
   if (file.truncated) {
-    const raw = await fetch(file.raw_url);
+    const raw = await fetch(file.raw_url, { signal: AbortSignal.timeout(20000) });
     if (!raw.ok) throw new Error(`GitHub: could not fetch gist content (${raw.status})`);
     content = await raw.text();
   }
@@ -1823,7 +1975,7 @@ async function fetchGistState(token, gistId) {
 }
 
 async function findExistingGist(token) {
-  const res = await fetch(`${GIST_API}?per_page=100`, { headers: ghHeaders(token) });
+  const res = await fetch(`${GIST_API}?per_page=100`, { headers: ghHeaders(token), signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`GitHub: ${res.status} ${res.statusText}`);
   const gists = await res.json();
   return gists.find((g) => g.files?.[GIST_FILENAME])?.id || null;
@@ -1928,6 +2080,7 @@ function mergeVideo(a, b) {
     author: firstSet(a.author, b.author) ?? null,
     channelId: firstSet(a.channelId, b.channelId) ?? null,
     channelThumbnail: firstSet(a.channelThumbnail, b.channelThumbnail) ?? null,
+    channelUrl: firstSet(a.channelUrl, b.channelUrl) ?? null,
     published: firstSet(a.published, b.published) ?? null,
     addedAt: seenTimes.length ? Math.min(...seenTimes) : Date.now(),
   };
@@ -1935,6 +2088,7 @@ function mergeVideo(a, b) {
 
 async function ghApi(token, url, method, body) {
   const res = await fetch(url, {
+    signal: AbortSignal.timeout(20000),
     method,
     headers: { ...ghHeaders(token), "Content-Type": "application/json" },
     body: JSON.stringify(body),

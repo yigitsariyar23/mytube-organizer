@@ -1,13 +1,13 @@
 :root {
-  --bg: #17161a;
-  --panel: #1e1d22;
-  --panel-2: #24232a;
-  --border: #2c2a31;
-  --text: #edeae4;
-  --text-muted: #9c98a0;
-  --accent: #e8b355;
-  --accent-dim: #6b5530;
-  --danger: #e0705a;
+  --bg: #18191c;
+  --panel: #202125;
+  --panel-2: #282a2f;
+  --border: #373a42;
+  --text: #f0ede7;
+  --text-muted: #aba9b1;
+  --accent: #edbc6b;
+  --accent-dim: #584727;
+  --danger: #ec8e7a;
   /* Last Video recency scale — see dateAgeClass(). Blue for this/last month,
      then green → yellow → orange → red as the year distance grows. */
   --age-current: #56B6E9;
@@ -15,10 +15,9 @@
   --age-recent: #E4C767;
   --age-old: #F0913C;
   --age-stale: #E0705A;
-  --scroll-thumb: #3a3841;
-  --scroll-thumb-hover: #4c4a55;
+  --scroll-thumb: #42454e;
+  --scroll-thumb-hover: #565a66;
   --radius: 10px;
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
@@ -56,6 +55,11 @@ html, body {
   color: var(--text);
   font-family: var(--sans);
   font-size: 14px;
+}
+
+/* Native controls and semantic text use the same family as the dashboard. */
+button, input, select, textarea, option, code, pre, kbd, samp {
+  font-family: inherit;
 }
 
 .app {
@@ -321,7 +325,7 @@ html, body {
 }
 
 .folder-count {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 11px;
   opacity: 0.7;
 }
@@ -436,7 +440,7 @@ html, body {
   border-radius: 6px;
   padding: 6px 8px;
   font-size: 13px;
-  font-family: var(--mono);
+  font-family: var(--sans);
 }
 
 .filter-input:focus { outline: none; border-color: var(--accent); }
@@ -511,7 +515,7 @@ html, body {
 .update-banner-text { flex: 1; min-width: 0; }
 
 .update-banner-cmd {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 11.5px;
   color: var(--accent);
   background: var(--panel);
@@ -546,7 +550,7 @@ html, body {
 /* "12 of 240 videos" — its own element so a count and a transient status
    message ("Refreshing…") can't overwrite each other. */
 .result-count {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 11.5px;
   color: var(--text-muted);
   white-space: nowrap;
@@ -563,7 +567,7 @@ html, body {
   border-radius: 6px;
   padding: 6px 6px;
   font-size: 13px;
-  font-family: var(--mono);
+  font-family: var(--sans);
   cursor: pointer;
 }
 
@@ -576,7 +580,7 @@ html, body {
 }
 
 .status-text {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -750,7 +754,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .row-date,
 .row-count,
 .row-subs {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 11.5px;
   color: var(--text);
   white-space: nowrap;
@@ -889,7 +893,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 }
 
 .channel-handle {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 11px;
   color: var(--text-muted);
 }
@@ -1039,6 +1043,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 }
 
 .modal-box-settings {
+  height: min(680px, calc(100dvh - 48px));
   width: 620px;
   max-width: calc(100vw - 48px);
 }
@@ -1054,11 +1059,6 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 /* Space stacked sections within a column; first title sits flush to the top. */
 .settings-col > .settings-section-title { margin-top: 20px; }
 .settings-col > .settings-section-title:first-child { margin-top: 0; }
-
-.settings-langs {
-  min-height: 220px;
-  resize: vertical;
-}
 
 .modal-box h2 { margin: 0 0 14px; font-size: 15px; }
 
@@ -1077,7 +1077,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   border-radius: 8px;
   padding: 9px 10px;
   font-size: 13px;
-  font-family: var(--mono);
+  font-family: var(--sans);
 }
 
 .field-input:focus { outline: none; border-color: var(--accent); }
@@ -1312,7 +1312,7 @@ label.scan-diff-row { cursor: pointer; }
 .scan-diff-arrow { color: var(--text-muted); }
 
 .scan-diff-sub {
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 10.5px;
   color: var(--text-muted);
 }
@@ -1470,7 +1470,7 @@ body[data-view="watchlater"] #videoFetchAllBtn { display: none; }
   right: 6px;
   background: rgba(0, 0, 0, 0.82);
   color: #fff;
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
@@ -1499,6 +1499,9 @@ body[data-view="watchlater"] #videoFetchAllBtn { display: none; }
   color: var(--text-muted);
   font-size: 12.5px;
 }
+a.video-channel { text-decoration: none; width: fit-content; max-width: 100%; }
+a.video-channel:hover { color: var(--accent); }
+a.video-channel:hover span { text-decoration: underline; }
 .video-channel img {
   width: 20px;
   height: 20px;
@@ -1532,3 +1535,130 @@ body[data-view="watchlater"] #videoFetchAllBtn { display: none; }
 }
 .video-act:hover { color: var(--text); border-color: var(--accent); }
 .video-act.on { color: var(--accent); border-color: var(--accent); }
+
+/* Recovery, incremental lists, and accessible actions. */
+body[data-view="removed"] .video-filters { display: flex; }
+body[data-view="removed"] .topbar .filter-group:not(.video-filters),
+body[data-view="removed"] #videoFetchAllBtn,
+body[data-view="removed"] #videoMarkAllBtn,
+body[data-view="removed"] #videoUnwatchedChip { display: none; }
+.removed-tab.active { color: var(--accent); background: var(--panel-2); }
+.video-title, a.channel-name { text-decoration: none; }
+.video-title:hover, a.channel-name:hover { text-decoration: underline; }
+button.tag-chip { line-height: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.video-actions { opacity: 1; flex-wrap: wrap; max-width: 290px; justify-content: flex-end; }
+.video-card:focus-within { background: var(--panel); }
+.channel-controls { display: flex; align-items: center; gap: 5px; }
+.channel-controls select { min-width: 0; flex: 1; }
+.load-more { display: block; margin: 8px auto 32px; }
+.load-more[hidden], .undo-toast[hidden], .refresh-errors[hidden], .retry-refresh[hidden] { display: none; }
+.undo-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; align-items: center; z-index: 2500; padding: 10px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: 0 6px 24px #0006; }
+.refresh-errors { margin: 8px 0; padding: 10px 14px; background: var(--panel-2); border-radius: 8px; font-size: 12px; }
+.retry-refresh { margin-bottom: 12px; }
+.backup-section { margin-top: 16px; }
+.backup-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.backup-row small { display: block; color: var(--text-muted); margin-top: 3px; }
+.scan-diff-section summary { cursor: pointer; padding: 10px 0; }
+.context-menu button:focus-visible, .context-submenu button:focus-visible { background: var(--panel-2); }
+@media (max-width: 900px) {
+  .video-card { grid-template-columns: 140px minmax(0, 1fr); }
+  .video-thumb { width: 140px; }
+  .video-actions { grid-column: 2; max-width: none; justify-content: flex-start; }
+}
+.modal-box { max-height: calc(100dvh - 48px); overflow-y: auto; }
+a.channel-name { color: var(--text); }
+body:has(.modal:not([hidden])) .undo-toast { display: none; }
+
+/* Keyboard settings use the existing dashboard theme. */
+.modal-box-settings { display: flex; flex-direction: column; overflow: hidden; }
+.modal-box-settings > h2, .settings-tabs, .settings-actions { flex: none; }
+.settings-tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+.settings-tabs button { background: var(--panel-2); color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+.settings-tabs button[aria-selected="true"] { color: var(--accent); border-color: var(--accent-dim); }
+.settings-content { flex: 1; scrollbar-gutter: stable; overflow-y: auto; min-height: 0; padding-right: 4px; }
+[data-settings-panel][hidden] { display: none; }
+.settings-actions .field-hint { flex: 1; margin: auto 0; }
+.settings-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.settings-section-head .btn { white-space: nowrap; }
+.control-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
+.control-option strong { font-size: 12px; }
+.control-option small { display: block; margin-top: 4px; color: var(--text-muted); font-size: 11.5px; line-height: 1.5; }
+.control-option input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
+.control-option select { width: 170px; flex: none; }
+.shortcut-status { font-size: 11.5px; line-height: 1.5; color: var(--text-muted); margin: 8px 0 12px; }
+.shortcut-status.error { color: var(--danger); }
+.shortcut-list { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.shortcut-group { margin: 0; padding: 8px 12px; background: var(--panel-2); color: var(--text-muted); font-size: 11px; }
+.shortcut-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-top: 1px solid var(--border); }
+.shortcut-row > span { flex: 1; font-size: 12px; }
+.shortcut-record { min-width: 105px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); font: 11px var(--sans); cursor: pointer; }
+.shortcut-record.recording { border-color: var(--accent); color: var(--accent); }
+.shortcut-clear { padding: 6px 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; font-size: 11px; cursor: pointer; }
+.shortcut-clear:disabled { opacity: .4; cursor: default; }
+.controls-subheading { margin-top: 24px; }
+.controls-reference { margin-top: 16px; font-size: 11.5px; color: var(--text-muted); }
+.controls-reference summary { cursor: pointer; color: var(--text); }
+.controls-reference dl > div { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; }
+.controls-reference dd { margin: 0; text-align: right; }
+kbd { font: 11px var(--sans); color: var(--text); }
+@media (max-width: 600px) {
+  .settings-grid { grid-template-columns: 1fr; }
+  .control-option select { width: 140px; }
+}
+
+/* Cosmetic polish: retain the compact layout and shared typography above. */
+:root {
+  --icon-play: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Crect%20x%3D%222%22%20y%3D%223%22%20width%3D%2220%22%20height%3D%2218%22%20rx%3D%224%22%2F%3E%3Cpath%20d%3D%22m10%208%206%204-6%204z%22%2F%3E%3C%2Fsvg%3E");
+  --icon-upload: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M12%2015V3m-5%205%205-5%205%205M4%2015v5h16v-5%22%2F%3E%3C%2Fsvg%3E");
+  --icon-download: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M12%203v12m-5-5%205%205%205-5M4%2016v4h16v-4%22%2F%3E%3C%2Fsvg%3E");
+}
+/* Transparent original glyphs retain the exact original icon footprint. */
+.brand-mark, #quickUploadBtn, #quickDownloadBtn { position: relative; color: transparent; }
+.brand-mark::after, #quickUploadBtn::after, #quickDownloadBtn::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  background-color: var(--text-muted);
+  mask-position: center;
+  mask-size: 16px 16px;
+  mask-repeat: no-repeat;
+}
+.brand-mark::after { background-color: var(--accent); mask-image: var(--icon-play); mask-size: contain; }
+#quickUploadBtn::after { mask-image: var(--icon-upload); mask-size: 13px 13px; }
+#quickDownloadBtn::after { mask-image: var(--icon-download); mask-size: 13px 13px; }
+#quickUploadBtn:hover::after, #quickDownloadBtn:hover::after { background-color: var(--accent); }
+
+/* Keep flag colors distinct while softening their solid fills. */
+.var-toggle.on-active { color: #91dfb1; background: #6fcf9721; border-color: #6fcf974d; }
+.var-toggle.on-finished { color: #92cff3; background: #56b6e921; border-color: #56b6e94d; }
+.var-toggle.on-track { color: #d8b4ef; background: #c792ea21; border-color: #c792ea4d; }
+.video-filters .var-toggle.on { color: #d8b4ef; background: #c792ea21; border-color: #c792ea4d; }
+.video-filters .var-toggle.on-neg { color: #eee1f6; background: #c792ea38; border-color: #c792ea70; }
+.btn-primary { box-shadow: inset 0 1px 0 #ffffff25; }
+.btn-ghost:hover, .shortcut-record:hover { background-color: var(--panel-2); }
+.video-card:hover, .channel-row:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.context-menu, .context-submenu { box-shadow: 0 8px 24px #0006; }
+
+/* Color/shadow transitions and opacity fades never move or resize the UI. */
+.btn, .icon-btn, .view-tab, .folder-item, .video-card, .channel-row,
+.video-act, .tag-chip, .shortcut-record, .settings-tabs button,
+.context-menu button, .context-submenu button, .search-input, .field-input,
+.filter-input, .var-lang, .folder-select, .folder-sort-select,
+.brand-mark::after, #quickUploadBtn::after, #quickDownloadBtn::after {
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+.modal:not([hidden]), .undo-toast:not([hidden]) { animation: surface-fade-in 140ms ease-out; }
+.context-menu:not([hidden]), .context-submenu:not([hidden]) { animation: surface-fade-in 90ms ease-out; }
+@keyframes surface-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+
+/* Searchable offline catalog; selection is committed by Settings Save. */
+.language-selection { font-size: 12px; color: var(--accent); line-height: 1.5; }
+#languagePresetBtn { margin-bottom: 14px; white-space: normal; }
+.language-catalog { max-height: 260px; overflow-y: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; }
+.language-choice { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; }
+.language-choice:hover { background: var(--panel-2); }
+.language-choice input { accent-color: var(--accent); }
+.language-choice strong { font-size: 12px; font-weight: 500; }
+.language-choice small { display: block; font-size: 11px; color: var(--text-muted); margin-top: 2px; }

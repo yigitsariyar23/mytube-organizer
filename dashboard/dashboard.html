@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>MyTube Organizer</title>
 <link rel="stylesheet" href="dashboard.css" />
 </head>
@@ -9,11 +10,11 @@
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-mark">◧</span>
+        <span class="brand-mark" aria-hidden="true">◧</span>
         <span class="brand-name">MyTube</span>
         <div class="brand-sync">
-          <button id="quickUploadBtn" class="icon-btn" type="button" title="Upload to the Gist — opens the same review as Settings, nothing moves until you apply it">↑</button>
-          <button id="quickDownloadBtn" class="icon-btn" type="button" title="Download from the Gist — opens the same review as Settings, nothing moves until you apply it">↓</button>
+          <button id="quickUploadBtn" aria-label="Review upload to Gist" class="icon-btn" type="button" title="Upload to the Gist — opens the same review as Settings, nothing moves until you apply it">↑</button>
+          <button id="quickDownloadBtn" aria-label="Review download from Gist" class="icon-btn" type="button" title="Download from the Gist — opens the same review as Settings, nothing moves until you apply it">↓</button>
         </div>
       </div>
 
@@ -23,6 +24,7 @@
         <button id="viewWatchLaterBtn" class="view-tab" data-view="watchlater">Watch&nbsp;Later</button>
       </div>
 
+      <button id="viewRemovedBtn" class="btn btn-text removed-tab">Removed videos</button>
       <button id="scanBtn" class="btn btn-primary btn-block">Scan Channels</button>
       <button id="refreshBtn" class="btn btn-ghost btn-block">Refresh Stats</button>
 
@@ -53,7 +55,7 @@
       </div>
       <div class="topbar">
         <div class="search-wrap">
-          <input id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
+          <input aria-label="Search library" id="searchInput" class="search-input" type="text" placeholder="Search channels…" />
           <button id="searchClear" class="input-clear" type="button" title="Clear search" hidden>×</button>
         </div>
         <div id="videoFilters" class="filter-group video-filters">
@@ -61,7 +63,7 @@
           <button id="videoSortDate" class="video-sort-btn" data-sort="date">Date <span class="vs-arrow"></span></button>
           <button id="videoSortLength" class="video-sort-btn" data-sort="length">Length <span class="vs-arrow"></span></button>
           <span class="video-filter-sep"></span>
-          <span id="videoUnwatchedChip" class="tag-chip var-toggle" data-role="filter-unwatched">Unwatched</span>
+          <button id="videoUnwatchedChip" class="tag-chip var-toggle" data-role="filter-unwatched">Unwatched</button>
           <button id="videoMarkAllBtn" class="btn btn-text">Mark all watched</button>
           <button id="videoFetchAllBtn" class="btn btn-text" title="Fetch the full upload history of every tracked channel (needs an API key)">Fetch full history</button>
         </div>
@@ -97,10 +99,12 @@
         <div class="topbar-end">
           <span id="resultCount" class="result-count"></span>
           <button id="clearAllFiltersBtn" class="btn btn-ghost" type="button" title="Clear every filter in this view" hidden>Clear filters</button>
-          <span id="statusText" class="status-text"></span>
+          <span id="statusText" class="status-text" role="status"></span>
         </div>
       </div>
 
+      <details id="refreshErrors" class="refresh-errors" hidden></details>
+      <button id="retryRefreshBtn" class="btn btn-ghost retry-refresh" hidden>Retry failed channels</button>
       <div id="listTableHeader" class="list-table-header" hidden>
         <div class="lth-channel">Channel</div>
         <div class="lth-sort-col" data-sort="date">Last Video <span class="lth-arrow"></span></div>
@@ -146,13 +150,21 @@
         </p>
       </div>
       <div id="watchLaterGrid" class="video-feed" hidden></div>
+      <button id="videoLoadMoreBtn" class="btn btn-ghost load-more" hidden>Load more</button>
     </main>
   </div>
 
   <!-- Settings panel -->
-  <div id="settingsModal" class="modal" hidden>
+  <div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-label="Settings" hidden>
     <div class="modal-box modal-box-settings">
       <h2>Settings</h2>
+      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button id="settingsGeneralTab" role="tab" aria-selected="true" aria-controls="settingsGeneralPanel" data-settings-tab="general">General</button>
+        <button id="settingsControlsTab" role="tab" aria-selected="false" aria-controls="settingsControlsPanel" tabindex="-1" data-settings-tab="controls">Controls</button>
+        <button id="settingsBackupsTab" role="tab" aria-selected="false" aria-controls="settingsBackupsPanel" tabindex="-1" data-settings-tab="backups">Backups</button>
+      </div>
+      <div class="settings-content">
+      <div id="settingsGeneralPanel" role="tabpanel" aria-labelledby="settingsGeneralTab" data-settings-panel="general">
       <div class="settings-grid">
         <section class="settings-col">
           <h3 class="settings-section-title">YouTube API</h3>
@@ -178,16 +190,54 @@
 
         <section class="settings-col">
           <h3 class="settings-section-title">Languages</h3>
-          <label class="field-label" for="languagesInput">Dropdown options (one per line)</label>
-          <textarea id="languagesInput" class="field-input settings-langs" spellcheck="false"></textarea>
-          <p class="field-hint">The set shown in each channel's language picker (right-click a channel &rarr; Set language to add one without coming here). One per line; blank resets to defaults. A flag is matched from the name &mdash; start a line with an emoji to force a different one.</p>
+          <p class="field-hint">Choose the languages you use. Only active languages appear in dashboard pickers and filters. Existing channel assignments are kept when a language is deactivated.</p>
+          <p id="languageSelection" class="language-selection" aria-live="polite"></p>
+          <button id="languagePresetBtn" type="button" class="btn btn-ghost">Use Turkish, English, Russian &amp; French</button>
+          <label class="field-label" for="languageSearch">Find a language</label>
+          <input id="languageSearch" class="field-input" type="search" placeholder="Search English or native names…" />
+          <div id="languageCatalog" class="language-catalog" role="group" aria-label="Active languages"></div>
         </section>
       </div>
 
-      <hr class="settings-sep" />
+      </div>
+      <section id="settingsControlsPanel" role="tabpanel" aria-labelledby="settingsControlsTab" data-settings-panel="controls" hidden>
+        <div class="settings-section-head"><div><h3 class="settings-section-title">Keyboard shortcuts</h3><p class="field-hint">Click a key to record a shortcut. Changes take effect when you save.</p></div><button id="resetControlsBtn" class="btn btn-ghost" type="button">Reset defaults</button></div>
+        <label class="control-option"><span><strong>Enable dashboard shortcuts</strong><small>Active while browsing this page. Paused in text fields, menus, and dialogs.</small></span><input id="shortcutsEnabledInput" type="checkbox" role="switch" /></label>
+        <p id="shortcutStatus" class="shortcut-status" role="status">Use letters, numbers, or punctuation, with optional modifiers. Escape cancels recording.</p>
+        <div id="shortcutList" class="shortcut-list"></div>
+        <p class="field-hint">Shortcuts stay on this device. Key labels use US keyboard positions; you can record the physical keys you prefer.</p>
+        <h3 class="settings-section-title controls-subheading">Mouse &amp; selection</h3>
+        <label class="control-option" for="selectionModifierInput"><span><strong>Select multiple items</strong><small>Hold this key and click a channel or video. Shift-click selects a range.</small></span><select id="selectionModifierInput" class="field-input"><option value="primary">Ctrl / ⌘ + click</option><option value="alt">Alt / Option + click</option></select></label>
+        <label class="control-option"><span><strong>Adjust number filters with the scroll wheel</strong><small>Applies to video counts and dates. You can always type or drag values.</small></span><input id="wheelAdjustsNumbersInput" type="checkbox" role="switch" /></label>
+        <details class="controls-reference"><summary>Everyday controls</summary><p>These standard controls stay available with shortcuts turned off.</p><dl>
+          <div><dt>Move between controls</dt><dd><kbd>Tab</kbd> / <kbd>Shift + Tab</kbd></dd></div>
+          <div><dt>Activate a button or folder</dt><dd><kbd>Enter</kbd> / <kbd>Space</kbd></dd></div>
+          <div><dt>Close a menu or dialog</dt><dd><kbd>Esc</kbd></dd></div>
+          <div><dt>Navigate menus</dt><dd>Arrow keys</dd></div>
+          <div><dt>Exclude a filter</dt><dd>Right-click, or <kbd>Shift + Enter</kbd> on a filter chip</dd></div>
+          <div><dt>Open a video in a background tab</dt><dd>Middle-click</dd></div>
+          <div><dt>Open item actions</dt><dd>Right-click</dd></div>
+        </dl></details>
+      </section>
+      <section id="settingsBackupsPanel" role="tabpanel" aria-labelledby="settingsBackupsTab" data-settings-panel="backups" hidden>
+      <section class="backup-section" aria-labelledby="backupHeading">
+        <h3 id="backupHeading" class="settings-section-title">Local backups</h3>
+        <p class="field-hint">Export a portable JSON file or restore an existing one. Downloads, imports, and clearing the library save a recovery snapshot first. The latest five snapshots stay on this device.</p>
+        <div class="settings-row">
+          <button id="exportBackupBtn" class="btn btn-ghost">Export JSON</button>
+          <button id="importBackupBtn" class="btn btn-ghost">Import JSON</button>
+          <button id="createBackupBtn" class="btn btn-ghost">Save snapshot</button>
+          <input id="backupFileInput" type="file" accept=".json,application/json" hidden />
+        </div>
+        <p id="backupStatus" class="field-hint" role="status"></p>
+        <div id="backupList"></div>
+      </section>
 
-      <div class="modal-actions">
-        <button id="clearDataBtn" class="btn btn-ghost">Clear all data</button>
+      <div class="settings-row"><button id="clearDataBtn" class="btn btn-ghost">Clear library</button></div>
+      </section>
+      </div>
+      <div class="modal-actions settings-actions">
+        <span id="settingsStatus" class="field-hint" role="status">Save to apply your preferences.</span>
         <button id="settingsCancel" class="btn btn-ghost">Cancel</button>
         <button id="settingsSave" class="btn btn-primary">Save</button>
       </div>
@@ -195,7 +245,7 @@
   </div>
 
   <!-- New folder / rename panel -->
-  <div id="folderModal" class="modal" hidden>
+  <div id="folderModal" class="modal" role="dialog" aria-modal="true" aria-label="Edit folder" hidden>
     <div class="modal-box">
       <h2 id="folderModalTitle">New folder</h2>
       <label id="folderNameLabel" class="field-label" for="folderNameInput">Folder name</label>
@@ -212,7 +262,7 @@
   </div>
 
   <!-- Scan review panel — shown after a scan, before anything is committed -->
-  <div id="scanDiffModal" class="modal" hidden>
+  <div id="scanDiffModal" class="modal" role="dialog" aria-modal="true" aria-label="Review scan" hidden>
     <div class="modal-box modal-box-wide">
       <h2>Review scan changes</h2>
       <p id="scanDiffSummary" class="field-hint"></p>
@@ -226,7 +276,7 @@
   </div>
 
   <!-- Sync diff panel -->
-  <div id="syncDiffModal" class="modal" hidden>
+  <div id="syncDiffModal" class="modal" role="dialog" aria-modal="true" aria-label="Review sync" hidden>
     <div class="modal-box modal-box-wide">
       <h2 id="syncDiffTitle">Review changes</h2>
       <p id="syncDiffSummary" class="field-hint"></p>
@@ -240,7 +290,7 @@
   </div>
 
   <!-- Playlist import review panel -->
-  <div id="playlistImportModal" class="modal" hidden>
+  <div id="playlistImportModal" class="modal" role="dialog" aria-modal="true" aria-label="Import playlist" hidden>
     <div class="modal-box modal-box-wide">
       <h2>Import playlist to Watch Later</h2>
       <label class="field-label" for="playlistImportName">List name</label>
@@ -255,11 +305,16 @@
     </div>
   </div>
 
+  <div id="undoToast" class="undo-toast" role="status" hidden>
+    <span id="undoMessage"></span><button id="undoBtn" class="btn btn-ghost">Undo</button>
+    <button id="undoDismiss" class="btn btn-text" aria-label="Dismiss undo">×</button>
+  </div>
+
   <!-- Right-click menu -->
   <div id="contextMenu" class="context-menu" hidden></div>
   <div id="contextSubmenu" class="context-submenu" hidden></div>
   <div id="contextSubSubmenu" class="context-submenu" hidden></div>
 
-  <script src="dashboard.js"></script>
+  <script type="module" src="dashboard.js"></script>
 </body>
 </html>

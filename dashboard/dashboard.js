@@ -1,3 +1,7 @@
+import { LANGUAGE_CATALOG, DEFAULT_LANGUAGES, canonicalLanguage, activeLanguages, languageCatalogMatches } from "../shared/languages.js";
+import { SHORTCUTS, normalizeControls, shortcutFromEvent, bindingError, shortcutConflict, formatShortcut, selectionModifierPressed } from "../shared/controls.js";
+import { RECORD_KEYS, VIDEO_FLAGS, recordPatch, clone, isPlaylistOverlayTitle } from "../shared/library.js";
+
 // dashboard.js — MyTube Organizer main panel logic
 
 const TAG_PALETTE = [
@@ -31,17 +35,9 @@ function langColor(lang) {
   return LANG_PALETTE[h % LANG_PALETTE.length];
 }
 
-// Language variable: a curated dropdown list. A channel may also hold a custom
-// language (via the "Other…" prompt); such values are injected as an extra option.
-const DEFAULT_LANGUAGES = [
-  "English", "Türkçe", "Español", "Português", "Deutsch", "Français",
-  "Italiano", "Русский", "日本語", "한국어", "中文", "हिन्दी", "العربية",
-];
-// Mutable at runtime: the curated set is editable in Settings and persisted
-// to storage under "languages". Reassigned in loadState and on settings save.
+// "languages" stores the active selection; catalog choices live in Settings.
 let LANGUAGES = [...DEFAULT_LANGUAGES];
-const LANG_OTHER = "__other__";
-
+let languagesDraft = new Set();
 // Flag emoji per language. Keyed by the lowercased label, with the native name,
 // the English name and the ISO 639-1 code all mapping to the same flag — so a
 // language typed by hand as "Dutch", "nederlands" or "nl" still resolves. A
@@ -128,9 +124,64 @@ function langLabel(lang) {
 }
 
 let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null, pendingPlaylistImport: null };
+let libraryBaseline = Object.fromEntries(RECORD_KEYS.map(k => [k, {}]));
+let undoVideoChanges = null;
+let libraryEditSequence = 0;
+let pendingVideoPage = { signature: '', limit: 60, list: [], mode: 'new', container: null };
+let failedRefreshIds = [];
+let refreshRunning = false;
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
+let controls = normalizeControls();
+let controlsDraft = null;
+let recordingShortcut = null;
+let syncSkipVideoIds = new Set();
+let syncSkipAllVideos = false;
+let syncReviewRequest = 0;
+
+async function requestWorker(type, payload = {}) {
+  try { return await chrome.runtime.sendMessage({ type, ...payload }); }
+  catch (error) { return { ok: false, error: error.message || 'The extension disconnected. Reload the dashboard and try again.' }; }
+}
+
+async function persistSettings(values) {
+  const result = await requestWorker('SET_SETTINGS', { values });
+  if (!result.ok) throw new Error(result.error || 'Could not save settings.');
+}
+
+async function persistLibrary(values) {
+  const editSequence = ++libraryEditSequence;
+  const patches = {};
+  const undo = [];
+  for (const key of Object.keys(values)) {
+    if (!RECORD_KEYS.includes(key)) continue;
+    patches[key] = recordPatch(libraryBaseline[key], values[key]);
+    if (key === 'videos') for (const change of patches[key]) {
+      if (!change.create && !change.remove && VIDEO_FLAGS.some(k => Object.hasOwn(change.set || {}, k) || change.unset?.includes(k))) {
+        const before = libraryBaseline.videos[change.id], after = values.videos[change.id];
+        undo.push({ id: change.id, before: Object.fromEntries(VIDEO_FLAGS.map(k => [k, before[k] ?? null])),
+          after: Object.fromEntries(VIDEO_FLAGS.map(k => [k, after[k] ?? null])) });
+      }
+    }
+    libraryBaseline[key] = clone(values[key]);
+  }
+  if (!Object.values(patches).some(changes => changes.length)) return;
+  const result = await requestWorker('PATCH_LIBRARY', { patches });
+  if (!result?.ok) {
+    await loadState();
+    render();
+    el.statusText.textContent = result?.error || 'Could not save changes.';
+    return;
+  }
+  if (undo.length && editSequence === libraryEditSequence) {
+    undoVideoChanges = undo.map(change => ({ ...change, after: result.videoStates[change.id] }));
+    el.undoMessage.textContent = `${undo.length === 1 ? 'Video updated' : `${undo.length} videos updated`}.`;
+    el.undoToast.hidden = false;
+  }
+}
+
 let currentFolderId = "all";       // selected channel folder (Channels/New views)
 let currentListId = "all";         // selected Watch Later list
-let currentView = "channels";      // "channels" | "new" | "watchlater"
+let currentView = "channels";      // "channels" | "new" | "watchlater" | "removed"
 // Watched filter per video view: "" (everything) | "unwatched" | "watched".
 // Same left/right-click rule as every other chip — see toggleChipFilter.
 let newWatchedFilter = "unwatched";        // New feed defaults to hiding watched
@@ -185,6 +236,7 @@ let filterBeforeDate = null; // ISO date string upper bound (inclusive)
 
 // Infinite scroll: render channels in batches as the user scrolls near the bottom.
 const PAGE_SIZE = 40;
+let channelPageSignature = "";
 let pendingChannels = []; // filtered channels not yet appended to the grid
 let pendingFolderOptions = []; // precomputed move-folder <option> data, rebuilt each render
 let scrollObserver = null;
@@ -202,6 +254,21 @@ const COL_GAP = 16;                           // must match the grid `gap`
 const COL_PAD_X = 28;                         // .list-table-header horizontal padding (14*2)
 
 const el = {
+  viewRemovedBtn: document.getElementById("viewRemovedBtn"),
+  videoLoadMoreBtn: document.getElementById("videoLoadMoreBtn"),
+  retryRefreshBtn: document.getElementById("retryRefreshBtn"),
+  refreshErrors: document.getElementById("refreshErrors"),
+  undoToast: document.getElementById("undoToast"),
+  undoMessage: document.getElementById("undoMessage"),
+  undoBtn: document.getElementById("undoBtn"),
+  undoDismiss: document.getElementById("undoDismiss"),
+  exportBackupBtn: document.getElementById("exportBackupBtn"),
+  importBackupBtn: document.getElementById("importBackupBtn"),
+  backupFileInput: document.getElementById("backupFileInput"),
+  createBackupBtn: document.getElementById("createBackupBtn"),
+  backupList: document.getElementById("backupList"),
+  backupStatus: document.getElementById("backupStatus"),
+
   folderList: document.getElementById("folderList"),
   folderSortSelect: document.getElementById("folderSortSelect"),
   folderSectionLabel: document.getElementById("folderSectionLabel"),
@@ -230,11 +297,21 @@ const el = {
   fillAvatarsBtn: document.getElementById("fillAvatarsBtn"),
   fillAvatarsStatus: document.getElementById("fillAvatarsStatus"),
   addFolderBtn: document.getElementById("addFolderBtn"),
+  shortcutList: document.getElementById("shortcutList"),
+  shortcutStatus: document.getElementById("shortcutStatus"),
+  resetControlsBtn: document.getElementById("resetControlsBtn"),
+  shortcutsEnabledInput: document.getElementById("shortcutsEnabledInput"),
+  selectionModifierInput: document.getElementById("selectionModifierInput"),
+  wheelAdjustsNumbersInput: document.getElementById("wheelAdjustsNumbersInput"),
+  settingsStatus: document.getElementById("settingsStatus"),
   settingsBtn: document.getElementById("settingsBtn"),
   settingsModal: document.getElementById("settingsModal"),
   apiKeyInput: document.getElementById("apiKeyInput"),
   gistTokenInput: document.getElementById("gistTokenInput"),
-  languagesInput: document.getElementById("languagesInput"),
+  languageSearch: document.getElementById("languageSearch"),
+  languageCatalog: document.getElementById("languageCatalog"),
+  languageSelection: document.getElementById("languageSelection"),
+  languagePresetBtn: document.getElementById("languagePresetBtn"),
   syncUploadBtn: document.getElementById("syncUploadBtn"),
   syncDownloadBtn: document.getElementById("syncDownloadBtn"),
   quickUploadBtn: document.getElementById("quickUploadBtn"),
@@ -300,7 +377,7 @@ const el = {
   watchLaterEmptyState: document.getElementById("watchLaterEmptyState"),
 };
 
-init();
+init().catch(error => { el.statusText.textContent = `Could not open the library: ${error.message}`; });
 
 // Only the years the library actually covers. These dropdowns bound
 // `lastVideoDate`, so a fixed 2005→today list was mostly dead choice: scrolling
@@ -355,17 +432,21 @@ async function init() {
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
+    for (const key of RECORD_KEYS) if (changes[key]) libraryBaseline[key] = clone(changes[key].newValue || {});
     if (changes.channels) state.channels = changes.channels.newValue || {};
     if (changes.folders) state.folders = changes.folders.newValue || {};
     if (changes.tags) state.tags = changes.tags.newValue || {};
     if (changes.videos) {
       state.videos = changes.videos.newValue || {};
-      resetVideoStateSnapshot();
     }
     if (changes.videoFolders) state.videoFolders = changes.videoFolders.newValue || defaultFolders();
     // Settings synced from another device (background gist merge / download).
     if (changes.apiKey) state.apiKey = changes.apiKey.newValue || "";
-    if (changes.languages) LANGUAGES = changes.languages.newValue?.length ? changes.languages.newValue : [...DEFAULT_LANGUAGES];
+    if (changes.languages) {
+      LANGUAGES = activeLanguages(changes.languages.newValue);
+      activeLangFilters = new Set([...activeLangFilters].filter(l => LANGUAGES.includes(l)));
+      excludedLangFilters = new Set([...excludedLangFilters].filter(l => LANGUAGES.includes(l)));
+    }
     if (changes.pendingScan) {
       state.pendingScan = changes.pendingScan.newValue || null;
       if (state.pendingScan) openScanDiffModal(state.pendingScan);
@@ -376,7 +457,17 @@ async function init() {
       if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
       else el.playlistImportModal.hidden = true;
     }
-    render();
+    if (changes.lastSyncedAt) state.lastSyncedAt = changes.lastSyncedAt.newValue || null;
+    if (changes.gistId) state.gistId = changes.gistId.newValue || '';
+    if (changes.gistToken) state.gistToken = changes.gistToken.newValue || '';
+    if (changes.controls) { controls = normalizeControls(changes.controls.newValue); renderShortcutHints(); }
+    if (changes.libraryBackups && !el.settingsModal.hidden) refreshBackupList();
+    if (changes.channels || changes.folders || changes.tags || changes.languages || changes.apiKey || changes.videoFolders) render();
+    else if (changes.videos && currentView !== 'channels') {
+      if (currentView === 'watchlater') renderFolders();
+      renderCurrentView();
+    }
+    if (changes.lastSyncedAt || changes.gistId) renderSyncStatus();
   });
 
   // After the listener is wired, so a long background job's incremental writes
@@ -403,17 +494,20 @@ async function loadState() {
     "channels", "folders", "tags", "videos", "videoFolders", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
     "pendingPlaylistImport",
     "sortDate", "sortCount", "sortSubs", "sortFolder", "sortPriority",
-    "folderSort", "languages", "currentView", "colWidths", "videoSort",
+    "folderSort", "languages", "currentView", "colWidths", "videoSort", "controls",
   ]);
+  controls = normalizeControls(data.controls);
   state.channels = data.channels || {};
   state.folders = data.folders || defaultFolders();
   state.tags = data.tags || {};
   state.videos = data.videos || {};
-  resetVideoStateSnapshot();
+  for (const key of RECORD_KEYS) libraryBaseline[key] = clone(data[key] || {});
   state.videoFolders = data.videoFolders && Object.keys(data.videoFolders).length ? data.videoFolders : defaultFolders();
+  libraryBaseline.folders = clone(state.folders);
+  libraryBaseline.videoFolders = clone(state.videoFolders);
   // "videos" was the old single video tab; it split into "new" + "watchlater".
   const v = data.currentView === "videos" ? "new" : data.currentView;
-  currentView = ["channels", "new", "watchlater"].includes(v) ? v : "channels";
+  currentView = ["channels", "new", "watchlater", "removed"].includes(v) ? v : "channels";
   state.apiKey = data.apiKey || "";
   state.gistToken = data.gistToken || "";
   state.gistId = data.gistId || "";
@@ -430,7 +524,7 @@ async function loadState() {
   const storedPriority = Array.isArray(data.sortPriority) ? data.sortPriority.filter((k) => SORT_KEYS.includes(k)) : [];
   sortPriority = [...new Set([...storedPriority, ...SORT_KEYS])];
   folderSort = ["alpha", "count-desc", "count-asc"].includes(data.folderSort) ? data.folderSort : "custom";
-  LANGUAGES = Array.isArray(data.languages) && data.languages.length ? data.languages : [...DEFAULT_LANGUAGES];
+  LANGUAGES = activeLanguages(data.languages);
   colWidths = Array.isArray(data.colWidths) && data.colWidths.length === COL_MINS.length
     ? data.colWidths.map((w, i) => Math.max(COL_MINS[i], Number(w) || COL_MINS[i]))
     : null;
@@ -449,7 +543,7 @@ function fdom() {
   if (currentView === "watchlater") {
     return {
       folders: state.videoFolders,
-      persist: () => chrome.storage.local.set({ videoFolders: state.videoFolders }),
+      persist: () => persistLibrary({ videoFolders: state.videoFolders }),
       counts: () => {
         const m = {};
         for (const v of Object.values(state.videos)) {
@@ -469,7 +563,7 @@ function fdom() {
   const trackedOnly = currentView === "new";
   return {
     folders: state.folders,
-    persist: () => chrome.storage.local.set({ folders: state.folders }),
+    persist: () => persistLibrary({ folders: state.folders }),
     counts: () => {
       const m = {};
       for (const c of Object.values(state.channels)) {
@@ -490,8 +584,11 @@ function fdom() {
 
 function render() {
   document.body.dataset.view = currentView;
+  renderShortcutHints();
   el.viewChannelsBtn.classList.toggle("active", currentView === "channels");
   el.viewNewBtn.classList.toggle("active", currentView === "new");
+  el.viewRemovedBtn.classList.toggle("active", currentView === "removed");
+  el.videoLoadMoreBtn.hidden = currentView === "channels";
   el.viewWatchLaterBtn.classList.toggle("active", currentView === "watchlater");
   const channels = currentView === "channels";
 
@@ -505,7 +602,7 @@ function render() {
   el.scrollSentinel.hidden = !channels;
   if (!channels) el.tagFilterBar.hidden = true;
   // Video surfaces
-  el.videoFeed.hidden = currentView !== "new";
+  el.videoFeed.hidden = currentView !== "new" && currentView !== "removed";
   el.watchLaterGrid.hidden = currentView !== "watchlater";
 
   if (channels) {
@@ -523,8 +620,8 @@ function render() {
   el.noResultsState.hidden = true;
   el.listTableHeader.hidden = true;
 
-  if (currentView === "new") {
-    el.searchInput.placeholder = "Search new videos…";
+  if (currentView === "new" || currentView === "removed") {
+    el.searchInput.placeholder = currentView === "removed" ? "Search removed videos…" : "Search new videos…";
     el.watchLaterEmptyState.hidden = true;
     renderVideoFeed();
   } else {
@@ -565,6 +662,7 @@ function newFeedUniverse() {
   const inFolder = folderScopeTest(currentFolderId);
   return Object.values(state.videos).filter((v) => {
     const ch = state.channels[v.channelId];
+    if (currentView === "removed") return !!v.hidden && (!inFolder || inFolder(ch?.folderId));
     if (!ch || !ch.trackVideos) return false;
     if (v.hidden) return false;              // user-dismissed from the feed
     if (isUpcomingOrLive(v)) return false;   // live streams / scheduled premieres
@@ -580,13 +678,13 @@ function applyVideoChips(list, watchedFilter) {
     if (watchedFilter === "unwatched" && v.watched) return false;
     if (watchedFilter === "watched" && !v.watched) return false;
     if (!q) return true;
-    const author = v.channelId ? state.channels[v.channelId]?.name : v.author;
+    const author = state.channels[v.channelId]?.name || v.author;
     return `${v.title} ${author || ""}`.toLowerCase().includes(q);
   });
 }
 
 function getFilteredVideos() {
-  return sortVideos(applyVideoChips(newFeedUniverse(), newWatchedFilter));
+  return sortVideos(applyVideoChips(newFeedUniverse(), currentView === "removed" ? "" : newWatchedFilter));
 }
 
 // A live stream or a scheduled/upcoming premiere — not a real uploaded video.
@@ -625,7 +723,7 @@ function maybeFetchVideoDetails() {
   if (videoDetailsRequested || !state.apiKey) return;
   const needs = Object.values(state.videos).some((v) => {
     // A saved video missing its channel name/avatar/date also needs a details pass.
-    if (v.saved && (!v.channelId || !v.channelThumbnail || !v.published)) return true;
+    if (v.saved && (!v.channelId || !v.channelThumbnail || !v.published || !v.author || !v.channelUrl || isPlaylistOverlayTitle(v.title))) return true;
     return (v.duration === undefined || v.live === "live" || v.live === "upcoming") &&
       (v.saved || (v.channelId && state.channels[v.channelId]?.trackVideos));
   });
@@ -650,39 +748,90 @@ function renderVideoFeed() {
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
-  const noneTracked = !anyTrackedChannel();
+  const noneTracked = currentView !== "removed" && !anyTrackedChannel();
   el.videoEmptyState.hidden = !noneTracked;
   if (noneTracked) {
     el.videoFeed.innerHTML = "";
+    el.videoLoadMoreBtn.hidden = true;
     renderResultCount(0, 0, "video");
     return;
   }
 
   const universe = newFeedUniverse();
-  const vids = sortVideos(applyVideoChips(universe, newWatchedFilter));
+  const vids = sortVideos(applyVideoChips(universe, currentView === "removed" ? "" : newWatchedFilter));
   renderResultCount(vids.length, universe.length, "video");
 
   if (!vids.length) {
-    const filtered = !!searchQuery.trim() || newWatchedFilter !== "";
-    el.videoFeed.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No videos match the current filters." : "No videos fetched yet — click Refresh Stats to pull them."}</p></div>`;
+    el.videoLoadMoreBtn.hidden = true;
+    const filtered = !!searchQuery.trim() || (currentView !== "removed" && newWatchedFilter !== "");
+    el.videoFeed.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No videos match the current filters." : currentView === "removed" ? "No removed videos in this folder." : "No videos fetched yet — click Refresh Stats to pull them."}</p></div>`;
     return;
   }
 
-  // Day headers only make sense when the feed is in date order.
-  const groupByDay = videoSortKey === "date";
-  let html = "";
-  let lastLabel = null;
-  for (const v of vids) {
-    if (groupByDay) {
-      const label = dayLabel(v.published);
-      if (label !== lastLabel) {
-        html += `<div class="video-day">${escapeHtml(label)}</div>`;
-        lastLabel = label;
-      }
+  renderVideoList(vids, currentView === 'removed' ? 'removed' : 'new', el.videoFeed);
+}
+
+// Keep existing card nodes and loaded depth when data changes. Only changed
+// cards are replaced; an on-screen item anchors the scroll offset.
+function reconcileChildren(container, entries) {
+  const top = el.main.getBoundingClientRect().top;
+  const anchors = [...container.querySelectorAll('[data-video-id], [data-channel-id]')]
+    .filter(node => node.getBoundingClientRect().bottom > top).slice(0, 8)
+    .map(node => ({ key: node.dataset.renderKey, offset: node.getBoundingClientRect().top }));
+  const focused = document.activeElement;
+  const focusCard = focused?.closest('[data-render-key]');
+  const focusKey = focusCard?.dataset.renderKey;
+  const focusSelector = focused?.dataset.action ? `[data-action="${focused.dataset.action}"]`
+    : focused?.dataset.role ? `[data-role="${focused.dataset.role}"]` : focused?.tagName === 'A' ? 'a' : null;
+  const old = new Map([...container.children].map(node => [node.dataset.renderKey, node]));
+  let cursor = container.firstChild;
+  for (const [key, html] of entries) {
+    let node = old.get(key);
+    if (!node || node._renderHtml !== html) {
+      const template = document.createElement('template');
+      template.innerHTML = html;
+      const replacement = template.content.firstElementChild;
+      replacement.dataset.renderKey = key;
+      replacement._renderHtml = html;
+      if (node === cursor) cursor = node.nextSibling;
+      if (node) node.replaceWith(replacement);
+      node = replacement;
     }
-    html += videoCardHtml(v, "new");
+    if (node !== cursor) container.insertBefore(node, cursor);
+    cursor = node.nextSibling;
+    old.delete(key);
   }
-  el.videoFeed.innerHTML = html;
+  for (const node of old.values()) node.remove();
+  for (const anchor of anchors) {
+    const node = [...container.children].find(n => n.dataset.renderKey === anchor.key);
+    if (node) { el.main.scrollTop += node.getBoundingClientRect().top - anchor.offset; break; }
+  }
+  if (focusKey && !focused.isConnected && focusSelector) {
+    const replacement = [...container.children].find(n => n.dataset.renderKey === focusKey);
+    replacement?.querySelector(focusSelector)?.focus({ preventScroll: true });
+  }
+}
+
+function renderVideoList(list, mode, container) {
+  const signature = JSON.stringify([currentView, currentFolderId, currentListId, searchQuery, videoSortKey, videoSortDir, newWatchedFilter, watchLaterWatchedFilter]);
+  if (signature !== pendingVideoPage.signature) {
+    pendingVideoPage.limit = 60;
+    container.replaceChildren();
+  }
+  Object.assign(pendingVideoPage, { signature, list, mode, container });
+  const entries = [];
+  let previousDay = null;
+  for (const video of list.slice(0, pendingVideoPage.limit)) {
+    if (mode === 'new' && videoSortKey === 'date') {
+      const day = dayLabel(video.published);
+      if (day !== previousDay) entries.push([`day:${day}`, `<div class="video-day">${escapeHtml(day)}</div>`]);
+      previousDay = day;
+    }
+    entries.push([`video:${video.id}`, videoCardHtml(video, mode)]);
+  }
+  reconcileChildren(container, entries);
+  el.videoLoadMoreBtn.hidden = list.length <= pendingVideoPage.limit;
+  el.videoLoadMoreBtn.textContent = `Load more (${Math.min(pendingVideoPage.limit, list.length)} of ${list.length})`;
 }
 
 // A video card for either video view. `mode` picks the action buttons:
@@ -690,15 +839,18 @@ function renderVideoFeed() {
 function videoCardHtml(v, mode) {
   const ch = v.channelId ? state.channels[v.channelId] : null;
   const channelName = ch?.name || v.author || "";
+  const channelUrl = videoChannelUrl(v);
   const avatarSrc = ch?.thumbnail || v.channelThumbnail || null;
   const avatar = avatarSrc
-    ? `<img src="${escapeHtml(avatarSrc)}" alt="" onerror="this.outerHTML='<span class=&quot;vc-avatar-fallback&quot;></span>'" />`
+    ? `<img src="${escapeHtml(avatarSrc)}" alt="" />`
     : `<span class="vc-avatar-fallback"></span>`;
   const when = v.published ? relativeTime(v.published) : "";
   const views = v.viewCount != null ? formatViews(v.viewCount) : "";
   const meta = [when, views].filter(Boolean).join(" · ");
   const durationBadge = v.duration != null ? `<span class="video-duration">${escapeHtml(formatDuration(v.duration))}</span>` : "";
-  const actions = mode === "watchlater"
+  const actions = mode === "removed"
+    ? `<button class="video-act" data-action="restore">Restore to New</button>`
+    : mode === "watchlater"
     ? `<button class="video-act" data-action="toggle-watched">${v.watched ? "Mark unwatched" : "Mark watched"}</button>
        <button class="video-act" data-action="remove" title="Remove from Watch Later">Remove</button>`
     : `<button class="video-act" data-action="toggle-watched">${v.watched ? "Mark unwatched" : "Mark watched"}</button>
@@ -711,12 +863,27 @@ function videoCardHtml(v, mode) {
         <span class="video-watched-badge">✓ watched</span>
       </div>
       <div class="video-meta">
-        <div class="video-title" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</div>
-        <div class="video-channel">${avatar}<span>${escapeHtml(channelName)}</span></div>
+        <a class="video-title" href="https://www.youtube.com/watch?v=${encodeURIComponent(v.id)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</a>
+        ${channelUrl
+          ? `<a class="video-channel" href="${escapeHtml(channelUrl)}" target="_blank" rel="noopener noreferrer" title="Open channel">${avatar}<span>${escapeHtml(channelName || "Open channel")}</span></a>`
+          : `<div class="video-channel" data-action="channel-unavailable">${avatar}<span>${escapeHtml(channelName || "Unknown channel")}</span></div>`}
         <div class="video-date">${escapeHtml(meta)}</div>
       </div>
       <div class="video-actions">${actions}</div>
     </div>`;
+}
+
+// Never build a channel destination from a display name or trust an imported URL.
+function videoChannelUrl(video) {
+  if (video.channelId) return `https://www.youtube.com/channel/${encodeURIComponent(video.channelId)}/videos`;
+  if (!video.channelUrl) return null;
+  try {
+    const url = new URL(video.channelUrl, "https://www.youtube.com");
+    if (!["https:", "http:"].includes(url.protocol) ||
+        !["www.youtube.com", "youtube.com", "m.youtube.com"].includes(url.hostname)) return null;
+    const path = url.pathname.match(/^\/(channel\/UC[0-9A-Za-z_-]{22}|@[^/]+|c\/[^/]+|user\/[^/]+)\/?$/);
+    return path ? "https://www.youtube.com/" + path[1] + "/videos" : null;
+  } catch { return null; }
 }
 
 // Seconds → "4:13" or "1:02:10".
@@ -764,6 +931,7 @@ function renderWatchLater() {
   el.watchLaterEmptyState.hidden = anySaved;
   if (!anySaved) {
     el.watchLaterGrid.innerHTML = "";
+    el.videoLoadMoreBtn.hidden = true;
     renderResultCount(0, 0, "video");
     return;
   }
@@ -773,12 +941,13 @@ function renderWatchLater() {
   renderResultCount(vids.length, universe.length, "video");
 
   if (!vids.length) {
+    el.videoLoadMoreBtn.hidden = true;
     const filtered = !!searchQuery.trim() || watchLaterWatchedFilter !== "";
     el.watchLaterGrid.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No saved videos match the current filters." : "This list is empty."}</p></div>`;
     return;
   }
 
-  el.watchLaterGrid.innerHTML = vids.map((v) => videoCardHtml(v, "watchlater")).join("");
+  renderVideoList(vids, "watchlater", el.watchLaterGrid);
 }
 
 // "Today" / "Yesterday" / "Jul 3, 2026" for the day-group headers (local time).
@@ -806,33 +975,8 @@ function relativeTime(iso) {
 // The user-owned fields of a video as one comparable string. An absent folderId
 // and "unsorted" are the same state (RSS videos carry none), so they compare
 // equal — same rule the sync diff uses.
-function videoUserStateKey(v) {
-  const list = v.folderId && v.folderId !== "unsorted" ? v.folderId : "";
-  return `${!!v.watched}|${!!v.saved}|${!!v.hidden}|${list}`;
-}
-
-// What those fields looked like at the last write. saveVideos() diffs against it
-// and stamps `userStateAt` on whatever the user changed, so no mutation site has
-// to remember to — and forgetting would matter: sync resolves these four fields
-// last-writer-wins from that stamp (`mergeUserState` in background.js), so an
-// unstamped change loses to the gist's older copy on the next sync.
-let videoStateSnapshot = new Map();
-
-function resetVideoStateSnapshot() {
-  videoStateSnapshot = new Map(
-    Object.entries(state.videos).map(([id, v]) => [id, videoUserStateKey(v)])
-  );
-}
-
 async function saveVideos() {
-  const now = Date.now();
-  for (const [id, v] of Object.entries(state.videos)) {
-    const key = videoUserStateKey(v);
-    const prev = videoStateSnapshot.get(id);
-    if (prev !== undefined && prev !== key) v.userStateAt = now;
-    videoStateSnapshot.set(id, key);
-  }
-  await chrome.storage.local.set({ videos: state.videos });
+  await persistLibrary({ videos: state.videos });
 }
 
 // Open a video on YouTube without changing its watched state.
@@ -1111,6 +1255,13 @@ function renderFolders() {
       }
     }
   }
+  for (const li of el.folderList.children) {
+    li.tabIndex = 0;
+    li.setAttribute('role', 'button');
+    li.setAttribute('aria-pressed', String(li.dataset.folderId === selected));
+    if (li.dataset.parentFolder) li.setAttribute('aria-expanded', String(!collapsed.has(li.dataset.folderId)));
+
+  }
 }
 
 function folderEmojiSlotHtml(folderId, emoji) {
@@ -1292,7 +1443,7 @@ function renderTagFilters() {
   );
   const usedTagIds = new Set(channelsInFolder.flatMap((c) => c.tags || []));
   const tagEntries = Object.entries(state.tags).filter(([id]) => usedTagIds.has(id));
-  const langs = [...new Set(channelsInFolder.map((c) => c.language).filter(Boolean))].sort();
+  const langs = [...new Set(channelsInFolder.map((c) => canonicalLanguage(c.language)).filter(l => LANGUAGES.includes(l)))].sort();
   const hasActive = channelsInFolder.some((c) => c.active);
   const hasFinished = channelsInFolder.some((c) => c.finished);
   const hasTracked = channelsInFolder.some((c) => c.trackVideos);
@@ -1389,7 +1540,12 @@ function renderGrid() {
   pendingFolderOptions = buildOrderedFolderList()
     .filter(({ id }) => !folderHasChildren(id))
     .map(({ id, f, isChild }) => ({ id, label: `${isChild ? "  " : ""}${escapeHtml(f.name)}` }));
-  el.channelGrid.innerHTML = "";
+  const signature = JSON.stringify([currentFolderId, searchQuery, filterActive, filterFinished, filterTracked,
+    [...activeTagFilters], [...excludedTagFilters], [...activeLangFilters], [...excludedLangFilters],
+    filterMinCount, filterMaxCount, filterAfterDate, filterBeforeDate, sortPriority, sortDate, sortCount, sortSubs, sortFolder]);
+  const loaded = signature === channelPageSignature ? Math.max(PAGE_SIZE, el.channelGrid.children.length) : PAGE_SIZE;
+  if (signature !== channelPageSignature) el.channelGrid.replaceChildren();
+  channelPageSignature = signature;
   el.channelGrid.classList.add("list-view");
 
   const totalChannels = Object.keys(state.channels).length;
@@ -1410,7 +1566,8 @@ function renderGrid() {
   }
   updateSortHeaders();
 
-  appendNextPage();
+  const entries = pendingChannels.splice(0, loaded).map(ch => [`channel:${ch.id}`, buildChannelRow(ch).outerHTML]);
+  reconcileChildren(el.channelGrid, entries);
   setupScrollObserver();
 }
 
@@ -1418,7 +1575,11 @@ function renderGrid() {
 function appendNextPage() {
   const batch = pendingChannels.splice(0, PAGE_SIZE);
   const frag = document.createDocumentFragment();
-  for (const ch of batch) frag.appendChild(buildChannelRow(ch));
+  for (const ch of batch) {
+    const row = buildChannelRow(ch);
+    row._renderHtml = row.outerHTML;
+    frag.appendChild(row);
+  }
   el.channelGrid.appendChild(frag);
 
   if (pendingChannels.length === 0 && scrollObserver) {
@@ -1524,6 +1685,7 @@ function enableNumberScrub(input) {
   // Hover is enough — no click first. passive:false because the page would
   // otherwise scroll out from under the cursor as the value changes.
   input.addEventListener("wheel", (e) => {
+    if (!controls.wheelAdjustsNumbers) return;
     e.preventDefault();
     const dir = e.deltaY < 0 ? 1 : -1;
     // An empty field lands on its base value on the first notch, not base±1.
@@ -1565,6 +1727,7 @@ function enableNumberScrub(input) {
 
 function enableSelectWheel(select) {
   select.addEventListener("wheel", (e) => {
+    if (!controls.wheelAdjustsNumbers) return;
     e.preventDefault();
     const next = select.selectedIndex + (e.deltaY < 0 ? -1 : 1);
     if (next < 0 || next >= select.options.length) return;
@@ -1583,7 +1746,7 @@ function renderResultCount(shown, total, noun) {
 
 // Re-render whichever view is showing. Every filter control ends here.
 function renderCurrentView() {
-  if (currentView === "new") renderVideoFeed();
+  if (currentView === "new" || currentView === "removed") renderVideoFeed();
   else if (currentView === "watchlater") renderWatchLater();
   else renderGrid();
 }
@@ -1698,10 +1861,10 @@ function getFilteredChannels() {
     list = list.filter((c) => !c.tags?.some((t) => excludedTagFilters.has(t)));
   }
   if (activeLangFilters.size) {
-    list = list.filter((c) => activeLangFilters.has(c.language));
+    list = list.filter((c) => activeLangFilters.has(canonicalLanguage(c.language)));
   }
   if (excludedLangFilters.size) {
-    list = list.filter((c) => !excludedLangFilters.has(c.language));
+    list = list.filter((c) => !excludedLangFilters.has(canonicalLanguage(c.language)));
   }
   if (filterActive === "only") {
     list = list.filter((c) => c.active);
@@ -1816,12 +1979,13 @@ function buildChannelRow(ch) {
   row.className = "channel-row";
   if (selectedChannelIds.has(ch.id)) row.classList.add("selected");
   row.dataset.channelId = ch.id;
+  row.dataset.renderKey = `channel:${ch.id}`;
 
   row.innerHTML = `
     <div class="channel-head">
       ${thumbHtml(ch)}
       <div class="channel-name-wrap">
-        <div class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</div>
+        <a class="channel-name" href="https://www.youtube.com/channel/${encodeURIComponent(ch.id)}/videos" target="_blank" rel="noopener noreferrer" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</a>
         <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
       </div>
     </div>
@@ -1832,14 +1996,14 @@ function buildChannelRow(ch) {
       <select class="var-lang${ch.language ? " has-lang" : ""}" data-role="set-language" title="Language"${ch.language ? ` style="border-color:${langColor(ch.language)};color:${langColor(ch.language)}"` : ""}>
         ${languageOptionsHtml(ch)}
       </select>
-      <span class="tag-chip var-toggle${ch.active ? " on-active" : ""}" data-role="toggle-active" title="Active — flag channels you're following">Active</span>
-      <span class="tag-chip var-toggle${ch.finished ? " on-finished" : ""}" data-role="toggle-finished" title="Finished — flag channels you consider done">Finished</span>
-      <span class="tag-chip var-toggle${ch.trackVideos ? " on-track" : ""}" data-role="toggle-track" title="Track — pull this channel's new uploads into the Videos feed">Track</span>
+      <button type="button" class="tag-chip var-toggle${ch.active ? " on-active" : ""}" data-role="toggle-active" aria-pressed="${!!ch.active}" title="Active — flag channels you're following">Active</button>
+      <button type="button" class="tag-chip var-toggle${ch.finished ? " on-finished" : ""}" data-role="toggle-finished" aria-pressed="${!!ch.finished}" title="Finished — flag channels you consider done">Finished</button>
+      <button type="button" class="tag-chip var-toggle${ch.trackVideos ? " on-track" : ""}" data-role="toggle-track" aria-pressed="${!!ch.trackVideos}" title="Track — pull this channel's new uploads into the Videos feed">Track</button>
       ${tagChipsHtml(ch)}
-      <span class="tag-chip add-tag" data-role="add-tag">+ tag</span>
+      <button type="button" class="tag-chip add-tag" data-role="add-tag">+ tag</button>
     </div>
     <div class="channel-controls">
-      <select class="folder-select" data-role="move-folder">${folderOptionsHtml(ch)}</select>
+      <select class="folder-select" data-role="move-folder" aria-label="Folder for ${escapeHtml(ch.name)}">${folderOptionsHtml(ch)}</select>
     </div>
   `;
   return row;
@@ -1855,7 +2019,7 @@ async function toggleChannelFlag(channelId, key) {
   const ch = state.channels[channelId];
   if (!ch) return;
   ch[key] = !ch[key];
-  await chrome.storage.local.set({ channels: state.channels });
+  await persistLibrary({ channels: state.channels });
   if (key === "trackVideos" && ch.trackVideos) {
     chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
   }
@@ -1863,7 +2027,7 @@ async function toggleChannelFlag(channelId, key) {
 
 function thumbHtml(ch) {
   return ch.thumbnail
-    ? `<img class="channel-thumb" src="${ch.thumbnail}" alt="" onerror="this.outerHTML='<div class=&quot;channel-thumb&quot;></div>'" />`
+    ? `<img class="channel-thumb" src="${escapeHtml(ch.thumbnail)}" alt="" />`
     : `<div class="channel-thumb"></div>`;
 }
 
@@ -1906,17 +2070,10 @@ function buildOrderedFolderList() {
 }
 
 function languageOptionsHtml(ch) {
-  const current = ch.language || "";
-  // A custom language not in the curated list still needs its own option.
-  const list = current && !LANGUAGES.includes(current) ? [current, ...LANGUAGES] : LANGUAGES;
-  const opts = list
-    .map((l) => `<option value="${escapeHtml(l)}" ${l === current ? "selected" : ""}>${escapeHtml(langLabel(l))}</option>`)
-    .join("");
-  return (
-    `<option value="" ${current ? "" : "selected"}>lang…</option>` +
-    opts +
-    `<option value="${LANG_OTHER}">Other…</option>`
-  );
+  const current = canonicalLanguage(ch.language);
+  const active = LANGUAGES.includes(current);
+  return `<option value="" ${active ? "" : "selected"}>${current && !active ? "Inactive" : "lang…"}</option>` +
+    LANGUAGES.map(language => `<option value="${escapeHtml(language)}" ${language === current ? "selected" : ""}>${escapeHtml(langLabel(language))}</option>`).join("");
 }
 
 function tagChipsHtml(ch) {
@@ -2032,17 +2189,29 @@ function nextTagColor() {
 const AUTO_REFRESH_STALE_MS = 3 * 60 * 60 * 1000;
 
 async function catchUpOnOpen() {
-  const ids = Object.keys(state.channels);
-  if (!ids.length) return;
-  const newest = ids.reduce((max, id) => Math.max(max, state.channels[id].lastFetched || 0), 0);
-  if (Date.now() - newest < AUTO_REFRESH_STALE_MS) return;
-  el.statusText.textContent = "Refreshing…";
-  const res = await chrome.runtime.sendMessage({ type: "REFRESH_STATS" });
-  await loadState();
-  render();
-  el.statusText.textContent = res?.ok
-    ? `Updated ${new Date().toLocaleTimeString()}.`
-    : `Refresh failed. ${res?.error || ""}`;
+  const stale = Object.values(state.channels).filter(ch => Date.now() - (ch.lastFetched || 0) >= AUTO_REFRESH_STALE_MS).map(ch => ch.id);
+  if (stale.length) await runRefresh(stale);
+}
+
+async function runRefresh(channelIds) {
+  if (refreshRunning) return;
+  refreshRunning = true;
+  el.refreshBtn.disabled = el.retryRefreshBtn.disabled = true;
+  el.statusText.textContent = 'Refreshing…';
+  try {
+    const res = await requestWorker('REFRESH_STATS', channelIds ? { channelIds } : {});
+    const failures = res.failures || [];
+    failedRefreshIds = [...new Set(failures.map(f => f.id))];
+    el.retryRefreshBtn.hidden = !failedRefreshIds.length;
+    el.refreshErrors.hidden = !failures.length;
+    el.refreshErrors.innerHTML = failures.length ? `<summary>${failures.length} refresh failure${failures.length === 1 ? '' : 's'}</summary><ul>${failures.map(f => `<li>${escapeHtml(f.name)}: ${escapeHtml(f.error)}</li>`).join('')}</ul>` : '';
+    el.statusText.textContent = failures.length ? `Updated with ${failures.length} failed request${failures.length === 1 ? '' : 's'}. Retry failed channels below.`
+      : res.ok ? `Updated ${new Date().toLocaleTimeString()}.${res.hasApiKey ? '' : ' Counts and durations need an API key.'}`
+      : res.error || res.lastError || 'Refresh failed. Try again.';
+  } finally {
+    refreshRunning = false;
+    el.refreshBtn.disabled = el.retryRefreshBtn.disabled = false;
+  }
 }
 
 // ---------- "There's a newer version on GitHub" ----------
@@ -2318,20 +2487,14 @@ let pendingSyncDiff = null;
 // it — and so does the on-open check, which only bothers the user when this is
 // non-zero. Removals of folders/lists only ever apply on upload.
 function syncDiffTotal(diff) {
-  const isUpload = diff.direction === "upload";
-  const empty = { added: [], removed: [], modified: [] };
-  const ch = diff.channels || empty;
-  const vids = diff.videos || { added: 0, modified: 0, removed: 0 };
-  const folderish = (f = empty) => f.added.length + f.modified.length + (isUpload ? f.removed.length : 0);
-  return (
-    ch.added.length + ch.removed.length + ch.modified.length +
-    folderish(diff.folders) + folderish(diff.videoFolders) +
-    (diff.settings || []).length +
-    vids.added + vids.modified + (vids.removed || 0)
-  );
+  const count = group => (group?.added?.length || 0) + (group?.modified?.length || 0);
+  const videos = diff.videos || {};
+  return count(diff.channels) + (diff.removeIds?.length || 0) + count(diff.folders) + count(diff.videoFolders) + count(diff.tags)
+    + (diff.settings?.length || 0) + (videos.added || 0) + (videos.modified || 0) + (videos.removed || 0);
 }
 
-function openSyncDiffModal(diff) {
+function openSyncDiffModal(diff, { keepChoices = false } = {}) {
+  if (!keepChoices) { syncReviewRequest++; syncSkipVideoIds.clear(); syncSkipAllVideos = false; }
   pendingSyncDiff = diff;
   const { direction, channels: { added, removed, modified } } = diff;
   const isUpload = direction === "upload";
@@ -2357,17 +2520,17 @@ function openSyncDiffModal(diff) {
   if (folderCount) extra.push(`${folderCount} folder change${folderCount === 1 ? "" : "s"}`);
   if (vfCount) extra.push(`${vfCount} list change${vfCount === 1 ? "" : "s"}`);
   if (vidsCount) extra.push(`${vidsCount} video${vidsCount === 1 ? "" : "s"}`);
+  const tagCount = (diff.tags?.added.length || 0) + (diff.tags?.modified.length || 0);
+  if (tagCount) extra.push(`${tagCount} tag change${tagCount === 1 ? "" : "s"}`);
   if (settings.length) extra.push(`${settings.length} setting${settings.length === 1 ? "" : "s"}`);
   el.syncDiffSummary.textContent = totalChanges === 0
     ? "No differences — already in sync."
-    : [`${added.length} to add, ${modified.length} to overwrite, ${removed.length} to remove`, ...extra].join(", ") + ".";
+    : [`${added.length} to add, ${modified.length} to overwrite, ${diff.removeIds?.length || 0} selected for removal`, ...extra].join(", ") + ".";
 
   if (removed.length) {
     el.syncDiffWarning.hidden = false;
     const n = removed.length;
-    el.syncDiffWarning.textContent = isUpload
-      ? `${n} channel${n === 1 ? "" : "s"} exist${n === 1 ? "s" : ""} in the Gist but not locally and will be removed from it. Uncheck any you want to keep in the Gist.`
-      : `${n} channel${n === 1 ? "" : "s"} exist${n === 1 ? "s" : ""} locally but not in the Gist and will be removed. Uncheck any you want to keep.`;
+    el.syncDiffWarning.textContent = `${n} channel${n === 1 ? '' : 's'} only exist${n === 1 ? 's' : ''} ${isUpload ? 'in the Gist' : 'locally'}. Select the ones to remove; dependent video changes update below.`;
   } else {
     el.syncDiffWarning.hidden = true;
   }
@@ -2377,10 +2540,15 @@ function openSyncDiffModal(diff) {
   const delLabel = isUpload ? "Will be removed from Gist" : "Will be removed locally";
   el.syncDiffBody.appendChild(buildDiffSection(addLabel, "add", added, false));
   el.syncDiffBody.appendChild(buildDiffSection(delLabel, "del", removed, true, isUpload));
+  const selectedRemovals = new Set(diff.removeIds || []);
+  el.syncDiffBody.querySelectorAll('[data-remove-id]').forEach(box => { box.checked = selectedRemovals.has(box.dataset.removeId); });
+  const allRemovals = el.syncDiffBody.querySelector('[data-role="select-all-removals"]');
+  if (allRemovals) { allRemovals.checked = removed.length > 0 && selectedRemovals.size === removed.length; allRemovals.indeterminate = selectedRemovals.size > 0 && selectedRemovals.size < removed.length; }
   if (modified.length) el.syncDiffBody.appendChild(buildSyncModSection(isUpload ? "Will overwrite in Gist" : "Will overwrite locally", modified));
 
   const dest = isUpload ? "in Gist" : "locally";
   if (settings.length) el.syncDiffBody.appendChild(buildSyncSettingsSection(`Settings — will overwrite ${dest}`, settings));
+  if (tagCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Tags — will overwrite ${dest}`, diff.tags.added, diff.tags.modified, []));
   if (folderCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Folders — will overwrite ${dest}`, fo.added, fo.modified, foRemoved));
   if (vfCount) el.syncDiffBody.appendChild(buildSyncFolderSection(`Watch Later lists — will overwrite ${dest}`, vf.added, vf.modified, vfRemoved));
   if (vidsCount) el.syncDiffBody.appendChild(buildSyncVideoSection(`Videos — merged ${dest}`, vids, dest));
@@ -2489,67 +2657,43 @@ function describeVideoChange(it) {
 // take some of a sync and not the rest.
 function buildSyncVideoSection(title, vids, dest) {
   const items = vids.items || [];
-  const removed = vids.removed || 0;
-  const sec = document.createElement("div");
-  sec.className = "scan-diff-section";
-  sec.appendChild(buildDiffSectionHeader(title, "mod", vids.added + vids.modified + removed));
-
-  const list = document.createElement("div");
-  list.className = "scan-diff-list";
-  const note = document.createElement("div");
-  note.className = "scan-diff-row";
-  note.innerHTML = `<span class="scan-diff-text">${escapeHtml(
-    `${vids.added} new, ${vids.modified} with changed watched/saved/list state`
-    + (removed ? `, ${removed} dropped (untracked channel, or past the per-channel history cap)` : "")
-    + `. Videos merge both ways; a merge never removes a saved, watched or dismissed video.`
-    + (items.length ? ` Untick a row below to leave that video alone — including a dropped one, which keeps it.` : "")
-  )}</span>`;
-  list.appendChild(note);
-  sec.appendChild(list);
-
-  if (!items.length) return sec;
-
-  const details = document.createElement("div");
-  details.className = "scan-diff-list scan-diff-videos";
-  details.hidden = true;
-
-  const all = document.createElement("label");
-  all.className = "scan-diff-row scan-diff-selectall";
-  all.innerHTML = `<input type="checkbox" data-role="select-all-videos" checked /> <span>Apply all of these — untick one to leave it as it is ${escapeHtml(dest)}</span>`;
+  const section = document.createElement('section');
+  section.className = 'scan-diff-section';
+  section.appendChild(buildDiffSectionHeader(title, 'mod', vids.added + vids.modified + (vids.removed || 0)));
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = `Review ${items.length} video changes (${vids.removed || 0} removals)`;
+  details.appendChild(summary);
+  const all = document.createElement('label');
+  all.className = 'scan-diff-row scan-diff-selectall';
+  all.innerHTML = `<input type="checkbox" data-role="select-all-videos" ${!syncSkipAllVideos && !syncSkipVideoIds.size ? 'checked' : ''} /> Apply video changes — uncheck to keep all videos unchanged ${escapeHtml(dest)}`;
   details.appendChild(all);
-
-  for (const it of items) {
-    const row = document.createElement("label");
-    row.className = "scan-diff-row";
-    const sub = [it.author, describeVideoChange(it)].filter(Boolean).join(" · ");
-    row.innerHTML =
-      `<input type="checkbox" data-video-id="${escapeHtml(it.id)}" checked />` +
-      `<span class="scan-diff-text"><b>${escapeHtml(it.title)}</b>` +
-      `<span class="scan-diff-sub">${escapeHtml(sub)}</span></span>`;
-    details.appendChild(row);
-  }
-  if (vids.truncated) {
-    const more = document.createElement("div");
-    more.className = "scan-diff-row";
-    more.innerHTML = `<span class="scan-diff-text"><span class="scan-diff-sub">${escapeHtml(
-      `+ ${vids.truncated} more not listed here (too many to review one by one) — these are applied.`
-    )}</span></span>`;
-    details.appendChild(more);
-  }
-
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.className = "scan-diff-toggle";
-  const label = (hidden) =>
-    `${hidden ? "Show" : "Hide"} the ${items.length} video change${items.length === 1 ? "" : "s"}`;
-  toggle.textContent = label(true);
-  toggle.addEventListener("click", () => {
-    details.hidden = !details.hidden;
-    toggle.textContent = label(details.hidden);
-  });
-  sec.appendChild(toggle);
-  sec.appendChild(details);
-  return sec;
+  all.querySelector('input').indeterminate = !syncSkipAllVideos && syncSkipVideoIds.size > 0;
+  const list = document.createElement('div');
+  list.className = 'scan-diff-list scan-diff-videos';
+  details.appendChild(list);
+  const more = document.createElement('button');
+  more.className = 'btn btn-ghost';
+  more.type = 'button';
+  let shown = 0;
+  const append = () => {
+    const fragment = document.createDocumentFragment();
+    for (const item of items.slice(shown, shown + 100)) {
+      const row = document.createElement('label');
+      row.className = 'scan-diff-row';
+      row.innerHTML = `<input type="checkbox" data-video-id="${escapeHtml(item.id)}" ${!syncSkipAllVideos && !syncSkipVideoIds.has(item.id) ? 'checked' : ''} /><span class="scan-diff-text"><b>${escapeHtml(item.title)}</b><span class="scan-diff-sub">${escapeHtml([item.author, describeVideoChange(item)].filter(Boolean).join(' · '))}</span></span>`;
+      fragment.appendChild(row);
+    }
+    list.appendChild(fragment);
+    shown = Math.min(items.length, shown + 100);
+    more.textContent = `Show more (${shown} of ${items.length})`;
+    more.hidden = shown >= items.length;
+  };
+  more.addEventListener('click', append);
+  details.appendChild(more);
+  details.addEventListener('toggle', () => { if (details.open && shown === 0) append(); });
+  section.appendChild(details);
+  return section;
 }
 
 // The section header shared by the scan/sync diff sections: a title span (with a
@@ -2632,6 +2776,24 @@ function buildDiffSection(title, kind, items, checkable, defaultChecked = false)
 // ---------- Events ----------
 
 function bindEvents() {
+  bindRecoveryControls();
+  bindKeyboardControls();
+  document.addEventListener('error', event => {
+    const image = event.target;
+    if (!(image instanceof HTMLImageElement)) return;
+    const fallback = document.createElement('span');
+    fallback.className = image.classList.contains('channel-thumb') ? 'channel-thumb' : 'vc-avatar-fallback';
+    image.replaceWith(fallback);
+  }, true);
+  el.viewRemovedBtn.addEventListener('click', () => setView('removed'));
+  el.videoLoadMoreBtn.addEventListener('click', () => {
+    pendingVideoPage.limit += 60;
+    renderVideoList(pendingVideoPage.list, pendingVideoPage.mode, pendingVideoPage.container);
+  });
+  el.folderList.addEventListener('keydown', event => {
+    if (event.target.matches('.folder-item') && ['Enter', ' '].includes(event.key)) { event.preventDefault(); event.target.click(); }
+  });
+
   el.folderList.addEventListener("click", (e) => {
     const li = e.target.closest(".folder-item");
     if (!li) return;
@@ -2826,9 +2988,14 @@ function bindEvents() {
     const id = card.dataset.videoId;
     const v = state.videos[id];
     if (!v) return;
-    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+    if (selectionModifierPressed(e, controls) || e.shiftKey) {
       e.preventDefault();
       handleVideoSelectionClick(id, e);
+      return;
+    }
+    if (e.target.closest('[data-action="restore"]')) {
+      v.hidden = false;
+      await saveVideos();
       return;
     }
     if (e.target.closest('[data-action="toggle-watched"]')) {
@@ -2843,13 +3010,14 @@ function bindEvents() {
     }
     if (e.target.closest("[data-action]")) return;
     if (selectedVideoIds.size) clearVideoSelection();
-    openVideo(id, false);
+    if (!e.target.closest("a[href]")) openVideo(id, false);
   });
   el.videoFeed.addEventListener("auxclick", (e) => {
     if (e.button !== 1) return;
     const card = e.target.closest(".video-card");
     if (!card || e.target.closest("[data-action]")) return;
     e.preventDefault();
+    if (e.target.closest("a[href]")) { chrome.tabs.create({ url: e.target.closest("a[href]").href, active: false }); return; }
     openVideo(card.dataset.videoId, true);
   });
   // Right-click a New-feed card → bulk menu if inside a 2+ selection, else single.
@@ -2864,16 +3032,21 @@ function bindEvents() {
       showVideoBulkContextMenu(e.clientX, e.clientY, [...selectedVideoIds]);
       return;
     }
+    if (currentView === 'removed') {
+      showContextMenu(e.clientX, e.clientY, [{ label: 'Restore to New', action: () => bulkVideoMutate([id], current => { current.hidden = false; }) }]);
+      return;
+    }
+    const markWatched = !v.watched;
     showContextMenu(e.clientX, e.clientY, [
       {
         label: v.watched ? "Mark unwatched" : "Mark watched",
-        action: async () => { v.watched = !v.watched; await saveVideos(); },
+        action: () => bulkVideoMutate([id], current => { current.watched = markWatched; }),
       },
       { separator: true },
       {
         label: "Remove",
         danger: true,
-        action: async () => { v.hidden = true; await saveVideos(); },
+        action: () => bulkVideoMutate([id], current => { current.hidden = true; }),
       },
     ]);
   });
@@ -2883,7 +3056,7 @@ function bindEvents() {
     const card = e.target.closest(".video-card");
     if (!card) return;
     const id = card.dataset.videoId;
-    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+    if (selectionModifierPressed(e, controls) || e.shiftKey) {
       e.preventDefault();
       handleVideoSelectionClick(id, e);
       return;
@@ -2899,13 +3072,14 @@ function bindEvents() {
     }
     if (e.target.closest("[data-action]")) return;
     if (selectedVideoIds.size) clearVideoSelection();
-    openVideo(id, false);
+    if (!e.target.closest("a[href]")) openVideo(id, false);
   });
   el.watchLaterGrid.addEventListener("auxclick", (e) => {
     if (e.button !== 1) return;
     const card = e.target.closest(".video-card");
     if (!card || e.target.closest("[data-action]")) return;
     e.preventDefault();
+    if (e.target.closest("a[href]")) { chrome.tabs.create({ url: e.target.closest("a[href]").href, active: false }); return; }
     openVideo(card.dataset.videoId, true);
   });
   // Right-click a saved video → bulk menu if inside a 2+ selection, else single.
@@ -2992,19 +3166,13 @@ function bindEvents() {
     chrome.tabs.create({ url: "https://www.youtube.com/feed/channels" });
   });
 
-  el.refreshBtn.addEventListener("click", async () => {
-    el.statusText.textContent = "Refreshing…";
-    videoDetailsRequested = false; // re-enable the auto length/view fetch
-    const res = await chrome.runtime.sendMessage({ type: "REFRESH_STATS" });
-    await loadState();
-    render();
-    el.statusText.textContent = summarizeRefresh(res);
-  });
+  el.refreshBtn.addEventListener('click', () => runRefresh());
+  el.retryRefreshBtn.addEventListener('click', () => runRefresh(failedRefreshIds));
 
   el.fillAvatarsBtn.addEventListener("click", async () => {
     // Persist a just-typed key so the fill works without a separate Save first.
     state.apiKey = el.apiKeyInput.value.trim();
-    await chrome.storage.local.set({ apiKey: state.apiKey });
+    await persistSettings({ apiKey: state.apiKey });
 
     el.fillAvatarsBtn.disabled = true;
     el.fillAvatarsStatus.textContent = "Fetching missing avatars…";
@@ -3014,25 +3182,6 @@ function bindEvents() {
     el.fillAvatarsBtn.disabled = false;
     el.fillAvatarsStatus.textContent = summarizeAvatarFill(res);
   });
-
-  // Turn the background refresh summary into a status line that explains why
-  // avatars/counts may not have filled (missing key, API error, etc.).
-  function summarizeRefresh(res) {
-    const time = new Date().toLocaleTimeString();
-    if (!res || !res.ok) return "Refresh failed. " + (res?.error || "");
-    if (res.queried === 0) return "No channels to refresh.";
-    if (!res.hasApiKey) {
-      return `Updated ${time}. No API key set — avatars and video counts need a YouTube API key in Settings. (${res.missingThumbs ?? "?"} without avatars.)`;
-    }
-    let msg = `Updated ${time}: ${res.thumbsFilled ?? 0} avatars filled`;
-    if (res.missingThumbs) msg += `, ${res.missingThumbs} still missing`;
-    msg += ".";
-    if (res.apiFailures) {
-      msg += ` ⚠ ${res.apiFailures} API call${res.apiFailures === 1 ? "" : "s"} failed` +
-        (res.lastError ? ` (${res.lastError})` : "") + ".";
-    }
-    return msg;
-  }
 
   // Status line for the targeted avatar-only backfill.
   function summarizeAvatarFill(res) {
@@ -3051,7 +3200,7 @@ function bindEvents() {
   }
 
   function isInteractiveTarget(t) {
-    return t.closest(".tag-chip") || t.closest("select") || t.closest(".tag-picker");
+    return t.closest(".tag-chip, select, .tag-picker, button, a[href]");
   }
 
   // Folder change / tag add-remove / row clicks
@@ -3066,7 +3215,7 @@ function bindEvents() {
     const channelId = channelCard.dataset.channelId;
 
     // Modifier click drives multi-select instead of any row action.
-    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+    if (selectionModifierPressed(e, controls) || e.shiftKey) {
       e.preventDefault();
       handleSelectionClick(channelId, e);
       return;
@@ -3077,7 +3226,7 @@ function bindEvents() {
       const tagId = Object.keys(state.tags).find((id) => state.tags[id].name === tagName);
       if (tagId) {
         state.channels[channelId].tags = state.channels[channelId].tags.filter((t) => t !== tagId);
-        await chrome.storage.local.set({ channels: state.channels });
+        await persistLibrary({ channels: state.channels });
       }
       return;
     }
@@ -3136,7 +3285,7 @@ function bindEvents() {
         submenu: () =>
           languageSubmenuItems(
             (lang) => setChannelLanguage(channelId, lang),
-            (l) => (ch.language || null) === l,
+            (l) => (canonicalLanguage(ch.language) || null) === l,
             [ch.language]
           ),
       },
@@ -3173,46 +3322,49 @@ function bindEvents() {
     if (e.target.dataset.role === "set-language") {
       const ch = state.channels[channelId];
       if (!ch) return;
-      let value = e.target.value;
-      if (value === LANG_OTHER) {
-        const custom = prompt("Language:", ch.language || "")?.trim();
-        // Cancelled / empty prompt: revert the <select> to what was stored.
-        if (!custom) { e.target.value = ch.language || ""; return; }
-        value = custom;
-      }
+      const value = e.target.value;
       ch.language = value || null;
-      await chrome.storage.local.set({ channels: state.channels });
+      await persistLibrary({ channels: state.channels });
       render();
       return;
     }
 
     if (e.target.dataset.role !== "move-folder") return;
     state.channels[channelId].folderId = e.target.value;
-    await chrome.storage.local.set({ channels: state.channels });
+    await persistLibrary({ channels: state.channels });
     renderFolders();
     if (currentFolderId !== "all") renderGrid();
   });
 
-  // Settings modal
-  el.settingsBtn.addEventListener("click", () => {
-    el.apiKeyInput.value = state.apiKey || "";
-    el.gistTokenInput.value = state.gistToken || "";
-    el.languagesInput.value = LANGUAGES.join("\n");
-    el.fillAvatarsStatus.textContent = "";
-    renderSyncStatus();
-    el.settingsModal.hidden = false;
+  el.languageSearch.addEventListener("input", renderLanguageCatalog);
+  el.languageCatalog.addEventListener("change", event => {
+    const input = event.target.closest('input[type="checkbox"]');
+    if (!input) return;
+    if (input.checked) languagesDraft.add(input.value); else languagesDraft.delete(input.value);
+    el.languageSelection.textContent = languagesDraft.size ? [...languagesDraft].join(" · ") : "No active languages";
   });
-  el.settingsCancel.addEventListener("click", () => (el.settingsModal.hidden = true));
+  el.languagePresetBtn.addEventListener("click", () => {
+    languagesDraft = new Set(DEFAULT_LANGUAGES);
+    el.languageSearch.value = "";
+    renderLanguageCatalog();
+  });
+  // Settings modal
+  el.settingsBtn.addEventListener("click", () => openSettings());
+  el.settingsCancel.addEventListener("click", () => { recordingShortcut = null; el.settingsModal.hidden = true; });
   el.settingsSave.addEventListener("click", async () => {
-    state.apiKey = el.apiKeyInput.value.trim();
-    state.gistToken = el.gistTokenInput.value.trim();
-    // Parse the language set: trim lines, drop blanks, dedupe (keep order).
-    // Empty box falls back to the built-in defaults.
-    const parsed = [...new Set(el.languagesInput.value.split("\n").map((l) => l.trim()).filter(Boolean))];
-    LANGUAGES = parsed.length ? parsed : [...DEFAULT_LANGUAGES];
-    await chrome.storage.local.set({ apiKey: state.apiKey, gistToken: state.gistToken, languages: LANGUAGES });
-    el.settingsModal.hidden = true;
-    render();
+    if (recordingShortcut) { sayShortcut('Finish recording or press Escape before saving.', true); return; }
+    const parsed = [...languagesDraft];
+    el.settingsSave.disabled = true;
+    try {
+      await persistSettings({ apiKey: el.apiKeyInput.value.trim(), gistToken: el.gistTokenInput.value.trim(), languages: parsed });
+      await chrome.storage.local.set({ controls: normalizeControls(controlsDraft) });
+      controls = normalizeControls(controlsDraft);
+      el.settingsModal.hidden = true;
+      await loadState();
+      render();
+      el.statusText.textContent = 'Settings saved.';
+    } catch (error) { el.settingsStatus.textContent = `Could not save: ${error.message}`; }
+    finally { el.settingsSave.disabled = false; }
   });
 
   // Both ways in run this: the Settings modal's buttons and the sidebar's ↑/↓.
@@ -3224,7 +3376,7 @@ function bindEvents() {
     const inSettings = !el.settingsModal.hidden;
     if (inSettings) {
       state.gistToken = el.gistTokenInput.value.trim();
-      await chrome.storage.local.set({ gistToken: state.gistToken });
+      await persistSettings({ gistToken: state.gistToken });
     }
     const say = (msg) => { (inSettings ? el.syncStatus : el.statusText).textContent = msg; };
 
@@ -3237,7 +3389,7 @@ function bindEvents() {
     const btns = [el.syncUploadBtn, el.syncDownloadBtn, el.quickUploadBtn, el.quickDownloadBtn];
     btns.forEach((b) => (b.disabled = true));
     say("Fetching diff…");
-    const diff = await chrome.runtime.sendMessage({ type: "FETCH_SYNC_DIFF", direction });
+    const diff = await requestWorker("FETCH_SYNC_DIFF", { direction });
     btns.forEach((b) => (b.disabled = false));
     say("");
     if (!diff?.ok) {
@@ -3262,7 +3414,7 @@ function bindEvents() {
     const { type, id } = folderModalMode;
     if (type === "rename-tag" && state.tags[id]) {
       state.tags[id].name = name;
-      await chrome.storage.local.set({ tags: state.tags });
+      await persistLibrary({ tags: state.tags });
     } else if (type === "rename-folder") {
       const d = fdom();
       if (d.folders[id]) { d.folders[id].name = name; await d.persist(); }
@@ -3328,18 +3480,11 @@ function bindEvents() {
   });
 
   // Context menu dismissal
-  document.addEventListener("click", hideContextMenu);
+  document.addEventListener("click", event => { if (!event.target.closest(".context-menu, .context-submenu")) hideContextMenu(); });
   document.addEventListener("scroll", hideContextMenu, true);
   window.addEventListener("blur", hideContextMenu);
 
   // Escape closes menu + modals; Enter submits the open modal
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      hideContextMenu();
-      el.settingsModal.hidden = true;
-      el.folderModal.hidden = true;
-    }
-  });
   el.folderNameInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") el.folderSave.click();
   });
@@ -3350,18 +3495,15 @@ function bindEvents() {
     if (e.key === "Enter") el.settingsSave.click();
   });
 
-  el.clearDataBtn.addEventListener("click", async () => {
-    if (!confirm("Clear all data? This will remove all channels, folders, and tags. This cannot be undone.")) return;
-    await chrome.storage.local.remove(["channels", "folders", "tags", "gistId", "lastSyncedAt", "lastSyncCheckAt"]);
-    // Only the cleared keys are reset — Watch Later (videos/videoFolders) is left
-    // alone, so `state` must be spread, not rebuilt (a rebuilt object dropped
-    // state.videos entirely and broke every video view).
-    state = { ...state, channels: {}, folders: defaultFolders(), tags: {}, gistId: "", lastSyncedAt: null };
-    currentFolderId = "all";
-    resetVariableFilters();
-    searchQuery = "";
+  el.clearDataBtn.addEventListener('click', async () => {
+    if (!confirm('Clear all channels, folders, tags, videos, and Watch Later lists? A local recovery snapshot will be saved first. Settings stay on this device.')) return;
+    const res = await requestWorker('CLEAR_LIBRARY');
+    if (!res.ok) { el.backupStatus.textContent = res.error; return; }
+    await loadState();
+    currentFolderId = currentListId = 'all';
+    clearAllFilters();
     el.settingsModal.hidden = true;
-    render();
+    el.statusText.textContent = 'Library cleared. Restore it from Settings → Local backups.';
   });
 
   // Scan review dialog — click row to open channel
@@ -3435,13 +3577,35 @@ function bindEvents() {
     await chrome.runtime.sendMessage({ type: "DISCARD_PLAYLIST_IMPORT" });
   });
 
-  // Sync diff dialog
-  el.syncDiffBody.addEventListener("change", (e) => {
-    const role = e.target.dataset.role;
-    if (role !== "select-all-removals" && role !== "select-all-videos") return;
-    const selector = role === "select-all-videos" ? "input[data-video-id]" : "input[data-remove-id]";
-    const on = e.target.checked;
-    el.syncDiffBody.querySelectorAll(selector).forEach((box) => (box.checked = on));
+  // Channel removals affect video pruning, so refresh the complete preview.
+  el.syncDiffBody.addEventListener('change', async event => {
+    const box = event.target;
+    const role = box.dataset.role;
+    if (role === 'select-all-videos') {
+      syncSkipAllVideos = !box.checked;
+      syncSkipVideoIds.clear();
+      el.syncDiffBody.querySelectorAll('[data-video-id]').forEach(input => { input.checked = box.checked; });
+      return;
+    }
+    if (box.dataset.videoId) {
+      if (syncSkipAllVideos) {
+        syncSkipVideoIds = new Set(pendingSyncDiff.videos.items.map(item => item.id));
+        syncSkipAllVideos = false;
+      }
+      if (box.checked) syncSkipVideoIds.delete(box.dataset.videoId); else syncSkipVideoIds.add(box.dataset.videoId);
+      const all = el.syncDiffBody.querySelector('[data-role="select-all-videos"]');
+      if (all) { all.checked = !syncSkipVideoIds.size; all.indeterminate = syncSkipVideoIds.size > 0 && syncSkipVideoIds.size < pendingSyncDiff.videos.items.length; }
+      return;
+    }
+    if (role !== 'select-all-removals' && !box.dataset.removeId) return;
+    if (role === 'select-all-removals') el.syncDiffBody.querySelectorAll('[data-remove-id]').forEach(input => { input.checked = box.checked; });
+    const removeIds = [...el.syncDiffBody.querySelectorAll('[data-remove-id]:checked')].map(input => input.dataset.removeId);
+    const request = ++syncReviewRequest;
+    el.syncDiffApply.disabled = true;
+    const diff = await requestWorker('FETCH_SYNC_DIFF', { direction: pendingSyncDiff.direction, removeIds });
+    if (request !== syncReviewRequest || !pendingSyncDiff) return;
+    if (!diff.ok) { el.syncDiffWarning.hidden = false; el.syncDiffWarning.textContent = diff.error; return; }
+    openSyncDiffModal(diff, { keepChoices: true });
   });
 
   el.syncDiffApply.addEventListener("click", async () => {
@@ -3452,18 +3616,23 @@ function bindEvents() {
     ).map((box) => box.dataset.removeId);
     // Video rows are ticked by default, so it's the *unticked* ones that carry a
     // decision: leave those alone on the target.
-    const skipVideoIds = Array.from(
-      el.syncDiffBody.querySelectorAll("input[data-video-id]:not(:checked)")
-    ).map((box) => box.dataset.videoId);
+    const skipVideoIds = [...syncSkipVideoIds];
 
     el.syncDiffApply.disabled = true;
     el.statusText.textContent = direction === "upload" ? "Uploading…" : "Downloading…";
 
     const res = direction === "upload"
-      ? await chrome.runtime.sendMessage({ type: "APPLY_UPLOAD", removeFromGistIds: removeIds, skipVideoIds })
-      : await chrome.runtime.sendMessage({ type: "APPLY_DOWNLOAD", removeLocalIds: removeIds, skipVideoIds });
+      ? await requestWorker("APPLY_UPLOAD", { removeFromGistIds: removeIds, skipVideoIds, reviewToken: pendingSyncDiff.reviewToken, skipAllVideos: syncSkipAllVideos })
+      : await requestWorker("APPLY_DOWNLOAD", { removeLocalIds: removeIds, skipVideoIds, reviewToken: pendingSyncDiff.reviewToken, skipAllVideos: syncSkipAllVideos });
 
     el.syncDiffApply.disabled = false;
+    if (res?.stale) {
+      openSyncDiffModal(res.diff, { keepChoices: true });
+      el.syncDiffWarning.hidden = false;
+      el.syncDiffWarning.textContent = res.error;
+      el.statusText.textContent = 'Review updated changes.';
+      return;
+    }
     el.syncDiffModal.hidden = true;
     pendingSyncDiff = null;
 
@@ -3479,6 +3648,7 @@ function bindEvents() {
   });
 
   el.syncDiffCancel.addEventListener("click", () => {
+    syncReviewRequest++;
     el.syncDiffModal.hidden = true;
     pendingSyncDiff = null;
   });
@@ -3491,10 +3661,286 @@ function bindEvents() {
   }
   el.syncDiffModal.addEventListener("mousedown", (e) => {
     if (e.target === el.syncDiffModal) {
+      syncReviewRequest++;
       el.syncDiffModal.hidden = true;
       pendingSyncDiff = null;
     }
   });
+}
+
+function renderShortcutHints() {
+  const searchKey = controls.enabled && controls.bindings.search;
+  el.searchInput.title = searchKey ? `Search library (${formatShortcut(searchKey, IS_MAC)})` : 'Search library';
+}
+
+function renderLanguageCatalog() {
+  const custom = [...new Set([...LANGUAGES, ...Object.values(state.channels).map(ch => canonicalLanguage(ch.language)).filter(Boolean)])]
+    .filter(name => !LANGUAGE_CATALOG.some(language => language.name === name))
+    .map(name => ({ code: "", name, native: "Previously used" }));
+  const catalog = [...LANGUAGE_CATALOG, ...custom].filter(language => languageCatalogMatches(language, el.languageSearch.value));
+  el.languageSelection.textContent = languagesDraft.size ? [...languagesDraft].join(" · ") : "No active languages";
+  el.languageCatalog.innerHTML = catalog.length ? catalog.map(language => `
+    <label class="language-choice"><input type="checkbox" value="${escapeHtml(language.name)}" ${languagesDraft.has(language.name) ? "checked" : ""}>
+    <span><strong>${escapeHtml(langLabel(language.name))}</strong><small>${escapeHtml(language.native)}</small></span></label>`).join("")
+    : '<p class="field-hint">No matching languages.</p>';
+}
+
+function openSettings(tab = 'general') {
+  controlsDraft = clone(controls);
+  recordingShortcut = null;
+  el.apiKeyInput.value = state.apiKey || '';
+  el.gistTokenInput.value = state.gistToken || '';
+  languagesDraft = new Set(LANGUAGES);
+  el.languageSearch.value = "";
+  renderLanguageCatalog();
+  el.fillAvatarsStatus.textContent = '';
+  el.settingsStatus.textContent = 'Save to apply your preferences.';
+  renderSyncStatus();
+  renderControlsSettings();
+  sayShortcut('Use letters, numbers, or punctuation, with optional modifiers. Escape cancels recording.');
+  selectSettingsTab(tab);
+  el.settingsModal.hidden = false;
+  refreshBackupList();
+}
+
+function selectSettingsTab(tab) {
+  stopShortcutRecording();
+  document.querySelectorAll('[data-settings-tab]').forEach(button => {
+    const selected = button.dataset.settingsTab === tab;
+    button.setAttribute('aria-selected', String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  document.querySelectorAll('[data-settings-panel]').forEach(panel => { panel.hidden = panel.dataset.settingsPanel !== tab; });
+  document.querySelector('.settings-content').scrollTop = 0;
+}
+
+function sayShortcut(message, error = false) {
+  el.shortcutStatus.textContent = message;
+  el.shortcutStatus.classList.toggle('error', error);
+}
+
+function renderControlsSettings() {
+  el.shortcutsEnabledInput.checked = controlsDraft.enabled;
+  el.selectionModifierInput.value = controlsDraft.selectionModifier;
+  el.wheelAdjustsNumbersInput.checked = controlsDraft.wheelAdjustsNumbers;
+  let group = '';
+  el.shortcutList.innerHTML = SHORTCUTS.map(action => {
+    const heading = group !== action.group ? `<h4 class="shortcut-group">${action.group}</h4>` : '';
+    group = action.group;
+    return `${heading}<div class="shortcut-row"><span>${action.label}</span><button type="button" class="shortcut-record" data-record-shortcut="${action.id}" aria-label="Change shortcut for ${action.label}">${escapeHtml(formatShortcut(controlsDraft.bindings[action.id], IS_MAC))}</button><button type="button" class="shortcut-clear" data-clear-shortcut="${action.id}" aria-label="Disable shortcut for ${action.label}" ${controlsDraft.bindings[action.id] ? '' : 'disabled'}>Clear</button></div>`;
+  }).join('');
+}
+
+function stopShortcutRecording() {
+  if (!recordingShortcut) return;
+  const id = recordingShortcut;
+  recordingShortcut = null;
+  const button = el.shortcutList.querySelector(`[data-record-shortcut="${id}"]`);
+  if (button) { button.classList.remove('recording'); button.textContent = formatShortcut(controlsDraft.bindings[id], IS_MAC); }
+}
+
+function bindShortcutSettings() {
+  const tabs = [...document.querySelectorAll('[data-settings-tab]')];
+  tabs.forEach((button, index) => {
+    button.addEventListener('click', () => selectSettingsTab(button.dataset.settingsTab));
+    button.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[next].click(); tabs[next].focus();
+    });
+  });
+  el.shortcutsEnabledInput.addEventListener('change', () => { controlsDraft.enabled = el.shortcutsEnabledInput.checked; });
+  el.selectionModifierInput.addEventListener('change', () => { controlsDraft.selectionModifier = el.selectionModifierInput.value; });
+  el.wheelAdjustsNumbersInput.addEventListener('change', () => { controlsDraft.wheelAdjustsNumbers = el.wheelAdjustsNumbersInput.checked; });
+  el.resetControlsBtn.addEventListener('click', () => {
+    stopShortcutRecording(); controlsDraft = normalizeControls(); renderControlsSettings();
+    sayShortcut('Defaults restored. Save to apply, or Cancel to keep your current controls.');
+  });
+  el.shortcutList.addEventListener('click', event => {
+    const record = event.target.closest('[data-record-shortcut]');
+    const clear = event.target.closest('[data-clear-shortcut]');
+    stopShortcutRecording();
+    if (record) {
+      recordingShortcut = record.dataset.recordShortcut;
+      record.classList.add('recording'); record.textContent = 'Press keys…'; record.focus();
+      sayShortcut('Press your new shortcut. Escape cancels; Backspace or Delete disables it.');
+    } else if (clear) {
+      const id = clear.dataset.clearShortcut;
+      controlsDraft.bindings[id] = null; renderControlsSettings();
+      el.shortcutList.querySelector(`[data-record-shortcut="${id}"]`).focus();
+      sayShortcut('Shortcut disabled. Save to apply this change.');
+    }
+  });
+  document.addEventListener('focusin', event => {
+    if (recordingShortcut && event.target.dataset.recordShortcut !== recordingShortcut) stopShortcutRecording();
+  });
+  document.addEventListener('keydown', event => {
+    if (!recordingShortcut || el.settingsModal.hidden) return;
+    if (event.key === 'Tab') { stopShortcutRecording(); return; }
+    event.preventDefault(); event.stopImmediatePropagation();
+    if (event.repeat || event.isComposing) return;
+    if (event.key === 'Escape') { stopShortcutRecording(); sayShortcut('Recording cancelled. Your shortcut is unchanged.'); return; }
+    const id = recordingShortcut;
+    const binding = ['Backspace', 'Delete'].includes(event.key) ? null : shortcutFromEvent(event, IS_MAC);
+    if (!binding && !['Backspace', 'Delete'].includes(event.key)) return;
+    const conflict = shortcutConflict(controlsDraft.bindings, id, binding);
+    const error = bindingError(binding) || (conflict ? `Already used for “${conflict.label}”. Choose another shortcut or clear that binding first.` : '');
+    if (error) { sayShortcut(error, true); return; }
+    controlsDraft.bindings[id] = binding;
+    recordingShortcut = null; renderControlsSettings();
+    el.shortcutList.querySelector(`[data-record-shortcut="${id}"]`).focus();
+    sayShortcut(`${binding ? 'Shortcut updated' : 'Shortcut disabled'}. Save to apply this change.`);
+  }, true);
+}
+
+function runKeyboardShortcut(event) {
+  if (!controls.enabled || event.defaultPrevented || event.repeat || event.isComposing) return;
+  if (event.target.isContentEditable || event.target.closest('input, textarea, select, [role="textbox"]')) return;
+  if (document.querySelector('.modal:not([hidden]), .context-menu:not([hidden]), .context-submenu:not([hidden]), .emoji-picker')) return;
+  const binding = shortcutFromEvent(event, IS_MAC);
+  if (!binding) return;
+  const action = SHORTCUTS.find(action => controls.bindings[action.id] === binding);
+  if (!action) return;
+  if (action.id === 'undo' && (el.undoToast.hidden || el.undoBtn.disabled)) return;
+  if (action.id === 'refresh' && el.refreshBtn.disabled) return;
+  event.preventDefault();
+  if (action.id === 'search') { el.searchInput.focus(); el.searchInput.select(); }
+  else if (['channels', 'new', 'watchlater', 'removed'].includes(action.id)) setView(action.id);
+  else if (action.id === 'settings' || action.id === 'controls') openSettings(action.id === 'controls' ? 'controls' : 'general');
+  else if (action.id === 'refresh') el.refreshBtn.click();
+  else if (action.id === 'undo') el.undoBtn.click();
+  else if (action.id === 'clearFilters') clearAllFilters();
+}
+
+function bindKeyboardControls() {
+  bindShortcutSettings();
+  for (const menu of [el.contextMenu, el.contextSubmenu, el.contextSubSubmenu]) {
+    menu.setAttribute('role', 'menu');
+    new MutationObserver(() => menu.querySelectorAll('button').forEach(button => button.setAttribute('role', 'menuitem'))).observe(menu, { childList: true });
+    menu.addEventListener('keydown', event => {
+      const buttons = [...menu.querySelectorAll('button')];
+      const index = buttons.indexOf(document.activeElement);
+      if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+          : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+        buttons[next]?.focus();
+      } else if (event.key === 'ArrowRight' && document.activeElement?.classList.contains('has-submenu')) {
+        event.preventDefault(); document.activeElement.click();
+      } else if (event.key === 'ArrowLeft' && menu !== el.contextMenu) {
+        event.preventDefault(); menu.hidden = true; menu._opener?.focus();
+      }
+    });
+  }
+  const modals = [...document.querySelectorAll('.modal')];
+  const focusable = modal => [...modal.querySelectorAll('button:not(:disabled), input:not([type="hidden"]):not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex="0"]')].filter(node => node.tabIndex >= 0 && node.getClientRects().length);
+  for (const modal of modals) {
+    new MutationObserver(() => {
+      if (!modal.hidden) {
+        modal._opener = document.activeElement;
+        if (!modal.contains(document.activeElement)) focusable(modal)[0]?.focus();
+      } else if (modal._opener?.isConnected && !modals.some(other => !other.hidden)) modal._opener.focus();
+    }).observe(modal, { attributes: true, attributeFilter: ['hidden'] });
+  }
+  document.addEventListener('keydown', event => {
+    if (event.defaultPrevented || event.isComposing) return;
+    const modal = modals.findLast(node => !node.hidden);
+    if (event.key === 'Escape') {
+      if (!el.contextMenu.hidden) {
+        event.preventDefault(); const opener = el.contextMenu._opener; hideContextMenu(); opener?.focus(); return;
+      }
+      if (modal) {
+        event.preventDefault(); modal.hidden = true;
+        if (modal === el.syncDiffModal) { pendingSyncDiff = null; syncReviewRequest++; }
+      }
+    }
+    if (event.key === 'Tab' && modal) {
+      const nodes = focusable(modal), first = nodes[0], last = nodes.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+    const chip = event.target.closest('span.tag-chip[data-role], button.tag-chip[data-role^="filter-"]');
+    if (chip && ['Enter', ' '].includes(event.key)) {
+      event.preventDefault();
+      chip.dispatchEvent(new MouseEvent(event.shiftKey ? 'contextmenu' : 'click', { bubbles: true, cancelable: true }));
+    }
+    runKeyboardShortcut(event);
+  });
+  new MutationObserver(() => {
+    el.tagFilterBar.querySelectorAll('span.tag-chip[data-role]').forEach(chip => { chip.tabIndex = 0; chip.setAttribute('role', 'button'); chip.setAttribute('aria-pressed', String(chip.classList.contains('active') || chip.classList.contains('on'))); });
+  }).observe(el.tagFilterBar, { childList: true, subtree: true });
+}
+
+async function refreshBackupList() {
+  const result = await requestWorker('LIST_BACKUPS');
+  if (!result.ok) { el.backupStatus.textContent = result.error; return; }
+  el.backupList.innerHTML = result.backups.length ? result.backups.map(backup =>
+    `<div class="backup-row"><span>${escapeHtml(new Date(backup.createdAt).toLocaleString())}<small>${escapeHtml(backup.reason)} · ${backup.counts.channels} channels · ${backup.counts.videos} videos</small></span><button class="btn btn-ghost" data-backup-id="${escapeHtml(backup.id)}">Restore</button></div>`
+  ).join('') : '<p class="field-hint">No local snapshots yet.</p>';
+}
+
+function bindRecoveryControls() {
+
+  el.undoDismiss.addEventListener('click', () => { el.undoToast.hidden = true; undoVideoChanges = null; });
+  el.undoBtn.addEventListener('click', async () => {
+    if (!undoVideoChanges) return;
+    el.undoBtn.disabled = true;
+    const result = await requestWorker('UNDO_VIDEOS', { changes: undoVideoChanges });
+    el.undoBtn.disabled = false;
+    el.statusText.textContent = result.ok ? 'Video changes undone.' : result.error;
+    if (result.ok) { undoVideoChanges = null; el.undoToast.hidden = true; }
+  });
+  el.exportBackupBtn.addEventListener('click', async () => {
+    const result = await requestWorker('EXPORT_BACKUP');
+    if (!result.ok) { el.backupStatus.textContent = result.error; return; }
+    const url = URL.createObjectURL(new Blob([JSON.stringify(result.backup, null, 2)], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `mytube-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    el.backupStatus.textContent = 'Backup exported. API keys and GitHub tokens are excluded.';
+  });
+  el.importBackupBtn.addEventListener('click', () => el.backupFileInput.click());
+  el.backupFileInput.addEventListener('change', async () => {
+    const file = el.backupFileInput.files[0];
+    el.backupFileInput.value = '';
+    if (!file) return;
+    try {
+      if (file.size > 50 * 1024 * 1024) throw new Error('This file exceeds the 50 MB import limit.');
+      const backup = JSON.parse(await file.text());
+      const preview = await requestWorker('PREVIEW_BACKUP', { backup });
+      if (!preview.ok) throw new Error(preview.error);
+      if (!confirm(`Replace this device’s library with ${preview.counts.channels} channels, ${preview.counts.videos} videos, ${preview.counts.folders} folders, ${preview.counts.videoFolders} Watch Later lists, and ${preview.counts.tags} tags from “${file.name}”? The current library will be saved as a recovery snapshot first.`)) return;
+      const result = await requestWorker('RESTORE_BACKUP', { backup });
+      if (!result.ok) throw new Error(result.error);
+      await finishRestore();
+    } catch (error) { el.backupStatus.textContent = `Import failed: ${error.message}`; }
+  });
+  el.createBackupBtn.addEventListener('click', async () => {
+    const result = await requestWorker('CREATE_BACKUP');
+    el.backupStatus.textContent = result.ok ? 'Local snapshot saved.' : result.error;
+    await refreshBackupList();
+  });
+  el.backupList.addEventListener('click', async event => {
+    const button = event.target.closest('[data-backup-id]');
+    if (!button || !confirm(`Restore ${button.parentElement.querySelector('span').textContent}? The current library will be saved as a recovery snapshot first.`)) return;
+    button.disabled = true;
+    const result = await requestWorker('RESTORE_BACKUP', { backupId: button.dataset.backupId });
+    if (!result.ok) { button.disabled = false; el.backupStatus.textContent = result.error; return; }
+    await finishRestore();
+  });
+}
+
+async function finishRestore() {
+  undoVideoChanges = null;
+  el.undoToast.hidden = true;
+  await loadState();
+  currentFolderId = currentListId = 'all';
+  clearAllFilters();
+  el.backupStatus.textContent = 'Library restored on this device. Sync remains manual.';
+  await refreshBackupList();
 }
 
 // ---------- Folder / tag management ----------
@@ -3569,9 +4015,9 @@ async function deleteFolder(id) {
   if (d.selected === id || childIds.includes(d.selected)) d.select("all");
 
   if (isList) {
-    await chrome.storage.local.set({ videos: state.videos, videoFolders: state.videoFolders });
+    await persistLibrary({ videos: state.videos, videoFolders: state.videoFolders });
   } else {
-    await chrome.storage.local.set({ channels: state.channels, folders: state.folders });
+    await persistLibrary({ channels: state.channels, folders: state.folders });
   }
   render();
 }
@@ -3586,7 +4032,7 @@ async function deleteTag(id) {
   }
   delete state.tags[id];
   activeTagFilters.delete(id);
-  await chrome.storage.local.set({ channels: state.channels, tags: state.tags });
+  await persistLibrary({ channels: state.channels, tags: state.tags });
   render();
 }
 
@@ -3594,6 +4040,7 @@ async function deleteTag(id) {
 
 function showContextMenu(x, y, items) {
   const menu = el.contextMenu;
+  menu._opener = document.activeElement;
   menu.innerHTML = "";
   hideSubmenu();
 
@@ -3611,6 +4058,14 @@ function showContextMenu(x, y, items) {
 
     if (item.submenu) {
       btn.classList.add("has-submenu");
+      btn.addEventListener('click', event => {
+        event.stopPropagation();
+        const rect = btn.getBoundingClientRect();
+        showSubmenu(rect.right, rect.top, item.submenu());
+        el.contextSubmenu._opener = btn;
+        el.contextSubmenu.querySelector('button')?.focus();
+      });
+      btn.setAttribute('aria-haspopup', 'menu');
       btn.addEventListener("mouseenter", () => {
         const btnRect = btn.getBoundingClientRect();
         showSubmenu(btnRect.right, btnRect.top, item.submenu());
@@ -3656,6 +4111,14 @@ function showSubmenu(x, y, items) {
 
     if (item.submenu) {
       btn.classList.add("has-submenu");
+      btn.addEventListener('click', event => {
+        event.stopPropagation();
+        const rect = btn.getBoundingClientRect();
+        showSubSubmenu(rect.right, rect.top, item.submenu());
+        el.contextSubSubmenu._opener = btn;
+        el.contextSubSubmenu.querySelector('button')?.focus();
+      });
+      btn.setAttribute('aria-haspopup', 'menu');
       btn.addEventListener("mouseenter", () => {
         const r = btn.getBoundingClientRect();
         showSubSubmenu(r.right, r.top, item.submenu());
@@ -3732,51 +4195,26 @@ function folderSubmenuItems(onPick, isActive = () => false, folders = state.fold
 function buildFolderSubmenu(channelId, ch) {
   const moveTo = async (folderId) => {
     state.channels[channelId].folderId = folderId;
-    await chrome.storage.local.set({ channels: state.channels });
+    await persistLibrary({ channels: state.channels });
     renderFolders();
     if (currentFolderId !== "all") renderGrid();
   };
   return folderSubmenuItems(moveTo, (id) => ch.folderId === id);
 }
 
-// Language picker submenu, shared by the single-channel and bulk context menus.
-// `onPick(langOrNull)` fires on choice, `isActive` marks the current value, and
-// `extra` seeds off-list values (a channel's custom language) so the row it's
-// already on is still pickable. "New language…" both creates the language and
-// assigns it, which is the only way to add one without opening Settings.
-function languageSubmenuItems(onPick, isActive = () => false, extra = []) {
-  const list = [...new Set([...extra.filter(Boolean), ...LANGUAGES])];
+// Only active languages appear in single-channel and bulk menus.
+function languageSubmenuItems(onPick, isActive = () => false) {
   return [
     { label: "— none —", active: isActive(null), action: () => onPick(null) },
-    ...list.map((l) => ({ label: langLabel(l), active: isActive(l), action: () => onPick(l) })),
-    {
-      label: "+ New language…",
-      action: async () => {
-        const name = prompt(
-          "New language — added to the picker for every channel.\n" +
-            "A flag is matched from the name; start with an emoji to force one."
-        )?.trim();
-        if (!name) return;
-        await addLanguage(name);
-        onPick(name);
-      },
-    },
+    ...LANGUAGES.map(language => ({ label: langLabel(language), active: isActive(language), action: () => onPick(language) })),
   ];
-}
-
-// Append a language to the curated set and persist it, so it shows up in every
-// picker (and syncs with the other settings). No-op if it's already there.
-async function addLanguage(name) {
-  if (LANGUAGES.includes(name)) return;
-  LANGUAGES = [...LANGUAGES, name];
-  await chrome.storage.local.set({ languages: LANGUAGES });
 }
 
 async function setChannelLanguage(channelId, lang) {
   const ch = state.channels[channelId];
   if (!ch) return;
   ch.language = lang || null;
-  await chrome.storage.local.set({ channels: state.channels });
+  await persistLibrary({ channels: state.channels });
   render(); // the filter bar gains/loses a language chip with the last channel using it
 }
 
@@ -3831,7 +4269,7 @@ async function bulkMutate(ids, fn) {
     const ch = state.channels[id];
     if (ch) fn(ch);
   }
-  await chrome.storage.local.set({ channels: state.channels });
+  await persistLibrary({ channels: state.channels });
   clearSelection();
   render(); // not just the grid: a language/tag edit also reshapes the filter bar
 }
@@ -3839,7 +4277,7 @@ async function bulkMutate(ids, fn) {
 async function bulkDelete(ids) {
   if (!confirm(`Delete ${ids.length} channels from MyTube? This cannot be undone.`)) return;
   for (const id of ids) delete state.channels[id];
-  await chrome.storage.local.set({ channels: state.channels });
+  await persistLibrary({ channels: state.channels });
   clearSelection();
   render();
 }
@@ -3982,6 +4420,8 @@ function showVideoBulkContextMenu(x, y, ids) {
       ),
     });
     items.push({ label: `Remove ${n} from Watch Later`, danger: true, action: () => bulkRemoveFromWatchLater(ids) });
+  } else if (currentView === 'removed') {
+    items.push({ label: `Restore ${n} to New`, action: () => bulkVideoMutate(ids, v => { v.hidden = false; }) });
   } else {
     items.push({ label: `Remove ${n} from feed`, danger: true, action: () => bulkVideoMutate(ids, (v) => (v.hidden = true)) });
   }
@@ -3994,7 +4434,7 @@ async function deleteChannel(channelId) {
   const confirmed = confirm(`Delete "${ch.name}" from MyTube? This cannot be undone.`);
   if (!confirmed) return;
   delete state.channels[channelId];
-  await chrome.storage.local.set({ channels: state.channels });
+  await persistLibrary({ channels: state.channels });
   render();
 }
 
@@ -4137,7 +4577,7 @@ async function addTagIdToChannel(channelId, tagId) {
   if (!ch.tags) ch.tags = [];
   if (!ch.tags.includes(tagId)) {
     ch.tags.push(tagId);
-    await chrome.storage.local.set({ channels: state.channels });
+    await persistLibrary({ channels: state.channels });
   }
 }
 
@@ -4148,12 +4588,12 @@ async function addTagToChannel(channelId, name) {
   if (!tagId) {
     tagId = slugify(name) + "-" + Date.now().toString(36).slice(-3);
     state.tags[tagId] = { name, color: nextTagColor() };
-    await chrome.storage.local.set({ tags: state.tags });
+    await persistLibrary({ tags: state.tags });
   }
   const ch = state.channels[channelId];
   if (!ch.tags) ch.tags = [];
   if (!ch.tags.includes(tagId)) {
     ch.tags.push(tagId);
-    await chrome.storage.local.set({ channels: state.channels });
+    await persistLibrary({ channels: state.channels });
   }
 }

@@ -26,7 +26,10 @@ native-host/
   install.sh                          registers it per browser profile (per device, one-time)
 version.json                          build stamp (UTC), rewritten by .githooks/pre-commit
 .githooks/pre-commit                  stamps version.json; enable with `git config core.hooksPath .githooks`
-icons/                                EMPTY — no packaged icon (manifest icon keys commented out)
+shared/library.js                    pure field patches, backup validation, stable serialization
+shared/controls.js                   shortcut catalog, normalization, matching, labels, selection modifiers
+package.json, tests/                  dependency-free Node regression tests + synthetic browser fixture
+icons/                                packaged extension icons
 check-missing.sh, csv-ids.txt,        one-off dev utilities / personal data dumps (see "Cruft")
   scraped-ids.txt
 ```
@@ -54,10 +57,12 @@ channels: { [channelId]: {
   finished,                 // bool — user flag: a channel you consider done
   trackVideos,              // bool — user flag: feed this channel's uploads into the New videos tab
   fetchedAll,               // bool — full upload history was API-fetched; exempts the channel from the video cap
-  lastVideoDate,            // ISO string, from the RSS feed
+  lastVideoDate,            // ISO string, from RSS or the uploads API fallback
   videoCount,               // number | null (null until fetched with an API key)
   subscriberCount,          // number | null (null if hidden or not yet fetched); shown in the list
-  lastFetched,              // epoch ms of the last stats refresh (drives merge freshness)
+  lastFetched,              // epoch ms of the last successful feed (RSS or fallback) + channel-stat refresh
+  lastFetchAttempt,          // epoch ms of the latest attempt, including failures
+  lastFetchError,            // latest failure text; cleared on a successful retry
 } }
 folders: { [folderId]: { name, order, parentId?, emoji? } }   // channel folders; "unsorted" (shown as
                                                               //   "Unfiled") is the pinned home
@@ -69,6 +74,7 @@ videos:  { [videoId]: {
   title, author,            // author = channel name for saves with no channel record; else null
   published,                // ISO | null (null for manual/imported saves — oEmbed & the scrape have no
                             //   upload date; backfilled from the API snippet on the next details pass)
+  channelUrl,               // string | null — captured channel/handle URL; canonicalized by API details
   channelThumbnail,         // string | absent — channel avatar url for saved videos whose channel ISN'T a
                             //   subscription (subscriptions read the avatar from `channels`); filled by
                             //   fillChannelThumbnails (API snippet), so the Watch Later card shows a photo
@@ -80,9 +86,8 @@ videos:  { [videoId]: {
   saved,                    // bool — in Watch Later
   folderId,                 // which Watch Later list ("unsorted" default); only meaningful when saved
   userStateAt,              // epoch ms | absent — when the user last changed watched/saved/hidden/
-                            //   folderId. Stamped automatically by the dashboard's saveVideos()
-                            //   (it diffs against videoStateSnapshot) and by the background's own
-                            //   saves; sync resolves those four fields last-writer-wins from it
+                            //   folderId. Stamped by the worker for PATCH_LIBRARY, Undo, restore,
+                            //   and its own saves; sync resolves those four fields last-writer-wins from it
   addedAt,                  // epoch ms first seen / saved
 } }
               // New-tab uploads (from RSS, per-channel-capped, pruned when a channel untracks) AND
@@ -96,13 +101,16 @@ reopenDashboardAt                                             // epoch ms stampe
                                                               //   reopen it on the way back up (per-device)
 lastSyncCheckAt                                               // epoch ms of the last on-open gist check
                                                               //   (throttle only; per-device, never synced)
-languages                                                     // string[] — editable language dropdown set (Settings, or
-                                                              //   "+ New language…" in the right-click language submenu)
+languages                                                     // string[] — active languages selected in Settings; empty is allowed
 sortDate, sortCount, sortSubs, sortFolder, sortPriority,       // one direction per sortable channel-list
   folderSort, currentView                                     //   column ("none"|"asc"|"desc") plus their
                                                               //   click-order priority; and the other
                                                               //   persisted UI prefs ("channels"|"new"|
-                                                              //   "watchlater"). Per-device — NOT synced
+                                                              //   "watchlater"|"removed"). Per-device — NOT synced
+libraryEpoch                                                 // incremented by clear/restore; invalidates older enrichment jobs
+libraryBackups                                               // latest five local recovery snapshots; never synced/exported recursively
+controls: { enabled, bindings: { [actionId]: chord | null },   // per-device keyboard + mouse preferences, never synced/exported
+  selectionModifier, wheelAdjustsNumbers }                    // "primary" (Ctrl/Meta) or "alt"; wheel option covers count/date fields
 colWidths                                                    // number[5] | absent — resized px widths of the 5 sized table columns
 pendingScan: { scannedAt, scannedCount, unresolved, added[], modified[], removed[] }
               // a scan awaiting review; never applied to `channels` until confirmed, never synced
@@ -121,25 +129,35 @@ pendingPlaylistImport: { playlistId, title, fetchedAt, statedCount, scrapedCount
 
 ## Message protocol (dashboard → background)
 
-All handlers live in the `chrome.runtime.onMessage` switch in `background.js`
-and reply through `sendResponse` (async, so each returns `true`).
+All handlers live in the `chrome.runtime.onMessage` dispatcher in `background.js`
+and reply through `sendResponse` (async, so each returns `true`). Rejections become
+`{ ok: false, error }` responses so the dashboard can reset its busy controls.
 
 | Type | Payload | Response |
 | --- | --- | --- |
 | `SCAN_RESULT` | `{ channels }` (from the content script) | scan diff counts; stashes `pendingScan`, opens dashboard |
 | `APPLY_SCAN` | `{ removeIds }` | `{ ok, added, modified, removed }` |
 | `DISCARD_SCAN` | — | `{ ok }` (clears `pendingScan`) |
-| `REFRESH_STATS` | — | diagnostics: `{ ok, hasApiKey, queried, thumbsFilled, missingThumbs, apiFailures, lastError, trackedUpdates }` |
-| `REFRESH_SINGLE` | `{ channelId }` | `{ ok }` |
+| `REFRESH_STATS` | `{ channelIds? }` (omit for all) | diagnostics, including `failures: [{id, name, error}]`: `{ ok, hasApiKey, queried, thumbsFilled, missingThumbs, apiFailures, lastError, trackedUpdates }` |
+| `REFRESH_SINGLE` | `{ channelId }` | same refresh diagnostics |
 | `FILL_MISSING_AVATARS` | — | `{ ok, hasApiKey, missingBefore, thumbsFilled, missingAfter, apiFailures, lastError }` |
 | `FILL_VIDEO_DETAILS` | — | `{ ok, hasApiKey, queried, filled, apiFailures, lastError }` (fills video length/views) |
 | `FETCH_ALL_VIDEOS` | `{ channelIds }` | `{ ok, hasApiKey, channels, total, added, apiFailures, lastError, failures[] }` (deep-fetch full upload history; `failures` = `{ id, name, error }` per skipped channel) |
 | `PLAYLIST_SCAN_RESULT` | `{ playlistId, title, videos, statedCount, scrapedCount }` (from the injected scraper) | `{ ok, count }`; stashes `pendingPlaylistImport`, opens dashboard |
 | `APPLY_PLAYLIST_IMPORT` | `{ listName, moveIds }` | `{ ok, listId, added, moved }` (creates a Watch Later list, saves the reviewed playlist into it) |
 | `DISCARD_PLAYLIST_IMPORT` | — | `{ ok }` (clears `pendingPlaylistImport`) |
-| `FETCH_SYNC_DIFF` | `{ direction }` | `{ ok, direction, channels: { added, removed, modified } }` |
-| `APPLY_UPLOAD` | `{ removeFromGistIds, skipVideoIds }` | `{ ok, gistId, lastSyncedAt }` |
-| `APPLY_DOWNLOAD` | `{ removeLocalIds, skipVideoIds }` | `{ ok, gistId, lastSyncedAt }` |
+| `FETCH_SYNC_DIFF` | `{ direction, removeIds? }` | diff incl. tags, all video rows, selected `removeIds`, and `reviewToken` |
+| `APPLY_UPLOAD` | `{ removeFromGistIds, skipVideoIds, skipAllVideos?, reviewToken }` | `{ ok, gistId, lastSyncedAt }` or `{ ok:false, stale:true, error, diff }` |
+| `APPLY_DOWNLOAD` | `{ removeLocalIds, skipVideoIds, skipAllVideos?, reviewToken }` | same apply result; takes a local snapshot first |
+| `PATCH_LIBRARY` | `{ patches: { [collection]: [{id, set?, unset?, create?, remove?}] } }` | `{ ok, videoStates }`; field patches from direct edits |
+| `SET_SETTINGS` | `{ values }` | `{ ok }`; serialized writes for `apiKey`, `languages`, `gistToken` |
+| `UNDO_VIDEOS` | `{ changes: [{id, before, after}] }` | `{ ok }`; rejects if current flags/stamp differ from `after` |
+| `EXPORT_BACKUP` | — | `{ ok, backup }`; portable JSON, no credentials |
+| `PREVIEW_BACKUP` | `{ backup }` | `{ ok, counts }`; validates without writing |
+| `CREATE_BACKUP` | — | `{ ok }`; manual local snapshot |
+| `LIST_BACKUPS` | — | `{ ok, backups }`; metadata/counts only |
+| `RESTORE_BACKUP` | `{ backup }` or `{ backupId }` | `{ ok }`; snapshots current library, replaces local library, increments epoch |
+| `CLEAR_LIBRARY` | — | `{ ok }`; snapshots then clears all five collections, increments epoch |
 
 The dashboard also reacts to `chrome.storage.onChanged` so background writes
 (auto-refresh, a scan that finished while it was closed) update the UI live.
@@ -149,8 +167,8 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 - **Catch-up on open.** The 3-hour alarm is the only *background* trigger, and
   its first fire is 3 hours after install — so a device left closed showed stale
   data until it happened to run. `catchUpOnOpen()` (dashboard `init`, after the
-  `onChanged` listener is wired) fires `REFRESH_STATS` if no channel has been
-  fetched in 3 hours. **YouTube data only — it never touches the gist.**
+  `onChanged` listener is wired) fires `REFRESH_STATS` for the channels whose last successful fetch is at least
+  3 hours old. **YouTube data only — it never touches the gist.**
 - **Sync never *applies* by itself.** Nothing is written to the gist, and nothing
   from the gist is written locally, without the user confirming a review. An
   automatic merge meant a device opened after sitting stale pushed its old
@@ -178,33 +196,45 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   library, writes `pendingScan`, and opens the dashboard, which shows the review
   dialog. Nothing hits `channels` until `APPLY_SCAN`. Removals apply only for
   IDs the user explicitly ticks.
-- **Stats refresh.** `channels.list?part=snippet,statistics` in batches of 50
+- **Stats refresh.** `channels.list?part=snippet,statistics,contentDetails` in batches of 50
   fills video/subscriber counts and backfills avatars; last-video date comes
   from each channel's RSS feed (`feeds/videos.xml`, regex-parsed by
-  `fetchChannelVideos` — no DOMParser in a worker). `FILL_MISSING_AVATARS` is
+  `fetchChannelVideos` — no DOMParser in a worker), with an uploads API fallback
+  for RSS 404s (see Refresh diagnostics below). `FILL_MISSING_AVATARS` is
   the cheap subset: snippet-only, only for channels missing a thumbnail. A
   refresh also fires an OS notification (`notifications` permission, inline icon)
   listing any `active`/`finished` channel whose `lastVideoDate` moved — the
   "tracked update" alert.
-- **Two video tabs share one `videos` store.** The sidebar has three views:
-  **Channels**, **New**, **Watch Later** (`currentView`).
-  - **Opening leaves watched state unchanged.** Both views route left-click and
-    middle-click through `openVideo`, which only opens a YouTube tab. Watched
+- **Video views share one `videos` store.** The sidebar has **Channels**, **New**,
+  **Watch Later**, and **Removed videos** (`currentView`).
+  - **Opening leaves watched state unchanged.** Card clicks use `openVideo`, while
+    title links keep native navigation; neither path changes watched state. Channel
+    names and avatars open the channel Videos tab (ID first, validated channelUrl
+    fallback). Unknown identity is inert, never a guessed name-based link. Watched
     changes require the explicit card, context-menu, or bulk controls.
-  - **Writing the store.** It's one storage key, so any background job that reads
-    it and writes back minutes later (stats refresh, `FETCH_ALL_VIDEOS`, detail
-    backfill) would clobber whatever the dashboard wrote meanwhile — a video
-    marked watched mid-refresh used to un-mark itself. Those jobs read via
-    `readVideoStore()` and write via `commitVideos(store, seenIds, extra)`, which
-    re-reads storage, re-applies the user-owned fields (`USER_VIDEO_FLAGS`:
-    watched/saved/hidden/folderId), and keeps ids that appeared after the read
-    (`seenIds` distinguishes those from ones `pruneVideos` dropped on purpose).
+  - **All library writes serialize in the worker.** Dashboard edits still own
+    their user decisions, but `persistLibrary` diffs `libraryBaseline` into
+    field patches and sends `PATCH_LIBRARY`. The baseline advances before the
+    request awaits and follows storage events. The worker's `withLibraryWrite`
+    queue reads the latest collections before applying those patches. A field
+    update never recreates a deleted record. Mirrored settings use `SET_SETTINGS`
+    through the same queue, so they cannot race a sync apply.
+  - **Enrichment owns metadata only.** Network requests run outside the queue.
+    `readVideoStore` captures a baseline and epoch; `commitVideos` merges changed
+    metadata into current storage, preserves all user flags, skips deleted ids,
+    and keeps newly added records. It applies a field only if it still matches
+    the baseline (or is missing), so an older job does not undo newer metadata.
+    Channel enrichment uses `commitChannelMetadata` with the same rule and a
+    metadata whitelist. Pruning runs **after** that merge against current saved
+    flags and current tracking state. Clear/restore increments `libraryEpoch`;
+    a job from an older epoch cannot write the old library back.
   - **New (RSS feed).** `fetchChannelVideos` parses the *full* `<entry>` list
     (not just the max date) for every `trackVideos` channel and upserts each into
     `videos` (`upsertChannelVideos`), preserving `watched` across refreshes;
     `pruneVideos` caps history per channel and drops videos whose channel
     untracked/vanished (saved ones survive; the cap also spares anything else
-    `isUserTouched`). No API key or quota. Rendered
+    `isUserTouched`). Normal RSS needs no API key or quota; recovering a missing
+    RSS feed uses the configured key. Rendered
     newest-first, grouped by day, filtered by the channel-folder sidebar + search
     + unwatched chip. **No algorithmic ranking** (no API exposes YouTube's
     per-subset feed); videos open on youtube.com/watch, where YouTube's own
@@ -259,6 +289,15 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     which the dashboard's `describeFetchFailures` renders by name. A failed
     channel is **not** marked `fetchedAll` — claiming a history is complete
     when it wasn't read exempts it from the prune cap and hides it from a retry.
+  - **Recovery.** `currentView === "removed"` reuses `videoFeed` and channel
+    folder scope, selects `hidden` videos (including untracked/missing channels),
+    and ignores the watched/live filters so they remain recoverable. Restore
+    clears `hidden`; normal New-feed tracking/watched filters then apply.
+    `persistLibrary` offers Undo for video flag/list edits using the worker's
+    returned flags and timestamp. `UNDO_VIDEOS` compares that exact state before
+    restoring prior flags and stamping a new decision; metadata is retained.
+    Menu actions resolve the current video by id when clicked; a refresh can
+    replace the in-memory record while a menu is open.
   - **Watch Later.** Saved videos (`saved:true`) organized into `videoFolders`
     (a second, independent folder tree with the *same* nesting/drag/emoji/rename
     rules as channel folders). Its own list sidebar; a video's `folderId` is its
@@ -267,7 +306,7 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     (see the sync notes); a tracked channel's video simply returns to the New feed.
 - **The folder sidebar is domain-generalized.** One `#folderList` and one set of
   folder functions serve both trees; `fdom()` returns the active domain (channel
-  `folders` + `currentFolderId` for Channels/New, `videoFolders` + `currentListId`
+  `folders` + `currentFolderId` for Channels/New/Removed, `videoFolders` + `currentListId`
   for Watch Later) — folders/counts/selection/persist. Channel behavior is the
   default, so it's unchanged.
 - **Two virtual sidebar entries, not one.** `"all"` (no scoping) and `FILED_ID`
@@ -288,9 +327,10 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 - **Adding to Watch Later (context menu).** `contextMenus` permission: right-click
   a YouTube video link or a watch/shorts page → "Save to MyTube Watch Later"
   (`setupContextMenus`, created on install *and* `onStartup`). `background.js`
-  extracts the id (`extractVideoId`), fetches title/author from the keyless public
-  **oEmbed** endpoint, stores it in `videos` with `saved:true, folderId:"unsorted"`,
-  and fires a confirming notification. No URL pasting — the extension captures the
+  extracts the id (`extractVideoId`), saves and notifies immediately in the write
+  queue, then fetches title/author through keyless **oEmbed** and details through
+  the API. Enrichment commits metadata only, so removing or moving the new save
+  during its fetch remains authoritative. No URL pasting — the extension captures the
   video from the page.
 - **Importing a playlist into Watch Later (context menu, scrape-based).**
   Right-click a YouTube playlist page or playlist link → "Import playlist to MyTube
@@ -303,7 +343,8 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   progress banner, **auto-scrolls to the bottom** until the (virtualized) video list
   stops growing or reaches the page's stated "N videos" count, scrapes each video's
   id + title + **channel byline** (id/name, read by climbing from the video anchor
-  to its row — not tied to renderer tag names, any `/watch?v=` anchor plus any
+  to its row, stopping at known row boundaries or ancestors containing another
+  video; ambiguous/missing bylines stay unknown. Channel handle URLs are retained. Any `/watch?v=` anchor plus any
   `/channel/`,`/@` link), grabs the
   playlist title (page H1 → tab title fallback), and posts `PLAYLIST_SCAN_RESULT`.
   `handlePlaylistScanResult` classifies each video vs the store (new vs
@@ -328,10 +369,11 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   wholesale write on either side.
 - **The directional review shows more than channels.** `computeSyncDiff` also
   diffs folders (add/rename/reparent/emoji), the Watch Later lists (`videoFolders`,
-  same diff), the video store (a **count summary** — too many to review per item),
-  and the mirrored settings, computed against the *effective* apply result (upload
+  same diff), the video store (counts plus paginated item rows), tag
+  additions/renames/color changes, and the mirrored settings, computed against
+  the *effective* apply result (upload
   uses `mergeSettings`, download overlays picked remote keys) so the preview
-  matches reality. Folders/lists/settings apply as a whole; **channel removals and
+  matches reality. Folders/lists/tags/settings apply as a whole; **channel removals and
   individual video changes are the two opt-outs**. Folder and list *removals* are
   never reported by the diff any more — both directions union them, so a folder
   the target has and the source doesn't simply stays.
@@ -344,9 +386,10 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   If you change what an apply writes, change these two helpers, not a parallel
   copy of the logic. **The same diff also carries `videos.items`** — one row per
   added/changed video (`{ id, title, author, from, to }`, `from: null` for a video
-  the target lacks), modified rows first, capped at `VIDEO_DIFF_LIMIT` with the
-  overflow reported as `truncated`. The review lists them behind a "Show the N
-  video changes" button, each ticked; unticking sends the id back as
+  the target lacks), removals first, then modifications and additions. All rows are returned
+  (`truncated: 0`); the dashboard creates DOM rows in pages of 100 behind a
+  disclosure. Its group checkbox covers the entire set, including unloaded
+  rows (`skipAllVideos`), and individual decisions live in `syncSkipVideoIds`; unticking sends the id back as
   `skipVideoIds`, and `effectiveSyncVideos` then leaves that video exactly as the
   target has it (dropping it if the target never had it). It's the only way to
   take part of a sync — the counts alone couldn't say *which* video moved.
@@ -403,8 +446,93 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
      serializer throws a plain-language error at 9 MB rather than writing a gist
      this extension could no longer read.
 
+- **Sync reviews describe a specific state.** `loadSyncContext` reads both
+  libraries/settings and hashes their canonical serialized state with SHA-256.
+  `buildSyncDiff` adds the selected channel removals to `reviewToken` and uses
+  those same choices for `effectiveSyncVideos`. Changing a channel checkbox
+  fetches an updated preview; the Apply button stays disabled during that read.
+  Apply re-reads and compares the token under the write queue. A changed source
+  or target returns `stale:true` with an updated diff; the user must review and
+  apply again. No review snapshot has to survive worker restarts. Network calls
+  have timeouts. This checks state at Apply; it is not a distributed transaction
+  across GitHub and other devices.
+- **Refresh diagnostics distinguish attempts from successes.** RSS requests run
+  six at a time with 15-second timeouts. `lastFetchAttempt` advances even on a
+  failure; `lastFetched` advances only after successful feed and channel-stat
+  requests. `lastFetchError` clears on success. The dashboard shows named
+  failures and Retry passes only their ids through `REFRESH_STATS`.
+  An RSS 404 goes through `recoverMissingChannelFeed`: the current refresh's
+  channel API response must explicitly report `videoCount:0` to accept it as an
+  empty channel. Cached counts, missing fields, and failed lookups never qualify.
+  Otherwise the returned `contentDetails.relatedPlaylists.uploads` id supplies
+  one page of up to 50 entries, keeping 15 readable uploads. The request has a
+  20-second timeout and shares `parseUploadItems` with the full-history fetch.
+  It never sets `fetchedAll` or enables tracking. An API-confirmed missing
+  channel, an unreadable fallback, or a missing key remains an actionable
+  failure; no channels or user flags are removed to clear an error.
+- **Local recovery is independent of Gist sync.** `libraryBackups` holds the
+  latest five snapshots, each with an id, date, reason, the five collections,
+  languages, and the local API key. Download/clear/import/restore must save a
+  snapshot successfully before writing. `RESTORE_BACKUP` validates format/version,
+  collection/field types and folder nesting; it normalizes orphaned assignments
+  to Unfiled and stamps restored video state. Portable exports use
+  `{format:"mytube-backup",version:1,library,settings}` and exclude API keys,
+  GitHub tokens, backup history, and device preferences. Import is replacement
+  on this device only, reviewed with counts, capped at 50 MB in the dashboard.
+- **Rendering is incremental and keyed.** Video grids start at 60 cards and
+  Load more adds 60. `renderVideoList` retains loaded depth for the same view,
+  scope, and filters. `reconcileChildren` preserves unchanged nodes, anchors
+  scroll to a visible item, and restores focus when a changed card is replaced.
+  Channel updates retain loaded depth too. Storage events for unrelated keys
+  do not rebuild grids. Titles are native links; channel toggles are buttons;
+  right-click context menus and their submenus support keyboard navigation.
+- **Regression checks require no dependencies or build.** `npm test` uses
+  Node's test runner with isolated Chrome/storage/network fakes. `npm run check`
+  checks syntax. `npm run test:browser` serves the actual UI/worker through a
+  synthetic fixture on loopback; `/tests/dashboard?smoke=1` runs browser checks.
+  Tests record/accept synthetic confirmations and mock all external requests.
+  The fixture is never referenced by the production HTML or manifest.
+- **Controls are dashboard preferences.** `shared/controls.js` owns the
+  `SHORTCUTS` catalog and defaults. Bindings use physical `KeyboardEvent.code`
+  with ordered `Mod+Alt+Shift` modifiers; Mod means Meta on Mac and Ctrl
+  elsewhere. Labels use US key positions. Null disables an action; normalization
+  rejects invalid/reserved combinations and disables duplicates. The Controls
+  tab edits `controlsDraft`; only Settings Save writes the local `controls` key.
+  Cancel/Escape/backdrop discard it on the next open. Recording intercepts keys
+  in capture phase, rejects conflicts, and treats Escape as cancel (not close).
+  The app dispatcher ignores typing, composition, repeats, open menus, and
+  dialogs. Standard focus/menu keys are never remapped. New actions need a
+  catalog entry and a `runKeyboardShortcut` dispatch branch.
+  `selectionModifierPressed` serves channels and both video grids. The wheel
+  preference guards count/date number fields and year selects. Neither controls
+  nor their defaults belong in `SYNC_SETTING_KEYS`, backups, or library patches.
+- **Preserve the original visual layout.** The sidebar uses the original compact
+  view tabs, with scan/refresh above folders. Keep all arrangement, dimensions,
+  spacing, and table/video-card layout unchanged. Typography uses the shared
+  sans-serif family throughout, including native controls and numeric metadata;
+  Variables buttons keep the same 11px text as other chips. Action menus open by
+  right-clicking folders, channels, or videos; there are no duplicate dot buttons. Visual polish
+  may recolor, replace/add icons, and add transitions. Current icon overlays
+  preserve the original glyph footprint; transitions affect only color/shadow
+  and opacity, with `prefers-reduced-motion` disabling them. Do not introduce
+  scaling/sliding animations or `transition: all`. Keyboard preferences live in the
+  Settings Controls tab, styled with the existing theme. Settings tabs support
+  arrow-key navigation and keep Save/Cancel visible while content scrolls.
+
 ## Conventions
 
+- **Reload in Vivaldi after every completed fix.** After finishing extension
+  code changes and their relevant checks, reload this checkout's unpacked
+  **MyTube Organizer** extension in **Vivaldi** before reporting completion.
+  This is standing user authorization; do not ask for permission each time.
+  Use the extension's **Reload extension** control when available, or its
+  **Reload** control at `vivaldi://extensions`. A dashboard page refresh alone
+  does not replace an extension reload. Identify the matching extension and
+  checkout before acting; never remove/reinstall it or change its ID. Reopen
+  the dashboard if necessary and verify it loads after the reload. If browser
+  access is unavailable or the matching extension cannot be identified, report
+  the concrete blocker rather than claiming it was reloaded. Documentation-only
+  changes do not need a reload.
 - **Never commit any AI usage including co-author etc.** No `Co-Authored-By`
   trailers, no "Generated with" lines, no AI attribution of any kind in commit
   messages or PR bodies.
@@ -424,10 +552,10 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   event delegation in `bindEvents()`. `state` in `dashboard.js` mirrors storage.
 - Always `escapeHtml()` any channel/folder/tag text interpolated into
   `innerHTML`.
-- The service worker owns cross-cutting storage writes (scan apply, refresh,
-  sync); the dashboard writes for direct user edits (move folder, add tag,
-  rename). Both persist by writing whole objects back to
-  `chrome.storage.local`.
+- The service worker owns persistence for library and mirrored-setting writes
+  through `withLibraryWrite`. The dashboard initiates direct edits as field
+  patches through `persistLibrary`; only device UI preferences write directly to
+  `chrome.storage.local`. Do not reintroduce dashboard whole-library writes.
 - Migrations run in `onInstalled` (`repairDoubledNames`, `renameHomeFolder`) —
   add one-off data fixes there. **The pinned home folder's id is `unsorted` but
   its label is `HOME_FOLDER_NAME` ("Unfiled")** — the id is a storage key every
@@ -617,3 +745,9 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
 tools for diffing scraped IDs against a Google Takeout export. They hold personal
 subscription data and a hardcoded local path, so they're **untracked** (kept
 locally, listed in `.gitignore`) and are not part of the shipped extension.
+
+Video API details correct existing scraped author/channel identity and discard a wrong-channel avatar. Saved videos without channelUrl receive a details pass with an API key; reviewed imports recheck identity even if duration is cached.
+
+Language choices live in shared/languages.js: an offline 48-language catalog with canonical aliases, plus the four-language default. Settings edits a cancellable languagesDraft; languages remains the synced active selection. Dashboard options/filters use only active canonical names, while old channel assignments are preserved and inactive assignments display “Inactive.” No prompt-based language additions remain.
+
+Settings uses one viewport-bounded 620 × 680px shell across all tabs; only settings-content scrolls and the action footer stays anchored. Playlist title extraction ranks dedicated title anchors above explicit title attributes and never uses thumbnail text or text length as a title heuristic. API snippet titles correct stored metadata; legacy Turkish/English badge-only titles trigger a details pass for saved videos.

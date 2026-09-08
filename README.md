@@ -186,16 +186,13 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
 
 Each row's **Variables** cell holds per-channel attributes alongside its tags:
 
-- **Language** — a dropdown of common languages, each shown with its **flag**.
-  Pick **Other…** to type any custom value; it's remembered and shown as its own
-  option afterwards. You can also **right-click a channel → Set language** to
-  pick from the same list without touching the dropdown; that menu's **+ New
-  language…** adds a language to the picker for every channel (the same set you
-  can edit in Settings → Languages). Right-clicking a multi-selection sets the
-  language on all of them at once. Flags are matched from the language name
-  (native name, English name or ISO code — `Nederlands`, `Dutch` and `nl` all
-  give 🇳🇱); an unrecognized name shows 🌐, and starting the name with an emoji
-  forces that emoji instead.
+- **Language** — choose from your active languages. Settings → General → Languages
+  has a searchable offline catalog of 48 common languages, searchable by English
+  name, native name, or code. Check the languages you want and Save; Cancel
+  discards changes. The default/preset is Turkish, English, Russian, and French.
+  Only active languages appear in row pickers, right-click menus, and filters.
+  Deactivating one keeps existing assignments (shown as “Inactive”) without
+  offering it as a choice. Right-click a multi-selection to set language in bulk.
 - **Active** / **Finished** — two independent flags (a channel can be neither,
   either, or both). Click a chip to toggle it; it lights up when on. Use them to
   mark channels you're actively following versus ones you consider done.
@@ -300,12 +297,29 @@ Row interactions:
   Active and Finished entries are the same flags as the row's chips, so you can
   set them without aiming at a chip.
 
-## Videos: New and Watch Later
+Channel and video titles are links: Tab to a title and press Enter to open it.
+Channel flag buttons work with Space/Enter and expose their on/off state.
+Within an open context menu, use arrow keys to move through items, Right Arrow to enter a submenu, and Escape to close it. Dialogs keep Tab
+focus inside and return focus when closed. Filter chips accept Enter/Space;
+Shift+Enter/Space selects the negative filter.
+
+## Videos: New, Watch Later, and Removed
 
 Opening a video in either view (left-click or middle-click) keeps its watched
 status unchanged. Use **Mark watched** or **Mark all watched** to update it manually.
 
-Two tabs at the top of the sidebar list videos, each for a different job.
+New and Watch Later sit at the top of the sidebar. **Removed videos** below
+them is a searchable recovery view for videos dismissed from New. Choose
+**Restore to New** on a card, or restore a selection from its actions menu.
+Restored videos still follow the New view's tracking and watched filters.
+
+Video edits offer **Undo** at the bottom of the dashboard, including bulk edits
+and removing a Watch Later save. Undo retains any metadata fetched since the edit
+and refuses to overwrite a later edit to the same video.
+
+Video lists initially render 60 cards. **Load more** adds the next 60. Background
+updates retain the loaded portion, unchanged cards, keyboard focus, and your scroll
+position. Channel lists also retain their loaded portion during updates.
 
 ### New
 
@@ -340,7 +354,8 @@ too many channels to keep up with YouTube's own subscriptions feed.
   found on YouTube", one with nothing public reads "no public uploads" — and
   they're skipped rather than marked as fetched, so a later retry still tries
   them.
-- **RSS-powered, no quota.** Roughly the 15 latest per channel, no API key.
+- **RSS-powered, no quota for normal feeds.** Roughly the 15 latest per channel,
+  no API key. A missing RSS feed can recover through the API when a key is set.
 - **Why not YouTube's algorithm?** No API exposes YouTube's personalized ranking
   for a subset of channels, so this feed is **chronological**. Every video opens
   on youtube.com, so YouTube's own algorithm still drives your actual watch
@@ -410,18 +425,25 @@ Watch Later lists and videos flow across; variables carry with each channel; and
 fresher stats win. The only channels deleted are the ones you tick in the review
 screen.
 
-The review screen lists the channels, folders, lists and settings that would
+The review screen lists the channels, folders, lists, tags and settings that would
 change. The **Videos** section leads with the counts, and a **"Show the N video
 changes"** button expands one row per video — its title, channel, and what the
 sync would do to it ("saved to Watch Later (Music)", "removed from Watch Later",
 "marked watched", "new", or "will be dropped — its channel isn't tracked").
 Every row is ticked; untick one and that video is left exactly as it is on this
 side — for a row that would be *dropped*, unticking is how you keep it. So you
-can take part of a sync and not the rest. (Very large syncs list the first 500
-changes; the rest still apply.)
+can take part of a sync and not the rest. Every video change can be reviewed,
+in batches of 100 rows. The group checkbox applies to the entire set, including
+rows you haven't expanded or loaded.
 
 Only real settings travel with the library: your **API key** and your **language
 set**. How you happen to be sorting or which view is open stays on each device.
+
+The review includes **tag additions, renames, and color changes**. Selecting or
+unselecting a channel removal recalculates the video changes it causes. Before
+Apply, MyTube checks that both libraries still match the review; if either has
+changed, it presents an updated review for you to confirm. Downloads save a local
+recovery snapshot before changing the library.
 
 **Opening the dashboard checks the gist for you.** If another device pushed
 something up, the same **Review download** screen opens by itself — so a device
@@ -449,17 +471,84 @@ grows past what the Gist API can serve back (10 MB), the sync stops with a
 message asking you to untrack a channel or two instead of writing a gist it
 couldn't read again.
 
+## Refresh reliability
+
+You can organize channels and videos while a refresh, playlist import, or metadata
+fetch runs. Background work applies its metadata changes without overwriting your
+folder moves, flags, saves, additions, or deletions.
+
+A failed RSS or channel-stat request does not mark the channel freshly fetched.
+The dashboard names failed channels and offers **Retry failed channels**. RSS
+requests have timeouts and run six at a time. On opening, MyTube refreshes the
+channels whose last successful refresh is older than three hours; one recently
+refreshed channel no longer hides stale data elsewhere.
+
+If a channel's RSS feed returns **HTTP 404**, MyTube uses your configured YouTube
+API key to check it. A channel confirmed to have no public uploads counts as a
+successful empty result; otherwise MyTube fetches its recent uploads through
+the API. Channels that YouTube cannot find, or whose uploads still cannot be
+read, remain named failures with guidance. Without an API key, the error points
+to Settings so you can enable this recovery.
+
 ## Settings
 
-Open with **⚙ Settings** in the sidebar footer:
+Open with **⚙ Settings** in the sidebar footer. Settings has three tabs:
+**General** for API access, sync, and languages; **Controls** for keyboard and
+mouse preferences; and **Backups** for exports, snapshots, and recovery.
 
 - **YouTube API** — the Data API v3 key, plus a **Fill Avatars** button that
   fetches only missing avatars (skips counts and RSS dates, so it's cheaper than
   a full refresh).
 - **Cross-device sync** — the GitHub token and the Upload / Download buttons.
-- **Clear all data** — wipes channels, folders and tags, and disconnects Gist
-  sync (clears the saved gist id and last-sync time). Keeps your API key, GitHub
-  token and UI preferences. This cannot be undone.
+- **Local backups** — **Export JSON** downloads a portable backup of channels,
+  videos, both folder trees, tags, and languages. API keys and GitHub tokens are
+  excluded. **Import JSON** validates the file and previews collection counts
+  before you confirm replacing this device's library. Imports accept MyTube
+  backup format version 1, up to 50 MB.
+- **Save snapshot** — saves a recovery copy on this device. The latest five
+  snapshots are listed with their date, reason, and counts; choose **Restore**
+  to recover one. Downloads, imports, restores, and clearing the library save a
+  snapshot first. If saving the snapshot fails, the destructive operation stops.
+  Local snapshots also preserve the YouTube API key; GitHub credentials and
+  device preferences stay in place. Snapshots are never uploaded to the Gist.
+- **Clear library** — clears channels, folders, tags, videos, and Watch Later
+  lists after saving a recovery snapshot. Keeps your settings and Gist connection.
+  Restore from **Local backups** if needed. Clearing and restoring are local
+  operations; cross-device sync still requires its own review.
+
+## Keyboard and mouse controls
+
+Open **Settings → Controls**, or press **Shift + /** in the dashboard. Click any shortcut to record a replacement, **Clear** to disable it,
+or **Reset defaults** to restore the original controls. Duplicate shortcuts and
+common browser shortcuts are rejected. **Save** applies your changes; **Cancel**
+discards them. Escape cancels a recording without closing Settings.
+
+| Action | Default |
+| --- | --- |
+| Search the library | `/` |
+| Channels / New videos / Watch Later / Removed videos | `1` / `2` / `3` / `4` |
+| Open Settings | `,` |
+| Open keyboard controls | `Shift + /` |
+| Refresh channel stats | `Shift + R` |
+| Undo the last video edit | `⌘ + Z` on Mac, `Ctrl + Z` elsewhere |
+| Clear the current filters | `Shift + X` |
+
+Shortcuts work inside the dashboard and pause while you're typing or using a
+menu or dialog. You can turn all app shortcuts off and still use Tab, Enter,
+Space, Escape, and arrow keys normally. Bindings follow physical keys, with US
+keyboard labels; record the positions you prefer on another layout.
+
+Controls also lets you choose **Ctrl/⌘-click** or **Alt/Option-click** for
+multi-selection and turn scroll-wheel adjustments to number/date filters on or
+off. Shift-click always selects a range. The **Everyday controls** reference
+lists menu navigation, filter exclusion, and mouse actions.
+
+Keyboard and mouse preferences stay on this device. They are excluded from
+Gist sync and portable backups; importing or restoring a library keeps them.
+
+The original layout and spacing are preserved. Visual polish is limited to
+colors, icons, and subtle hover transitions and menu/dialog fades. Animations
+turn off when your system requests reduced motion.
 
 ## What to do if the DOM breaks
 
@@ -479,7 +568,7 @@ YouTube's DOM.
 
 | Piece | File | Role |
 | --- | --- | --- |
-| Service worker | `background.js` | Message routing, scan diffing, stats refresh, Gist sync, the 3-hour alarm. Owns all `chrome.storage.local` writes for cross-cutting operations. |
+| Service worker | `background.js` | Message routing, scan diffing, stats refresh, Gist sync, the 3-hour alarm. Serializes all library writes, including field patches submitted by dashboard edits. |
 | Dashboard | `dashboard/` | The single-page UI (`dashboard.html` / `.css` / `.js`). Renders from storage, reacts to `chrome.storage.onChanged`. |
 | Content script | `content-scripts/scrape-subscriptions.js` | Runs only on `youtube.com/feed/channels`; scrapes channel links and posts a `SCAN_RESULT` message. |
 
@@ -489,3 +578,22 @@ See `CLAUDE.md` for the storage schema, message protocol and internal notes.
 
 - Manual "add channel" (paste a channel ID/handle without waiting for a scan).
 - Per-folder / per-tag "unread" counter.
+
+## Development checks
+
+Loading the extension still requires no build or package installation. With Node.js
+22 or newer, run `npm test` for storage, refresh, sync, and backup regression tests,
+and `npm run check` for syntax checks.
+
+`npm run test:browser` serves a synthetic dashboard at
+`http://127.0.0.1:8767/tests/dashboard`. Add `?smoke=1` to run the browser checks.
+The fixture uses the real dashboard and worker modules with in-memory Chrome APIs,
+2,000 synthetic videos, mocked network responses, and recorded test confirmations.
+It has no access to the installed extension's library or real Gist. It is only
+loaded by the development server, never by the extension.
+
+The dashboard uses one consistent sans-serif font throughout, including form controls and Variables chips. Right-click folders, channels, or videos to open their action menus.
+
+In New and Watch Later, click a channel name or avatar to open that channel’s Videos tab in a new tab. Playlist imports retain channel handle links and avoid borrowing names from neighboring videos or the playlist owner. Unknown channels stay unlinked; API details can correct older scraped names when an API key is configured.
+
+Settings tabs share a consistent window size with scrolling content and fixed Save/Cancel controls. Playlist imports ignore thumbnail badges and durations when reading titles. Previously imported badge-only titles are repaired on the next video-details refresh when an API key is available.
