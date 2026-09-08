@@ -1,6 +1,8 @@
+import { native, callNative, consumeInbox } from './native.js';
 import { initialize, platform } from './platform.js';
 import { parseYouTubeLink, readPlaylist } from './links.js';
 const $ = selector => document.querySelector(selector);
+let sharedPlaylistId = null;
 function text(selector, value) { $(selector).textContent = value; }
 function folderOptions(folders) {
   const parents = new Set(Object.values(folders).map(folder => folder.parentId).filter(Boolean));
@@ -41,6 +43,7 @@ async function saveLink(mode) {
       $('#mobileSaveModal').hidden = true;
       const result = await platform.runtime.sendMessage({ type: 'PLAYLIST_SCAN_RESULT', ...preview });
       if (!result?.ok) { $('#mobileSaveModal').hidden = false; throw new Error(result?.error || 'No readable videos found.'); }
+      if (sharedPlaylistId) { await callNative('acknowledge', { id: sharedPlaylistId }); sharedPlaylistId = null; }
     }
   } catch (error) { text('#mobileSaveStatus', error.message); }
   finally { for (const button of buttons) button.disabled = false; }
@@ -65,13 +68,15 @@ try {
   await initialize();
   const { dashboardReady } = await import('../dashboard/dashboard.js');
   await dashboardReady;
+  if (native) await callNative('ready');
   $('#mobileLoading').remove();
   $('#mobileFolders').addEventListener('click', () => showDrawer(!document.body.classList.contains('mobile-drawer-open')));
   $('#mobileShade').addEventListener('click', () => showDrawer(false));
   $('#folderList').addEventListener('click', event => { if (event.target.closest('.folder-item') && !event.target.closest('.mobile-item-actions')) showDrawer(false); });
   $('#mobileSettings').addEventListener('click', () => { showDrawer(false); $('#settingsBtn').click(); });
   $('#mobileSaveOpen').addEventListener('click', openSave);
-  $('#mobileSaveCancel').addEventListener('click', () => { $('#mobileSaveModal').hidden = true; });
+  $('#mobileSaveCancel').addEventListener('click', () => { $('#mobileUrl').blur(); $('#mobileSaveModal').hidden = true; });
+  $('#mobileUrl').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); event.target.blur(); } });
   $('#mobileSaveVideo').addEventListener('click', () => saveLink('video'));
   $('#mobileImportPlaylist').addEventListener('click', () => saveLink('playlist'));
   $('#mobileSaveModal').addEventListener('click', event => { if (event.target === $('#mobileSaveModal')) $('#mobileSaveModal').hidden = true; });
@@ -83,13 +88,31 @@ try {
   const params = new URLSearchParams(location.search);
   const incoming = params.get('url') || params.get('text');
   if (incoming) { $('#mobileUrl').value = incoming; await openSave(); history.replaceState(null, '', location.pathname); }
+  if (native) {
+    $('#mobileInstall').hidden = true;
+    let consuming = false;
+    const receiveShares = async () => {
+      if (consuming || !$('#mobileSaveModal').hidden) return;
+      consuming = true;
+      try {
+        await consumeInbox(await callNative('inbox'), platform.runtime.sendMessage, id => callNative('acknowledge', { id }), async item => {
+          sharedPlaylistId = item.id; $('#mobileUrl').value = item.url; await openSave();
+        });
+      } catch (error) { text('#statusText', `Shared link is still on this device: ${error.message}`); }
+      finally { consuming = false; }
+    };
+    addEventListener('mytube-foreground', receiveShares);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) receiveShares(); });
+    await receiveShares();
+  }
   $('#mobileInstall').addEventListener('click', () => {
-    alert('On iPhone or iPad: open MyTube in Safari, tap Share, then Add to Home Screen. Your library stays on this device; use Gist sync or export a backup to keep another copy.');
+    alert('On iPhone or iPad: open MyTube in your browser, tap Share, then Add to Home Screen. Your library stays on this device; use Gist sync or export a backup to keep another copy.');
   });
   const updateOnline = () => { text('#mobileConnection', navigator.onLine ? '' : 'Offline · saved changes stay on this device'); };
   addEventListener('online', updateOnline); addEventListener('offline', updateOnline); updateOnline();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+  if (!native && 'serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js').catch(() => {});
   navigator.storage?.persist?.().catch(() => {});
 } catch (error) {
+  if (native) callNative('startupError').catch(() => {});
   text('#mobileLoading', `MyTube could not start: ${error.message}. Reload to try again.`);
 }

@@ -1,0 +1,9 @@
+// Set these to identifiers registered to your Apple team before device installation.
+MYTUBE_BUNDLE_ID = com.yigitsariyar.mytube
+MYTUBE_APP_GROUP = group.com.yigitsariyar.mytube
+// Set DEVELOPMENT_TEAM in Xcode Signing & Capabilities for both targets.
+IPHONEOS_DEPLOYMENT_TARGET = 16.0
+SWIFT_VERSION = 5.0
+TARGETED_DEVICE_FAMILY = 1,2
+CODE_SIGN_STYLE = Automatic
+ENABLE_USER_SCRIPT_SANDBOXING = NO

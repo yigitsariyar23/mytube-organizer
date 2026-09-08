@@ -598,28 +598,27 @@ In New and Watch Later, click a channel name or avatar to open that channel’s 
 
 Settings tabs share a consistent window size with scrolling content and fixed Save/Cancel controls. Playlist imports ignore thumbnail badges and durations when reading titles. Previously imported badge-only titles are repaired on the next video-details refresh when an API key is available.
 
-## MyTube Mobile
+## MyTube on iPhone and iPad
 
-The mobile web app reuses the extension's library, settings, backups, and reviewed
-Gist sync. Open it in Safari and use Share → Add to Home Screen. Each browser/device
-has its own IndexedDB library: configure your Gist token in Settings, then review a
-Download to bring over your desktop library. Upload mobile changes explicitly;
-there is no automatic cross-device merge.
+The standalone app bundles the interface and stores its library on each device.
+It runs without a hosted site or a running Mac. Use YouTube or Vivaldi's Share menu
+→ MyTube to queue a video locally; open MyTube to add it to Watch Later. Public or
+unlisted playlist shares queue for import review and require a YouTube API key.
+Copy/paste through **+ Save** is also available.
 
-Tap **+ Save** and paste a YouTube link copied from YouTube's Share menu. Save a
-video to Watch Later or import a public/unlisted playlist into a new list after
-review. Playlist imports require a YouTube API key; private playlists and YouTube's
-built-in Watch Later/Liked Videos lists are not supported by the mobile importer.
-Touch **Actions** buttons expose the desktop right-click menus.
+Run `npm run prepare:ios`, then open `ios/MyTube.xcodeproj` in Xcode to build for an
+iPhone/iPad simulator or a signed physical device. Both app targets need the same
+App Group and development team for device installation. See [iOS setup](ios/README.md)
+for installation, signing, local backups, and testing instructions.
 
-This first version accepts pasted links. It does not yet register in the iOS
-Share sheet; that requires a separate native companion. The app caches its shell
-for offline use after installation, but metadata, playlist import, and sync need
-connectivity. Refresh runs while the app is open, not on a closed-app timer.
-Browser data removal also removes local libraries and recovery snapshots; use
-JSON export or reviewed Gist upload for a separate copy.
+The app uses the extension's library logic, touch Actions menus, backups, and
+optional reviewed Gist sync. To transfer data without cloud sync, export a JSON
+backup on desktop, transfer it to Files on the device, and import it in Settings.
+Export on iOS opens the native Share sheet for Save to Files. Every device owns
+its own library; no automatic cross-device merge runs. Metadata, playlist imports,
+and optional Gist operations need internet access. Saving and organizing locally
+works without a hosted MyTube service.
 
-Run `npm run build` and then `npm run dev:mobile` for a local preview on port 8770.
-The generated `dist/` Worker serves the app and an allowlisted public YouTube
-metadata bridge. Library data stays in the browser; GitHub credentials and the
-YouTube API key are sent directly to their respective APIs, not that bridge.
+For local web development only, run `npm run build` and `npm run dev:mobile` to
+preview at `http://127.0.0.1:8770`. This preview is separate from the installed app.
+No further cloud publishing is authorized.

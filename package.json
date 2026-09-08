@@ -6,6 +6,7 @@
     "check": "node --check background.js && node --check dashboard/dashboard.js",
     "test:browser": "node tests/browser-server.js",
     "build": "node scripts/build-mobile.js",
-    "dev:mobile": "node scripts/serve-mobile.js"
+    "dev:mobile": "node scripts/serve-mobile.js",
+    "prepare:ios": "node scripts/prepare-ios.js"
   }
 }

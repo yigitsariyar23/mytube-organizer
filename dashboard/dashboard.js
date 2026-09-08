@@ -3895,6 +3895,11 @@ function bindRecoveryControls() {
   el.exportBackupBtn.addEventListener('click', async () => {
     const result = await requestWorker('EXPORT_BACKUP');
     if (!result.ok) { el.backupStatus.textContent = result.error; return; }
+    if (chrome.runtime.exportBackup) {
+      try { await chrome.runtime.exportBackup(result.backup); el.backupStatus.textContent = 'Choose Save to Files to keep your backup.'; }
+      catch (error) { el.backupStatus.textContent = error.message; }
+      return;
+    }
     const url = URL.createObjectURL(new Blob([JSON.stringify(result.backup, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a');
     link.href = url;

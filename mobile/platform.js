@@ -1,8 +1,10 @@
+import { native, callNative, nativeStorage } from './native.js';
 import { openStorage } from './storage.js';
 const event = () => { const listeners = new Set(); return { addListener: fn => listeners.add(fn), emit: (...args) => { for (const fn of listeners) fn(...args); }, listeners }; };
 const storageEvent = event(), installed = event(), messages = event();
 const channel = new BroadcastChannel('mytube-mobile');
-const local = openStorage(indexedDB, changes => { storageEvent.emit(changes, 'local'); channel.postMessage(changes); });
+const changed = changes => { storageEvent.emit(changes, 'local'); channel.postMessage(changes); };
+const local = native ? nativeStorage(changed) : openStorage(indexedDB, changed);
 channel.onmessage = event => storageEvent.emit(event.data, 'local');
 const nativeFetch = globalThis.fetch.bind(globalThis);
 // Only public YouTube metadata/feed reads need the same-origin bridge. Credentials
@@ -14,6 +16,7 @@ globalThis.fetch = (input, options) => {
     if (url.pathname === '/oembed') {
       target.searchParams.set('video', new URL(url.searchParams.get('url')).searchParams.get('v'));
     } else target.searchParams.set('channel', url.searchParams.get('channel_id'));
+    if (native) return callNative('metadata', Object.fromEntries(target.searchParams)).then(result => new Response(result.body, { status: result.status, headers: { 'Content-Type': result.contentType } }));
     return nativeFetch(target, options);
   }
   return nativeFetch(input, options);
@@ -32,7 +35,8 @@ export const platform = {
   runtime: {
     id: 'mytube-mobile', platform: 'mobile-web', onInstalled: installed, onStartup: event(), onMessage: messages,
     getURL: path => new URL('/' + path, location.origin).href,
-    withLibraryLock: work => navigator.locks.request('mytube-library-write', work),
+    withLibraryLock: work => native ? work() : navigator.locks.request('mytube-library-write', work),
+    ...(native ? { exportBackup: backup => callNative('exportBackup', { backup }) } : {}),
     sendMessage(message) { return new Promise(resolve => {
       let handled = false;
       for (const handler of messages.listeners) handled = handler(message, { id: 'mytube-mobile' }, resolve) || handled;
@@ -48,7 +52,7 @@ export const platform = {
   notifications: { create: (_id, details) => notifications.emit(details) }
 };
 export async function initialize() {
-  if (!navigator.locks) throw new Error('This browser cannot safely coordinate library writes. Please use a recent Safari version.');
+  if (!native && !navigator.locks) throw new Error('This browser cannot safely coordinate library writes. Use an up-to-date browser with a secure HTTPS connection.');
   globalThis.chrome = platform;
   await import('../background.js');
   for (const fn of installed.listeners) await fn();

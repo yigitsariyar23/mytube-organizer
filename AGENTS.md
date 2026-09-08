@@ -774,3 +774,43 @@ only proxies fixed public oEmbed/RSS endpoints and never receives library creden
 The Sites project ID is in `.openai/hosting.json`; reuse it. Build after committing
 because the pre-commit hook stamps version.json. `tests/mobile.test.js` covers link
 validation, playlist ownership, metadata proxy restrictions, and save/lock behavior.
+
+## Local-only mobile development
+
+The user requires MyTube Mobile to run locally on their own devices. Do not publish
+or update any hosted deployment, including chatgpt.site, unless explicitly requested
+again. The existing Sites metadata identifies a historical deployment only; its
+presence is not permission to deploy. Keep local builds independent of Sites.
+
+## Standalone iPhone/iPad app
+
+`ios/MyTube.xcodeproj` contains MyTube (universal UIKit/WKWebView app), MyTubeShare
+(Share extension), and UI regression tests. Run `npm run prepare:ios` before Xcode
+builds after web changes. `scripts/generate-ios-project.py` reproduces target wiring.
+The app bundles `ios/Web` from the mobile build, and serves public assets only over
+its own loopback listener; no hosted origin or Mac service is required. Native
+LocalStore owns the atomic protected library file; the WKWebView is nonpersistent.
+`mobile/native.js` adapts storage and Share inbox handling. Native bridge messages
+must originate from the main frame of the exact loopback origin. Only fixed public
+YouTube oEmbed/RSS metadata endpoints are fetched by the native bridge.
+
+The Share extension writes individual atomic inbox files in an App Group and never
+edits the library. The main app acknowledges a video only after SAVE_VIDEO succeeds;
+retries retain an existing saved video's user state. Playlist inbox records remain
+until a successful scan creates a pending review. Match the App Group entitlement
+and team on both targets before physical-device installation. No signing secrets or
+personal Xcode user state belong in source control. Use iPhone and iPad simulator
+tests; report physical-device signing or installation limitations accurately.
+
+Native keyboard layout follows view.keyboardLayoutGuide. The Save modal uses a
+scrollable fields area and fixed action buttons so the iPhone keyboard cannot cover
+Save/Cancel. AppTests/testReadOnlyNavigation covers cancelling with the keyboard
+open; run write-bearing UI tests only in simulators. AppIcon lives in the native
+asset catalog; generated project definitions preserve the selected development team.
+
+Normalize the LocalServer bundle root with standardizedFileURL before comparing it
+to standardized requested asset paths. Physical iPhones may supply /private/var
+bundle URLs that normalize to /var; comparing mixed forms rejects all assets and
+produces an empty page. Native startup is complete only after the JS ready bridge
+message, not merely WKNavigationDelegate.didFinish. Debug builds retain bounded
+startup milestones in Application Support/startup-diagnostics.txt (no library data).

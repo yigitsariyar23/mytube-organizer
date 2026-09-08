@@ -17,3 +17,8 @@ native-host/com.mytube.organizer.updater.json
 
 # Mobile build output
 dist/
+
+# Generated native app assets and local Xcode state
+ios/Web/
+ios/**/xcuserdata/
+ios/DerivedData/

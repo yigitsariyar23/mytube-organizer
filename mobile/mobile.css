@@ -24,7 +24,9 @@ body { font-size: 16px; }
 .context-menu, .context-submenu { max-height:65dvh; overflow-y:auto; max-width:calc(100vw - 24px); }
 .modal-box { max-width:calc(100vw - 24px); }
 .modal-box-settings { height:min(720px,calc(100dvh - 24px)); max-height:calc(100dvh - 24px); }
-#mobileSaveModal .modal-box { width:460px; }
+#mobileSaveModal .modal-box { width:460px; display:flex; flex-direction:column; overflow:hidden; }
+#mobileSaveModal h2, #mobileSaveModal .mobile-save-actions { flex:none; }
+.mobile-save-fields { overflow-y:auto; min-height:0; }
 .mobile-save-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
 #mobileSaveStatus { min-height:20px; font-size:14px; color:var(--accent); }
 .mobile-save-hint { color:var(--text-muted); font-size:14px; line-height:1.5; }

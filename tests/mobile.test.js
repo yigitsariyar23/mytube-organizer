@@ -73,3 +73,14 @@ test('mobile asset server serves only generated public assets with a restrictive
   assert.equal(serveAsset(new Request('https://mytube.test/.git/config'),assets).status,404);
   assert.match(serveAsset(new Request('https://mytube.test/'),assets).headers.get('Content-Security-Policy'),/script-src 'self'/);
 });
+
+test('native Share inbox acknowledges only successful saves and pauses for playlist review', async () => {
+  const { consumeInbox } = await import('../mobile/native.js');
+  const events = [];
+  const items = [{id:'one',videoId:id},{id:'two',playlistId:'PLtest'}, {id:'three',videoId:'12345678901'}];
+  await consumeInbox(items, async message => {events.push(message);return {ok:true};}, async id => events.push(id), async item => events.push(item.id));
+  assert.deepEqual(events,[{type:'SAVE_VIDEO',videoId:id},'one','two']);
+  let acknowledged = false;
+  await assert.rejects(consumeInbox(items, async()=>({ok:false,error:'disk full'}), async()=>{acknowledged=true;},async()=>{}), /disk full/);
+  assert.equal(acknowledged,false);
+});
