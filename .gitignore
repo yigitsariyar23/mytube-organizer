@@ -14,3 +14,6 @@ native-host/com.mytube.organizer.updater.json
 
 # Claude Code transient worktrees
 .claude/worktrees/
+
+# Mobile build output
+dist/

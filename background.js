@@ -89,7 +89,7 @@ function notifyTrackedUpdates(updated) {
 // All library writes pass through this queue. Network enrichment runs outside it.
 let libraryWrites = Promise.resolve();
 function withLibraryWrite(work) {
-  const job = libraryWrites.then(work);
+  const job = libraryWrites.then(() => chrome.runtime.withLibraryLock ? chrome.runtime.withLibraryLock(work) : work());
   libraryWrites = job.catch(() => {});
   return job;
 }
@@ -323,20 +323,21 @@ function extractPlaylistId(url) {
 
 // Add a video to the Watch Later store. Title/author come from YouTube's public
 // oEmbed endpoint (no API key, no quota); the thumbnail is derived from the id.
-async function saveVideoToWatchLater(videoId) {
+async function saveVideoToWatchLater(videoId, folderId) {
   const result = await withLibraryWrite(async () => {
     const { videos = {}, videoFolders = {} } = await chrome.storage.local.get(['videos', 'videoFolders']);
-    if (videos[videoId]?.saved) return { already: true, title: videos[videoId].title };
+    if (folderId && (!videoFolders[folderId] || Object.values(videoFolders).some(folder => folder.parentId === folderId))) throw new Error('Choose an existing list without sublists.');
+    if (videos[videoId]?.saved && !folderId) return { already: true, title: videos[videoId].title };
     videoFolders.unsorted ||= { name: HOME_FOLDER_NAME, order: 0 };
     const existing = videos[videoId] || {};
     videos[videoId] = { ...existing, id: videoId, title: existing.title || `Video ${videoId}`,
       thumbnail: existing.thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      watched: !!existing.watched, saved: true, folderId: existing.folderId || 'unsorted',
+      watched: !!existing.watched, saved: true, folderId: folderId || existing.folderId || 'unsorted',
       userStateAt: Math.max(Date.now(), (existing.userStateAt || 0) + 1), addedAt: existing.addedAt || Date.now() };
     await chrome.storage.local.set({ videos, videoFolders });
     return { title: videos[videoId].title };
   });
-  if (result.already) { notify('mytube-save', 'Already saved', result.title); return; }
+  if (result.already) { notify('mytube-save', 'Already saved', result.title); return { ok: true, already: true }; }
   notify('mytube-save', 'Saved to Watch Later', result.title);
   const { store, seenIds } = await readVideoStore();
   const video = store[videoId];
@@ -355,6 +356,7 @@ async function saveVideoToWatchLater(videoId) {
   const { apiKey } = await chrome.storage.local.get('apiKey');
   if (apiKey) await fillVideoDetails(store, apiKey, [videoId]);
   await commitVideos(store, seenIds);
+  return { ok: true };
 }
 
 // ---------- Import a whole playlist into Watch Later ----------
@@ -717,6 +719,10 @@ chrome.storage.local.get("reopenDashboardAt").then(({ reopenDashboardAt }) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (sender.id && sender.id !== chrome.runtime.id) return;
   const handlers = {
+    SAVE_VIDEO: () => {
+      if (!/^[A-Za-z0-9_-]{11}$/.test(msg.videoId || '')) throw new Error('Invalid video link.');
+      return saveVideoToWatchLater(msg.videoId, msg.folderId);
+    },
     PATCH_LIBRARY: () => patchLibrary(msg.patches || {}),
     SET_SETTINGS: () => withLibraryWrite(async () => {
       const values = Object.fromEntries(Object.entries(msg.values || {}).filter(([key]) => [...SYNC_SETTING_KEYS, 'gistToken'].includes(key)));

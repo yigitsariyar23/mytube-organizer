@@ -377,7 +377,8 @@ const el = {
   watchLaterEmptyState: document.getElementById("watchLaterEmptyState"),
 };
 
-init().catch(error => { el.statusText.textContent = `Could not open the library: ${error.message}`; });
+export const dashboardReady = init();
+dashboardReady.catch(error => { el.statusText.textContent = `Could not open the library: ${error.message}`; });
 
 // Only the years the library actually covers. These dropdowns bound
 // `lastVideoDate`, so a fixed 2005→today list was mostly dead choice: scrolling
@@ -476,7 +477,7 @@ async function init() {
   // computed against freshly-refreshed local data; neither is allowed to surface
   // as an unhandled rejection.
   (async () => {
-    await checkForAppUpdate(); // small and quick; the banner shouldn't wait on a refresh
+    if (chrome.runtime.platform !== 'mobile-web') await checkForAppUpdate(); // small and quick; the banner shouldn't wait on a refresh
     try { await catchUpOnOpen(); } catch (e) { /* reported in the status line */ }
     try { await checkRemoteChangesOnOpen(); } catch (e) { /* silent by design */ }
   })();

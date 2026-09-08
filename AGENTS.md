@@ -751,3 +751,26 @@ Video API details correct existing scraped author/channel identity and discard a
 Language choices live in shared/languages.js: an offline 48-language catalog with canonical aliases, plus the four-language default. Settings edits a cancellable languagesDraft; languages remains the synced active selection. Dashboard options/filters use only active canonical names, while old channel assignments are preserved and inactive assignments display “Inactive.” No prompt-based language additions remain.
 
 Settings uses one viewport-bounded 620 × 680px shell across all tabs; only settings-content scrolls and the action footer stays anchored. Playlist title extraction ranks dedicated title anchors above explicit title attributes and never uses thumbnail text or text length as a title heuristic. API snippet titles correct stored metadata; legacy Turkish/English badge-only titles trigger a details pass for saved videos.
+
+## Mobile web app
+
+`mobile/platform.js` adapts Chrome storage/runtime APIs to IndexedDB, BroadcastChannel,
+and Web Locks, then loads the shared worker module in the page. `withLibraryWrite`
+uses the optional platform lock; desktop retains its existing queue. `dashboardReady`
+is exported so mobile controls attach only after dashboard initialization.
+`SAVE_VIDEO {videoId, folderId?}` validates the destination and uses the same
+save/enrichment flow as the desktop context menu.
+
+`mobile/bootstrap.js` adds link input, touch Actions menus, and install/offline UI.
+`mobile/links.js` reads public/unlisted playlists through the Data API, using
+videoOwnerChannelId/videoOwnerChannelTitle, never the playlist owner's identity.
+Imports retain the existing review-before-apply protocol. No native iOS Share
+Extension or private-playlist OAuth exists yet. There are no background mobile
+alarms and no automatic Gist application.
+
+`scripts/build-mobile.js` transforms a copy of the dashboard into `dist/server/index.js`
+with embedded allowlisted assets and an offline shell service worker. `mobile/server.js`
+only proxies fixed public oEmbed/RSS endpoints and never receives library credentials.
+The Sites project ID is in `.openai/hosting.json`; reuse it. Build after committing
+because the pre-commit hook stamps version.json. `tests/mobile.test.js` covers link
+validation, playlist ownership, metadata proxy restrictions, and save/lock behavior.
