@@ -141,13 +141,19 @@ result for review:
   only the ones you actually want gone — removing a channel also drops its
   folder, tags and variables.
 
+**Apply changes** commits the reviewed scan and **Discard** drops it. Pressing
+Escape (or clicking outside the dialog) only sets the review aside: a banner —
+"A scan is waiting for review. [Review]" — brings it back.
+
 If a scan reports "no channels found", YouTube likely changed how channel links
 are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-breaks).
 
 ## Folders and tags
 
-- Each channel lives in a single **folder**. Move it via the folder dropdown on
-  its row, or right-click the row → **Move to folder**.
+- Each channel lives in a single **folder**. Move it via the folder picker on
+  its row, right-click the row → **Move to folder**, or **drag the row** (or
+  your whole selection) onto a folder in the sidebar. Every move can be undone
+  from the toast at the bottom.
 - The folder sidebar starts with two entries that aren't folders: **All**
   (everything) and **Filed** — the mirror image of **Unfiled**, showing every
   channel that *is* in a folder. Both sit alongside the real folders, count like
@@ -157,30 +163,36 @@ are rendered — see [What to do if the DOM breaks](#what-to-do-if-the-dom-break
   versions — same folder, same contents, new label.)
 - **Folders** support:
   - **Nesting** one level deep (a top-level folder can hold subfolders). Create
-    a subfolder from the "New folder" dialog's parent selector or by
-    right-clicking a top-level folder → **New subfolder…**.
+    a subfolder from the "New folder" dialog's **Inside folder** picker or by
+    right-clicking a top-level folder → **New subfolder…**. A folder with
+    subfolders is a **group** and holds no channels itself: creating the first
+    subfolder of a folder moves its channels into that subfolder, and any
+    channel that still ends up directly in a group (an older library, a sync)
+    is moved into a child folder named **General**.
   - **Drag and drop** (in "Custom" sort only): drop onto the middle of a
     top-level folder to nest inside it, or onto the top/bottom edge of a folder
-    to reorder as a sibling.
+    to reorder as a sibling. A drop that would nest two levels deep still shows
+    where it would land and is then refused ("Only one level of nesting.").
   - A per-folder **emoji** (right-click the folder → **Set emoji…**). Clicking
     the emoji itself just opens the folder, like clicking its name.
   - **Sort** modes — Custom (manual order), A → Z, Count ↓, Count ↑ — chosen
     from the dropdown in the Folders header.
   - **Collapse/expand** of parents (click anywhere on the parent row — the
     caret shows the state), and a channel **count** that includes subfolders.
-  - Rename / delete via right-click. Deleting a folder moves its channels to
-    **Unfiled** and promotes any subfolders to top-level. "Unfiled" is pinned
-    and can't be renamed, moved or deleted.
+  - Rename / delete via right-click (subfolders also offer **Move to top
+    level**). Deleting a folder moves its channels to **Unfiled** and promotes
+    any subfolders to top-level — and can be undone. "Unfiled" is pinned and
+    can't be renamed, moved or deleted.
 - **Tags** are freeform and multiple per channel. Click the **"+ tag"** chip on
-  a row to open a dropdown of your existing tags (each with its color) — click
-  one to add it, or click **"+ New tag"** to type a new name (Enter to create).
-  Tags get a color automatically. A **filter bar** appears above the list with a
-  chip per tag used by channels in the current folder (plus language and
-  active/finished filters — see [Variables](#variables)); click chips to narrow
-  the view (they combine with the selected folder). Left-clicking a tag chip on a
-  channel row removes that tag from that channel. Rename or delete a tag by
-  right-clicking it in the **filter bar**, or delete one everywhere via the
-  **×** beside it in the "+ tag" dropdown.
+  a row to open the tag popover: every tag is listed with its color and a ✓
+  when the channel (or every selected channel) has it — click to add or remove,
+  and the popover stays open so you can set several. Type in **"+ New tag
+  (Enter)"** to create one. Tags get a color automatically. A **filter bar**
+  appears above the list with a chip per tag used by channels in the current
+  folder (plus language and active/finished filters — see
+  [Variables](#variables)). Clicking a tag chip on a channel row removes that tag
+  ("Remove"). Rename, recolor or delete a tag with **shift**+right-click on its
+  filter chip, or delete one everywhere via the **×** beside it in the popover.
 
 ## Variables
 
@@ -289,18 +301,37 @@ filter is actually active — an empty folder just says so).
 
 Row interactions:
 
-- **Left-click** a row (anywhere but a tag or dropdown) → opens the channel's
-  Videos page in a new tab.
+- **Left-click** a row (anywhere but a chip or picker) → opens the channel's
+  Videos page in a new tab (and clears the selection).
 - **Middle-click** → opens it in a background tab without leaving the dashboard.
-- **Right-click** → Move to folder, Set language, Mark active / inactive, Mark
-  finished / unfinished, Track videos, Fetch all videos, Delete channel. The
-  Active and Finished entries are the same flags as the row's chips, so you can
-  set them without aiming at a chip.
+- **Right-click** → Move to folder, Set language, Tags…, Mark active / inactive,
+  Mark finished / unfinished, Track videos, Refresh stats, Fetch videos…, Open
+  channel, Delete channel. Right-clicking a row outside the selection selects
+  just that row first; inside a selection you get the bulk menu ("N channels").
+
+**Selecting several channels** (the same gestures work on video cards):
+
+- **⌘/Ctrl-click** toggles a row (the modifier is configurable in Settings →
+  Controls). **Shift-click** selects the range from the last clicked row;
+  **⌘/Ctrl+Shift-click** adds that range to the selection.
+- **Drag a rectangle** starting in empty list space (beside or between rows, or
+  below the last one) to select the rows it touches; hold ⌘/Ctrl to add.
+- **⌘/Ctrl+A** selects every row in the view, including ones not scrolled in
+  yet; **Esc** clears the selection. "N selected" shows next to the result count.
+- Editing a selected row's folder, language, flags or tags applies to the whole
+  selection, and bulk actions keep the selection so you can chain edits (rows an
+  edit takes out of the view leave it).
+
+**Undo:** every change you make in the dashboard — folder moves, flags,
+language, tags, deleting channels, creating/renaming/deleting/reordering
+folders, lists and tags, emoji, Watch Later edits — shows an **Undo** toast at
+the bottom (⌘/Ctrl+Z too). Undo only puts back what is still exactly as that
+edit left it, so a refresh that landed meanwhile is kept.
 
 Channel and video titles are links: Tab to a title and press Enter to open it.
 Channel flag buttons work with Space/Enter and expose their on/off state.
-Within an open context menu, use arrow keys to move through items, Right Arrow to enter a submenu, and Escape to close it. Dialogs keep Tab
-focus inside and return focus when closed. Filter chips accept Enter/Space;
+Within an open context menu, use arrow keys to move through items, Right Arrow to enter a submenu, Left Arrow to leave it, and Escape to close it. Dialogs keep Tab
+focus inside, close on Escape or a click outside, and return focus when closed. Filter chips accept Enter/Space;
 Shift+Enter/Space selects the negative filter.
 
 ## Videos: New, Watch Later, and Removed
@@ -313,9 +344,10 @@ them is a searchable recovery view for videos dismissed from New. Choose
 **Restore to New** on a card, or restore a selection from its actions menu.
 Restored videos still follow the New view's tracking and watched filters.
 
-Video edits offer **Undo** at the bottom of the dashboard, including bulk edits
-and removing a Watch Later save. Undo retains any metadata fetched since the edit
-and refuses to overwrite a later edit to the same video.
+Video edits offer **Undo** at the bottom of the dashboard, like every other
+edit, including bulk edits and removing a Watch Later save. Undo retains any
+metadata fetched since the edit and refuses to overwrite a later edit to the
+same video.
 
 Video lists initially render 60 cards. **Load more** adds the next 60. Background
 updates retain the loaded portion, unchanged cards, keyboard focus, and your scroll
@@ -344,16 +376,25 @@ too many channels to keep up with YouTube's own subscriptions feed.
   the feed — it won't come back on the next refresh. Live streams and scheduled
   premieres are filtered out automatically (they're not finished videos); an API
   key makes this detection reliable.
-- **Fetch the full back catalog.** A normal refresh only sees each channel's
-  latest ~15 uploads (YouTube's RSS limit). To pull a channel's **entire** upload
-  history, right-click it → **Fetch all videos** (or select several), or use
-  **Fetch full history** in the New toolbar for every tracked channel. This needs
-  an API key and can use notable quota for very large channels, but it isn't
-  capped afterward — the full history stays. Channels that can't be read are
-  **named** in the result — a deleted or terminated channel reads "channel not
-  found on YouTube", one with nothing public reads "no public uploads" — and
-  they're skipped rather than marked as fetched, so a later retry still tries
-  them.
+- **Fetch by category.** A normal refresh only sees each channel's latest ~15
+  uploads (YouTube's RSS limit). **Fetch videos…** in the New toolbar (or
+  right-click a channel, or a selection of channels) opens a dialog where you
+  pick **what** to fetch — **Videos**, **Shorts**, **Past live streams**, any mix —
+  **how far back** (the latest 50 of each, or the full history) and, from the
+  toolbar, whether to fetch the tracked channels in the selected folder or all of
+  them. Each category is read from YouTube's own per-category playlist, so asking
+  for only Shorts never downloads the rest. This needs an API key; a full history
+  of very large channels can use notable quota, but it isn't capped afterward.
+  Channels that can't be read are **named** in the result — a deleted or
+  terminated channel reads "channel not found on YouTube", one with nothing
+  public reads "no public uploads" — and they're skipped rather than marked as
+  fetched, so a later retry still tries them. A channel that simply has no
+  Shorts or streams isn't an error.
+- **Filter by category.** The **Videos**, **Shorts** and **Streams** chips filter
+  the New feed and Watch Later: left click shows only that category, right click
+  hides it. Shorts are recognized from the free RSS feed automatically; past
+  streams are recognized once fetched through **Fetch videos…** → Past live
+  streams. Short and stream cards carry a small badge on the thumbnail.
 - **RSS-powered, no quota for normal feeds.** Roughly the 15 latest per channel,
   no API key. A missing RSS feed can recover through the API when a key is set.
 - **Why not YouTube's algorithm?** No API exposes YouTube's personalized ranking
@@ -477,6 +518,11 @@ You can organize channels and videos while a refresh, playlist import, or metada
 fetch runs. Background work applies its metadata changes without overwriting your
 folder moves, flags, saves, additions, or deletions.
 
+While a refresh or a video fetch over several channels runs, a progress line
+under **Refresh Stats** shows how far it is ("Refreshing 40/180 · ~2 min") with
+**Stop**; stopping keeps whatever was already read. When it ends, the line shows
+the result ("Done · 3 failed") until you dismiss it with ×.
+
 A failed RSS or channel-stat request does not mark the channel freshly fetched.
 The dashboard names failed channels and offers **Retry failed channels**. RSS
 requests have timeouts and run six at a time. On opening, MyTube refreshes the
@@ -530,7 +576,7 @@ discards them. Escape cancels a recording without closing Settings.
 | Open Settings | `,` |
 | Open keyboard controls | `Shift + /` |
 | Refresh channel stats | `Shift + R` |
-| Undo the last video edit | `⌘ + Z` on Mac, `Ctrl + Z` elsewhere |
+| Undo the last edit | `⌘ + Z` on Mac, `Ctrl + Z` elsewhere |
 | Clear the current filters | `Shift + X` |
 
 Shortcuts work inside the dashboard and pause while you're typing or using a
@@ -540,15 +586,21 @@ keyboard labels; record the positions you prefer on another layout.
 
 Controls also lets you choose **Ctrl/⌘-click** or **Alt/Option-click** for
 multi-selection and turn scroll-wheel adjustments to number/date filters on or
-off. Shift-click always selects a range. The **Everyday controls** reference
-lists menu navigation, filter exclusion, and mouse actions.
+off. Shift-click always selects a range (add the modifier to extend the
+selection with it), dragging in empty list space draws a selection rectangle,
+⌘/Ctrl+A selects everything in view and Esc clears the selection — these stay on
+even with shortcuts turned off. The **Everyday controls** reference lists them
+with menu navigation, filter exclusion, and the other mouse actions.
 
 Keyboard and mouse preferences stay on this device. They are excluded from
 Gist sync and portable backups; importing or restoring a library keeps them.
 
-The original layout and spacing are preserved. Visual polish is limited to
-colors, icons, and subtle hover transitions and menu/dialog fades. Animations
-turn off when your system requests reduced motion.
+The dashboard follows the design language MyTube shares with MyGram Organizer
+(`~/other-projects/design-language/DESIGN.md`): the same layout, sizes,
+components and gestures, in MyTube's gold. Every control is drawn by the
+dashboard — no browser dropdowns, checkboxes or browser pop-up dialogs. Motion is
+limited to color changes and fades, and turns off when your system requests
+reduced motion.
 
 ## What to do if the DOM breaks
 
@@ -592,7 +644,7 @@ The fixture uses the real dashboard and worker modules with in-memory Chrome API
 It has no access to the installed extension's library or real Gist. It is only
 loaded by the development server, never by the extension.
 
-The dashboard uses one consistent sans-serif font throughout, including form controls and Variables chips. Right-click folders, channels, or videos to open their action menus.
+The dashboard uses one consistent sans-serif font throughout. Right-click folders, channels, videos, or (with Shift) tag filter chips to open their action menus.
 
 In New and Watch Later, click a channel name or avatar to open that channel’s Videos tab in a new tab. Playlist imports retain channel handle links and avoid borrowing names from neighboring videos or the playlist owner. Unknown channels stay unlinked; API details can correct older scraped names when an API key is configured.
 

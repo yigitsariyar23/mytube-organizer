@@ -149,7 +149,7 @@ test('an unreadable first uploads page does not hide the need to fetch older pag
   const h = feedHarness({ playlist: { items: [upload('private', undefined, 'Private video')], nextPageToken: 'older' } });
   const result = await h.send({ type: 'REFRESH_STATS', channelIds: ['c'] });
   assert.equal(result.ok, false);
-  assert.match(result.failures[0].error, /Fetch full history/);
+  assert.match(result.failures[0].error, /Full history/);
   assert.equal(h.db.channels.c.lastFetched, undefined);
 });
 
@@ -164,4 +164,39 @@ test('the full-history fetch still imports every page using the shared upload pa
   assert.equal(pages, 2);
   assert.equal(h.db.channels.c.fetchedAll, true);
   assert.equal(Object.keys(h.db.videos).length, 2);
+});
+
+test('a category fetch pages only the requested category playlists and stamps each video kind', async () => {
+  const requested = [];
+  const h = feedHarness({
+    channels: { UCabc: channel('UCabc') },
+    channelItems: [{ id: 'UCabc', contentDetails: { relatedPlaylists: { uploads: 'UUabc' } } }],
+    playlistFetch: async () => {
+      const id = h.calls.at(-1).url.searchParams.get('playlistId');
+      requested.push(id);
+      if (id === 'UULVabc') return { ok: false, status: 404, text: async () => '{}' };
+      return json({ items: [upload(`${id}-1`), upload(`${id}-2`)], nextPageToken: 'more' });
+    },
+  });
+  const result = await h.send({ type: 'FETCH_ALL_VIDEOS', channelIds: ['UCabc'], kinds: ['short', 'live'], limit: 2 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(requested, ['UUSHabc', 'UULVabc']);
+  assert.equal(result.failures.length, 0);
+  assert.deepEqual({ ...result.byKind }, { short: 2, live: 0 });
+  assert.equal(h.db.videos['UUSHabc-1'].kind, 'short');
+  assert.equal(h.db.channels.UCabc.fetchedAll, undefined);
+  assert.equal(h.db.channels.UCabc.trackVideos, true);
+});
+
+test('RSS marks Shorts from their link, and a /watch hint never overrides a known kind', async () => {
+  const entry = (id, path) => `<entry><yt:videoId>${id}</yt:videoId><link rel="alternate" href="https://www.youtube.com/${path}${id}"/><title>${id}</title><published>2026-09-01T00:00:00+00:00</published></entry>`;
+  const feed = `<feed>${entry('s1', 'shorts/')}${entry('w1', 'watch?v=')}${entry('w2', 'watch?v=')}</feed>`;
+  const h = harness({ apiKey: '', channels: { c: channel() }, videos: { w2: { id: 'w2', channelId: 'c', kind: 'live', published: '2026-09-01T00:00:00+00:00' } } }, async (_db, rawUrl) => {
+    if (new URL(rawUrl).pathname === '/feeds/videos.xml') return { ok: true, text: async () => feed };
+    throw new Error(`Unexpected request: ${rawUrl}`);
+  });
+  await h.send({ type: 'REFRESH_SINGLE', channelId: 'c' });
+  assert.equal(h.db.videos.s1.kind, 'short');
+  assert.equal(h.db.videos.w1.kind, 'video');
+  assert.equal(h.db.videos.w2.kind, 'live');
 });

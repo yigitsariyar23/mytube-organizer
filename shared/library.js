@@ -89,13 +89,14 @@ export function validateBackup(input) {
   }
   for (const [key, folderKey] of [['channels', 'folders'], ['videos', 'videoFolders']]) {
     const folders = library[folderKey];
-    const parents = new Set(Object.values(folders).map(f => f.parentId).filter(Boolean));
     for (const item of Object.values(library[key])) {
       if (key === 'videos' && !item.saved) continue;
-      if (!folders[item.folderId] || parents.has(item.folderId)) item.folderId = 'unsorted';
+      if (!folders[item.folderId]) item.folderId = 'unsorted';
       if (key === 'channels') item.tags = (item.tags || []).filter(t => library.tags[t]);
     }
   }
+  // Items filed directly in a group move into its "General" child (§11).
+  repairLibraryGroups(library);
   const settings = {};
   if (input.settings?.languages !== undefined) {
     if (!Array.isArray(input.settings.languages) || input.settings.languages.some(l => typeof l !== 'string')) throw new Error('Invalid languages.');
@@ -130,4 +131,94 @@ export function isPlaylistOverlayTitle(title) {
     .replace(/İZLENDİ|İzlendi|izlendi|watched|Şimdi oynatılıyor|şimdi oynatılıyor|now playing/giu, '')
     .trim();
   return !rest;
+}
+
+// ---------- Folder groups (DESIGN §11) ----------
+
+// A folder with subfolders is a *group* and holds no items of its own. Any item
+// sitting directly in a group moves into the group's child named "General",
+// created when missing. The new child's id is derived from the group's id, so
+// two devices repairing the same library create the same folder (a sync union
+// then merges them instead of duplicating). `include` limits which items count
+// (Watch Later: only saved videos). Returns true when anything changed.
+export function repairGroupItems(folders, items, { include = () => true } = {}) {
+  const groups = new Set(Object.values(folders).map(f => f.parentId).filter(id => id && folders[id]));
+  if (!groups.size) return false;
+  const general = {};
+  let changed = false;
+  for (const item of Object.values(items)) {
+    if (!item || !include(item) || !groups.has(item.folderId)) continue;
+    const parentId = item.folderId;
+    general[parentId] ||= Object.keys(folders).find(id => folders[id].parentId === parentId && String(folders[id].name).trim().toLowerCase() === 'general')
+      || createGeneralFolder(folders, parentId);
+    item.folderId = general[parentId];
+    changed = true;
+  }
+  return changed;
+}
+
+function createGeneralFolder(folders, parentId) {
+  let id = `general-${parentId}`;
+  for (let n = 2; folders[id]; n++) id = `general-${parentId}-${n}`;
+  const order = Math.max(-1, ...Object.values(folders).filter(f => f.parentId === parentId).map(f => f.order ?? 0)) + 1;
+  folders[id] = { name: 'General', order, parentId };
+  return id;
+}
+
+// Both trees at once: channels in `folders`, saved videos in `videoFolders`.
+// Mutates `data` (any subset of the record collections) and returns the keys
+// it changed, so a caller writes only those.
+export function repairLibraryGroups(data) {
+  const changed = new Set();
+  if (data.folders && data.channels && repairGroupItems(data.folders, data.channels)) changed.add('folders').add('channels');
+  if (data.videoFolders && data.videos && repairGroupItems(data.videoFolders, data.videos, { include: v => v.saved })) changed.add('videoFolders').add('videos');
+  return [...changed];
+}
+
+// ---------- Undo (DESIGN §9) ----------
+
+// The records one edit touched, per collection: [{ key, id, before, after }]
+// with `undefined` for "absent" (a create has no before, a delete no after).
+export function editChanges(before, after, keys = Object.keys(after)) {
+  const entries = [];
+  for (const key of keys) {
+    const a = before[key] || {}, b = after[key] || {};
+    for (const id of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      if (same(a[id], b[id])) continue;
+      entries.push({ key, id, before: a[id] === undefined ? undefined : clone(a[id]), after: b[id] === undefined ? undefined : clone(b[id]) });
+    }
+  }
+  return entries;
+}
+
+// Put `current` (a library: { channels, folders, … }) back to the before-state
+// of `entries` — but only for records still exactly as the edit left them,
+// compared on the fields the edit changed. A refresh or an avatar landing in
+// between touches other fields, so it neither blocks the undo nor is reverted;
+// a record edited again since, or deleted meanwhile, is left alone (and never
+// resurrected). Mutates `current`; returns { reverted, skipped }.
+export function revertEdit(current, entries) {
+  let reverted = 0, skipped = 0;
+  for (const { key, id, before, after } of entries) {
+    const records = current[key] ||= {};
+    const now = records[id];
+    if (after === undefined) {
+      // Deleted by the edit: restore it unless something recreated it.
+      if (now === undefined && before !== undefined) { records[id] = clone(before); reverted++; } else skipped++;
+      continue;
+    }
+    if (now === undefined) { skipped++; continue; }
+    if (before === undefined) {
+      // Created by the edit: remove it if it's still what the edit created.
+      if (Object.keys(after).every(k => same(now[k], after[k]))) { delete records[id]; reverted++; } else skipped++;
+      continue;
+    }
+    const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(k => !same(before[k], after[k]));
+    if (!fields.every(k => same(now[k], after[k]))) { skipped++; continue; }
+    for (const k of fields) {
+      if (before[k] === undefined) delete now[k]; else now[k] = clone(before[k]);
+    }
+    reverted++;
+  }
+  return { reverted, skipped };
 }

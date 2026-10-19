@@ -1,4 +1,4 @@
-import { RECORD_KEYS, VIDEO_FLAGS, isPlaylistOverlayTitle, applyRecordPatch, same, clone, validateBackup, makeBackup, backupCounts, stableStringify } from "./shared/library.js";
+import { RECORD_KEYS, VIDEO_FLAGS, isPlaylistOverlayTitle, applyRecordPatch, same, clone, validateBackup, makeBackup, backupCounts, stableStringify, repairLibraryGroups } from "./shared/library.js";
 
 // background.js — MV3 service worker (module)
 // Storage schema:
@@ -94,15 +94,22 @@ function withLibraryWrite(work) {
   return job;
 }
 
+// The folder/item pairs repairLibraryGroups needs to see together.
+const GROUP_PAIRS = [['folders', 'channels'], ['videoFolders', 'videos']];
+
 async function patchLibrary(patches) {
   return withLibraryWrite(async () => {
     const keys = Object.keys(patches).filter(k => RECORD_KEYS.includes(k));
-    const data = await chrome.storage.local.get(keys);
+    // Read the partner collection of every patched folder tree too, so a patch
+    // can't leave items filed directly in a group (DESIGN §11).
+    const readKeys = [...new Set([...keys, ...GROUP_PAIRS.filter(pair => pair.some(k => keys.includes(k))).flat()])];
+    const data = await chrome.storage.local.get(readKeys);
     for (const key of keys) {
       data[key] ||= {};
       applyRecordPatch(data[key], patches[key], { videos: key === 'videos' });
     }
-    await chrome.storage.local.set(data);
+    const repaired = repairLibraryGroups(data);
+    await chrome.storage.local.set(Object.fromEntries([...new Set([...keys, ...repaired])].map(k => [k, data[k]])));
     const videoStates = Object.fromEntries((patches.videos || []).filter(change => data.videos?.[change.id]).map(change =>
       [change.id, Object.fromEntries(VIDEO_FLAGS.map(key => [key, data.videos[change.id][key] ?? null]))]));
     return { ok: true, videoStates };
@@ -226,6 +233,11 @@ chrome.runtime.onInstalled.addListener(() => withLibraryWrite(async () => {
     }
     if (touched) await chrome.storage.local.set({ videos: data.videos });
   }
+  // Items filed directly in a group (a folder with subfolders) move into its
+  // "General" child — groups hold no items of their own (DESIGN §11).
+  const current = await chrome.storage.local.get(["channels", "folders", "videos", "videoFolders"]);
+  const repaired = repairLibraryGroups(current);
+  if (repaired.length) await chrome.storage.local.set(Object.fromEntries(repaired.map(k => [k, current[k]])));
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: REFRESH_PERIOD_MIN });
   setupContextMenus();
 }));
@@ -714,6 +726,12 @@ chrome.storage.local.get("reopenDashboardAt").then(({ reopenDashboardAt }) => {
   if (Date.now() - reopenDashboardAt < REOPEN_AFTER_RELOAD_MS) openDashboard();
 });
 
+// Jobs live in this worker's memory, so a fresh worker has none running: a
+// `jobProgress` left behind by one that was killed mid-job is stale.
+chrome.storage.local.get("jobProgress").then(({ jobProgress }) => {
+  if (jobProgress) chrome.storage.local.remove("jobProgress");
+});
+
 // ---------- Message routing ----------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -740,9 +758,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     DISCARD_SCAN: async () => { await chrome.storage.local.remove('pendingScan'); return { ok: true }; },
     REFRESH_STATS: () => msg.channelIds ? refreshChannelStats(msg.channelIds) : refreshAllChannelStats(),
     REFRESH_SINGLE: () => refreshChannelStats([msg.channelId]),
+    CANCEL_JOB: async () => { jobGeneration++; return { ok: true }; },
     FILL_MISSING_AVATARS: fillMissingAvatars,
     FILL_VIDEO_DETAILS: fillMissingVideoDetails,
-    FETCH_ALL_VIDEOS: () => fetchAllVideosForChannels(msg.channelIds || []),
+    FETCH_ALL_VIDEOS: () => fetchAllVideosForChannels(msg.channelIds || [], { kinds: msg.kinds, limit: msg.limit }),
     PLAYLIST_SCAN_RESULT: () => handlePlaylistScanResult(msg),
     APPLY_PLAYLIST_IMPORT: () => applyPlaylistImport(msg.listName, msg.moveIds || []),
     DISCARD_PLAYLIST_IMPORT: async () => { await chrome.storage.local.remove('pendingPlaylistImport'); return { ok: true }; },
@@ -1030,8 +1049,41 @@ async function fillMissingAvatars() {
   return stats;
 }
 
-async function refreshChannelStats(channelIds) {
-  if (!channelIds.length) return { ok: true, queried: 0 };
+// ---------- Long jobs: progress + cancel ----------
+// A refresh or a video fetch over several channels mirrors its progress into
+// `jobProgress` ({ kind, done, total, startedAt } — per-device, never synced or
+// backed up) for the dashboard's sidebar progress box, and checks between steps
+// whether CANCEL_JOB bumped `jobGeneration` since it started. A cancelled job
+// stops at its next step and still commits what it already has.
+let jobGeneration = 0;
+
+async function runJob(kind, total, work) {
+  const generation = jobGeneration;
+  const startedAt = Date.now();
+  const tracked = total > 1;
+  const job = {
+    cancelled: false,
+    isCancelled: () => (job.cancelled ||= generation !== jobGeneration),
+    report: async (done) => {
+      if (tracked) await chrome.storage.local.set({ jobProgress: { kind, done, total, startedAt } }).catch(() => {});
+    },
+  };
+  await job.report(0);
+  try {
+    const result = await work(job);
+    if (job.cancelled && result && typeof result === "object") result.cancelled = true;
+    return result;
+  } finally {
+    if (tracked) await chrome.storage.local.remove("jobProgress").catch(() => {});
+  }
+}
+
+function refreshChannelStats(channelIds) {
+  if (!channelIds.length) return Promise.resolve({ ok: true, queried: 0 });
+  return runJob("refresh", channelIds.length, (job) => refreshChannelStatsJob(channelIds, job));
+}
+
+async function refreshChannelStatsJob(channelIds, job) {
   const { apiKey } = await chrome.storage.local.get("apiKey");
   const data = await chrome.storage.local.get(["channels", "libraryEpoch"]);
   const channels = data.channels || {};
@@ -1048,6 +1100,7 @@ async function refreshChannelStats(channelIds) {
   // 1) Video count / subscriber count / avatar: with an API key, batches of 50 (1 unit/call)
   if (apiKey) {
     for (const group of chunk(channelIds, YT_CHANNELS_BATCH)) {
+      if (job.isCancelled()) break;
       try {
         const url = `${API_BASE}/channels?part=snippet,statistics,contentDetails&id=${group.join(",")}&key=${apiKey}`;
         const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
@@ -1098,7 +1151,10 @@ async function refreshChannelStats(channelIds) {
   seenIds.epoch = libraryEpoch;
   const now = Date.now();
   // Bound simultaneous RSS requests and report each failed channel.
-  for (const group of chunk(channelIds, 6)) await Promise.all(group.map(async (id) => {
+  let done = 0;
+  for (const group of chunk(channelIds, 6)) {
+  if (job.isCancelled()) break;
+  await Promise.all(group.map(async (id) => {
     const ch = channels[id];
     if (!ch) return;
     const prevDate = ch.lastVideoDate || null;
@@ -1125,6 +1181,9 @@ async function refreshChannelStats(channelIds) {
     }
     if (ch.trackVideos) upsertChannelVideos(videoStore, id, feed.videos, now);
   }));
+  done += group.length;
+  await job.report(done);
+  }
   // Duration isn't in RSS — backfill it (and fresher view counts) via the API
   // when a key is set. Only newly-seen videos are queried, so this is cheap.
   if (apiKey) {
@@ -1168,8 +1227,13 @@ async function fetchChannelVideos(channelId) {
       // The RSS feed carries a live-ish view count in media:community. Duration
       // is NOT in RSS — it's filled later via the API (fillVideoDetails).
       const viewsMatch = block.match(/<media:statistics views="(\d+)"/);
+      // A Short's entry links to /shorts/<id>; everything else links to /watch.
+      // /watch only rules out a Short (a past stream looks the same), so it's a
+      // hint that never overrides a kind a category fetch already established.
+      const link = (block.match(/<link rel="alternate" href="([^"]+)"/) || [])[1] || "";
       videos.push({
         videoId,
+        ...(link.includes("/shorts/") ? { kind: "short" } : { kindHint: "video" }),
         title: decodeXml(rawTitle).replace(/\s+/g, " ").trim(),
         published,
         viewCount: viewsMatch ? Number(viewsMatch[1]) : null,
@@ -1212,7 +1276,7 @@ async function recoverMissingChannelFeed(channel, apiKey) {
     const data = await res.json();
     if (!Array.isArray(data.items)) throw new Error("YouTube returned invalid upload details.");
     const videos = parseUploadItems(data.items).slice(0, 15);
-    if (!videos.length && data.nextPageToken) return failed("YouTube's recent uploads contain no readable videos. Use Fetch full history to check older uploads.");
+    if (!videos.length && data.nextPageToken) return failed("YouTube's recent uploads contain no readable videos. Use Fetch videos → Full history to check older uploads.");
     const lastVideoDate = videos.reduce((latest, v) => v.published > (latest || "") ? v.published : latest, null);
     return { ok: true, lastVideoDate, videos };
   } catch (e) {
@@ -1244,6 +1308,8 @@ function upsertChannelVideos(store, channelId, videos, now) {
       existing.published = v.published || existing.published;
       existing.channelId = channelId;
       if (v.viewCount != null) existing.viewCount = v.viewCount;
+      if (v.kind) existing.kind = v.kind;
+      else if (v.kindHint && !existing.kind) existing.kind = v.kindHint;
     } else {
       store[v.videoId] = {
         id: v.videoId,
@@ -1252,6 +1318,7 @@ function upsertChannelVideos(store, channelId, videos, now) {
         published: v.published,
         thumbnail: v.thumbnail,
         viewCount: v.viewCount ?? null,
+        ...(v.kind || v.kindHint ? { kind: v.kind || v.kindHint } : {}),
         watched: false,
         saved: false,
         addedAt: now,
@@ -1460,6 +1527,20 @@ function uploadsPlaylistId(channelId) {
   return channelId && channelId.startsWith("UC") ? "UU" + channelId.slice(2) : null;
 }
 
+// YouTube keeps a per-category variant of every uploads playlist: swap the
+// "UU" prefix for UULF (long-form videos, no Shorts), UUSH (Shorts) or UULV
+// (past live streams). Undocumented but served by playlistItems.list like any
+// playlist, which is what lets a fetch ask for "only Shorts" without pulling
+// the whole catalog. An empty category has no playlist at all (404).
+const KIND_PLAYLIST_PREFIX = { video: "UULF", short: "UUSH", live: "UULV" };
+const VIDEO_KINDS = Object.keys(KIND_PLAYLIST_PREFIX);
+
+function categoryPlaylistId(uploadsId, channelId, kind) {
+  const suffix = uploadsId?.startsWith("UU") ? uploadsId.slice(2)
+    : channelId?.startsWith("UC") ? channelId.slice(2) : null;
+  return suffix ? KIND_PLAYLIST_PREFIX[kind] + suffix : null;
+}
+
 // Look up each channel's real uploads-playlist id via channels.list
 // (contentDetails.relatedPlaylists.uploads) — the reliable source. 1 unit / 50.
 //
@@ -1499,7 +1580,9 @@ async function resolveUploadsPlaylists(channelIds, apiKey) {
 
 // Page through a channel's entire uploads playlist (50/page) to get ALL its
 // videos — the RSS feed only exposes the latest ~15. 1 quota unit per page.
-async function fetchAllUploads(playlistId, apiKey) {
+// `limit` stops paging once that many videos are in (null = the whole playlist);
+// `kind` is stamped on every video when the playlist is a category playlist.
+async function fetchAllUploads(playlistId, apiKey, { limit = null, kind = null } = {}) {
   if (!playlistId) return { videos: [], error: "no uploads playlist" };
   const videos = [];
   let pageToken = "";
@@ -1519,11 +1602,11 @@ async function fetchAllUploads(playlistId, apiKey) {
       break;
     }
     const data = await res.json();
-    videos.push(...parseUploadItems(data.items || []));
+    for (const v of parseUploadItems(data.items || [])) videos.push(kind ? { ...v, kind } : v);
     pageToken = data.nextPageToken || "";
-    if (!pageToken) break;
+    if (!pageToken || (limit && videos.length >= limit)) break;
   }
-  return { videos, error };
+  return { videos: limit ? videos.slice(0, limit) : videos, error };
 }
 
 // Shared by the RSS fallback and full-history fetch so both import the same
@@ -1541,10 +1624,22 @@ function parseUploadItems(items) {
   return videos;
 }
 
-// Deep-fetch every upload for the given channels via the API, exempt them from
-// the per-channel cap (`fetchedAll`), auto-track them so the videos show, then
-// backfill lengths/views/live status. Dashboard-triggered (`FETCH_ALL_VIDEOS`).
-async function fetchAllVideosForChannels(channelIds) {
+// Fetch uploads for the given channels via the API, auto-track them so the
+// videos show, then backfill lengths/views/live status. Dashboard-triggered
+// (`FETCH_ALL_VIDEOS`).
+//   kinds  — subset of VIDEO_KINDS; each is paged from its own category
+//            playlist and stamped with that `kind`. Omitted = the plain uploads
+//            playlist (everything, unclassified).
+//   limit  — newest N per playlist; null = the whole history, which also sets
+//            `fetchedAll` (exempting the channel from the prune cap).
+function fetchAllVideosForChannels(channelIds, options = {}) {
+  return runJob("fetch", channelIds.length, (job) => fetchAllVideosJob(channelIds, options, job));
+}
+
+async function fetchAllVideosJob(channelIds, { kinds = null, limit = null } = {}, job) {
+  kinds = Array.isArray(kinds) ? kinds.filter((k) => VIDEO_KINDS.includes(k)) : null;
+  if (kinds && !kinds.length) return { ok: false, hasApiKey: true, error: "Pick at least one category." };
+  limit = Number.isInteger(limit) && limit > 0 ? limit : null;
   const { apiKey } = await chrome.storage.local.get("apiKey");
   if (!apiKey) return { ok: false, hasApiKey: false };
   const { channels = {}, libraryEpoch = 0 } = await chrome.storage.local.get(["channels", "libraryEpoch"]);
@@ -1555,17 +1650,21 @@ async function fetchAllVideosForChannels(channelIds) {
   // `failures` is what the dashboard reports: one row per channel that came back
   // with nothing, named, so "some requests failed" can say *which* channel and
   // why. `apiFailures`/`lastError` stay for callers that only want a count.
-  const result = { ok: true, hasApiKey: true, channels: 0, added: 0, total: 0, apiFailures: 0, lastError: null, failures: [] };
+  const result = { ok: true, hasApiKey: true, channels: 0, added: 0, total: 0, apiFailures: 0, lastError: null, failures: [], byKind: {} };
   // Resolve real uploads-playlist ids up front (falls back to the UU shortcut).
   const { map: uploads, gone, error: lookupError } = await resolveUploadsPlaylists(channelIds.filter((id) => channels[id]), apiKey);
   if (lookupError) { result.apiFailures++; result.lastError = lookupError; }
+  let done = 0;
   for (const id of channelIds) {
+    if (job.isCancelled()) break;
+    await job.report(done++);
     if (!channels[id]) continue;
     // A channel the lookup says doesn't exist has no playlist to page; asking
     // anyway just spends quota on a guaranteed 404.
     const { videos, error } = gone.has(id)
       ? { videos: [], error: "channel not found on YouTube" }
-      : await fetchAllUploads(uploads[id] || uploadsPlaylistId(id), apiKey);
+      : kinds ? await fetchCategoryUploads(id, uploads[id], kinds, limit, apiKey, result.byKind)
+      : await fetchAllUploads(uploads[id] || uploadsPlaylistId(id), apiKey, { limit });
     if (error) {
       result.apiFailures++;
       result.lastError = error;
@@ -1576,7 +1675,7 @@ async function fetchAllVideosForChannels(channelIds) {
     }
     const before = Object.keys(store).length;
     upsertChannelVideos(store, id, videos, now);
-    channels[id].fetchedAll = true;
+    if (!limit) channels[id].fetchedAll = true;
     channels[id].trackVideos = true; // so the pulled-in videos actually appear
     result.added += Object.keys(store).length - before;
     result.total += videos.length;
@@ -1590,6 +1689,20 @@ async function fetchAllVideosForChannels(channelIds) {
   await fillVideoDetails(store, apiKey);
   await commitVideos(store, seenIds);
   return result;
+}
+
+// Page each requested category playlist for one channel. A 404 there means the
+// channel simply has nothing in that category (no Shorts, never streamed) —
+// not a failure. Any other error fails the channel, same as the plain fetch.
+async function fetchCategoryUploads(channelId, uploadsId, kinds, limit, apiKey, byKind) {
+  const videos = [];
+  for (const kind of kinds) {
+    const res = await fetchAllUploads(categoryPlaylistId(uploadsId, channelId, kind), apiKey, { limit, kind });
+    if (res.error && res.error !== "no public uploads") return { videos: [], error: res.error };
+    videos.push(...res.videos);
+    byKind[kind] = (byKind[kind] || 0) + res.videos.length;
+  }
+  return { videos, error: null };
 }
 
 // ISO-8601 duration ("PT1H2M10S") → seconds. Returns null on empty/malformed.
@@ -1622,9 +1735,12 @@ function pruneVideos(store, channels) {
     const ch = channels[v.channelId];
     if (!v.saved && !isRecentUserState(v) && (!ch || !ch.trackVideos)) delete store[vid];
   }
+  // Capped per channel *and* kind, so fetching a channel's latest Shorts or
+  // streams doesn't push its regular videos out (or the other way round).
   const byChannel = {};
-  for (const v of Object.values(store)) (byChannel[v.channelId] ||= []).push(v);
-  for (const [channelId, list] of Object.entries(byChannel)) {
+  for (const v of Object.values(store)) (byChannel[`${v.channelId}\u0000${v.kind || "video"}`] ||= []).push(v);
+  for (const list of Object.values(byChannel)) {
+    const channelId = list[0].channelId;
     if (channels[channelId]?.fetchedAll) continue; // full history kept intact
     if (list.length <= VIDEO_KEEP_PER_CHANNEL) continue;
     list.sort((a, b) => (a.published < b.published ? 1 : -1)); // newest first
@@ -1937,6 +2053,7 @@ async function applySync(direction, removeIds, skipVideoIds, reviewToken, skipAl
         await chrome.storage.local.set({ gistId, lastSyncedAt });
       } else {
         await snapshotLibrary('Before sync download', local);
+        repairLibraryGroups(result);
         await chrome.storage.local.set({ ...result, ...remoteSettings, gistId, lastSyncedAt });
       }
       return { ok: true, gistId, lastSyncedAt };
@@ -2089,6 +2206,8 @@ function mergeVideo(a, b) {
     channelUrl: firstSet(a.channelUrl, b.channelUrl) ?? null,
     published: firstSet(a.published, b.published) ?? null,
     addedAt: seenTimes.length ? Math.min(...seenTimes) : Date.now(),
+    // "video" can be a mere RSS hint; a Short/stream classification is certain.
+    ...(a.kind || b.kind ? { kind: [a.kind, b.kind].find((k) => k && k !== "video") || "video" } : {}),
   };
 }
 

@@ -1,0 +1,52 @@
+/* Organizer design language — shared tokens (see DESIGN.md §1–2).
+   Vendored into each app as shared/ui/tokens.css by sync.sh; don't edit the
+   copies. An app imports this, then sets only its brand block:
+     :root { --accent: …; --accent-dim: …; --accent-text: …; } */
+
+:root {
+  /* Neutrals (dark only) */
+  --bg: #18191c;
+  --panel: #202125;
+  --panel-2: #282a2f;
+  --border: #373a42;
+  --text: #f0ede7;
+  --text-muted: #aba9b1;
+
+  /* Brand — overridden per app */
+  --accent: #edbc6b;
+  --accent-dim: #584727;
+  --accent-text: #1a1408;
+
+  /* Status */
+  --danger: #ec8e7a;
+  --ok: #6fcf97;
+
+  /* Flags: a flag's own color on its toggle and its filter chip */
+  --flag-active: #6fcf97;
+  --flag-finished: #56b6e9;
+  --flag-track: #c792ea;
+  --flag-text: #0f1418;
+
+  /* Recency scale for last-activity dates (ageClass in ui.js) */
+  --age-current: #56b6e9;
+  --age-year: #6fcf97;
+  --age-recent: #e4c767;
+  --age-old: #f0913c;
+  --age-stale: #e0705a;
+
+  --scroll-thumb: #42454e;
+  --scroll-thumb-hover: #565a66;
+
+  /* Type */
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  /* Sizes (MyGram's) */
+  --sidebar-w: 260px;
+  --row-h: 56px;
+  --avatar: 40px;
+  --gutter: 20px;
+  --radius: 10px;
+  --radius-sm: 8px;
+  --radius-dialog: 14px;
+  --shadow-pop: 0 10px 30px rgba(0, 0, 0, .45);
+}

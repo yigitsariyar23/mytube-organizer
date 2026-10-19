@@ -18,6 +18,14 @@ async function check(name, run) {
   catch (error) { results.push(`FAIL ${name}: ${error.message}`); }
   output.textContent = results.join('\n');
 }
+const isOpen = selector => $(selector).open;
+// Esc / backdrop on a kit <dialog>: a close request the dialog may refuse.
+const requestClose = dialog => (dialog.requestClose ? dialog.requestClose() : dialog.close());
+const toastButton = label => [...document.querySelectorAll('.ui-toast button')].find(button => button.textContent === label);
+const menuItem = label => [...document.querySelectorAll('.ui-menu .ui-menu-item')].find(item => item.textContent.trim() === label);
+const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const MOD = mac ? { metaKey: true } : { ctrlKey: true };
+const clickWith = (node, extra = {}) => node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ...extra }));
 const key = (code, extra = {}, target = document.body) => target.dispatchEvent(new KeyboardEvent('keydown', { code, key: extra.key || code.replace(/^(Key|Digit)/, '').toLowerCase(), bubbles: true, cancelable: true, ...extra }));
 await until(() => $('#videoFeed .video-card'));
 await check('New and Watch Later channel names and avatars link to the channel', async () => {
@@ -48,13 +56,13 @@ await check('Active languages are searchable, cancellable, and restrict dashboar
   assert($('#languageSelection').textContent === 'English', 'cancel saved language draft');
   click('#languagePresetBtn');
   click('#settingsSave');
-  await until(() => $('#settingsModal').hidden && $('#statusText').textContent === 'Settings saved.');
+  await until(() => !isOpen('#settingsModal') && $('#statusText').textContent === 'Settings saved.');
   click('#viewChannelsBtn');
   await until(() => $('.var-lang'));
-  const picker = $('.var-lang');
-  assert([...picker.options].map(o => o.value).join(',') === ',Turkish,English,Russian,French', 'inactive choices leaked');
-  picker.value = 'Turkish';
-  picker.dispatchEvent(new Event('change', { bubbles: true }));
+  $('.var-lang').click();
+  const options = [...document.querySelectorAll('.ui-listbox .ui-option')];
+  assert(options.map(o => o.textContent.replace(/[^A-Za-z— ]/g, '').trim()).join(',') === '— none —,Turkish,English,Russian,French', 'inactive choices leaked');
+  options.find(o => o.textContent.includes('Turkish')).click();
   await until(() => window.fixture.db.channels.c0.language === 'Turkish');
   assert(window.fixture.db.languages.length === 4, 'active selection not saved');
   click('#viewNewBtn');
@@ -80,10 +88,10 @@ await check('Shortcut recording rejects conflicts, preserves Escape, and saves a
   click('#settingsBtn'); click('#settingsControlsTab'); assert(!$('#settingsControlsPanel').hidden, 'controls tab not open');
   click('[data-record-shortcut="search"]'); key('Digit1');
   assert($('#shortcutStatus').textContent.includes('Already used'), 'duplicate accepted');
-  key('Escape', { key: 'Escape' }); assert(!$('#settingsModal').hidden, 'Escape closed settings during recording');
+  key('Escape', { key: 'Escape' }); requestClose($('#settingsModal')); assert(isOpen('#settingsModal'), 'Escape closed settings during recording');
   click('[data-record-shortcut="search"]'); key('KeyK');
   key('Digit1'); assert(document.body.dataset.view === 'new', 'shortcut ran inside dialog');
-  click('#settingsSave'); await until(() => $('#settingsModal').hidden);
+  click('#settingsSave'); await until(() => !isOpen('#settingsModal'));
   assert(window.fixture.db.controls.bindings.search === 'KeyK', 'binding not persisted');
   document.activeElement?.blur(); key('Slash', { key: '/' }); assert(document.activeElement !== $('#searchInput'), 'old binding still active');
   key('KeyK'); assert(document.activeElement === $('#searchInput'), 'new binding did not run');
@@ -91,21 +99,21 @@ await check('Shortcut recording rejects conflicts, preserves Escape, and saves a
 await check('Reset is cancellable and clearing a binding disables only that action', async () => {
   click('#settingsBtn'); click('#settingsControlsTab'); click('#resetControlsBtn'); click('#settingsCancel');
   assert(window.fixture.db.controls.bindings.search === 'KeyK', 'Cancel saved draft');
-  click('#settingsBtn'); click('#settingsControlsTab'); click('[data-clear-shortcut="search"]'); click('#settingsSave'); await until(() => $('#settingsModal').hidden);
+  click('#settingsBtn'); click('#settingsControlsTab'); click('[data-clear-shortcut="search"]'); click('#settingsSave'); await until(() => !isOpen('#settingsModal'));
   document.activeElement?.blur(); key('KeyK'); assert(document.activeElement !== $('#searchInput'), 'cleared binding still active');
   key('Digit1'); await until(() => document.body.dataset.view === 'channels');
 });
 await check('Disabled shortcuts, Alt selection, and wheel settings are honored', async () => {
   click('#settingsBtn'); click('#settingsControlsTab'); click('#shortcutsEnabledInput');
-  $('#selectionModifierInput').value = 'alt'; $('#selectionModifierInput').dispatchEvent(new Event('change', { bubbles: true }));
-  click('#wheelAdjustsNumbersInput'); click('#settingsSave'); await until(() => $('#settingsModal').hidden);
+  $('#selectionModifierInput').click(); [...document.querySelectorAll('.ui-listbox .ui-option')].find(o => /Alt|Option/.test(o.textContent)).click();
+  click('#wheelAdjustsNumbersInput'); click('#settingsSave'); await until(() => !isOpen('#settingsModal'));
   key('Digit2'); assert(document.body.dataset.view === 'channels', 'disabled shortcut ran');
   const row = $('#channelGrid [data-channel-id]'); row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, altKey: true }));
   assert(row.classList.contains('selected'), 'Alt selection failed');
   const input = $('#filterMinCount'), before = input.value;
   input.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true }));
   assert(input.value === before, 'disabled wheel changed filter');
-  click('#settingsBtn'); click('#settingsControlsTab'); click('#resetControlsBtn'); click('#settingsSave'); await until(() => $('#settingsModal').hidden);
+  click('#settingsBtn'); click('#settingsControlsTab'); click('#resetControlsBtn'); click('#settingsSave'); await until(() => !isOpen('#settingsModal'));
   key('Digit2'); await until(() => document.body.dataset.view === 'new');
 });
 await check('Settings tabs and filter chips retain standard keyboard behavior', async () => {
@@ -113,9 +121,9 @@ await check('Settings tabs and filter chips retain standard keyboard behavior', 
   assert(document.activeElement === $('#settingsControlsTab'), 'unselected tab received focus');
   key('ArrowRight', { key: 'ArrowRight' }, $('#settingsControlsTab'));
   assert(!$('#settingsBackupsPanel').hidden && document.activeElement === $('#settingsBackupsTab'), 'tab arrows did not move panels');
-  key('Escape', { key: 'Escape' }); assert($('#settingsModal').hidden, 'Escape did not dismiss dialog');
+  requestClose($('#settingsModal')); assert(!isOpen('#settingsModal'), 'Escape did not dismiss dialog');
   key('Enter', { key: 'Enter', shiftKey: true }, $('#videoUnwatchedChip'));
-  assert($('#videoUnwatchedChip').classList.contains('on-neg'), 'keyboard exclusion did not select watched videos');
+  assert($('#videoUnwatchedChip').classList.contains('out'), 'keyboard exclusion did not select watched videos');
   key('Enter', { key: 'Enter', shiftKey: true }, $('#videoUnwatchedChip'));
   click('#videoUnwatchedChip');
 });
@@ -136,9 +144,9 @@ await check('Background writes preserve loaded cards and scroll position', async
 });
 await check('Remove and Undo restore the video without marking it watched', async () => {
   click('[data-video-id="v1"] [data-action="hide"]');
-  await until(() => !$('#undoToast').hidden);
-  assert(window.fixture.db.videos.v1.hidden, 'not removed');
-  click('#undoBtn');
+  await until(() => window.fixture.db.videos.v1.hidden, 'not removed');
+  await until(() => document.querySelector('.ui-toast')?.textContent.includes('Removed “Video 0001'), 'no undo toast for the removal');
+  toastButton('Undo').click();
   await until(() => !window.fixture.db.videos.v1.hidden);
   assert(!window.fixture.db.videos.v1.watched, 'opening/removing marked watched');
 });
@@ -161,14 +169,107 @@ await check('Opening a card only opens its YouTube tab', async () => {
 await check('Video menu actions survive a background refresh while the menu is open', async () => {
   const card = $('#videoFeed .video-card'), id = card.dataset.videoId;
   card.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
-  const remove = [...document.querySelectorAll('#contextMenu button')].find(button => button.textContent === 'Remove');
+  const remove = menuItem('Remove');
   assert(remove, 'remove action missing');
   await chrome.runtime.sendMessage({ type: 'PATCH_LIBRARY', patches: { videos: [{ id, set: { title: 'Updated while menu open' } }] } });
   remove.click();
   await until(() => window.fixture.db.videos[id].hidden, 'menu action was lost');
+  await until(() => document.querySelector('.ui-toast')?.textContent.includes('Removed'), 'no undo toast');
   assert(window.fixture.db.videos[id].title === 'Updated while menu open', 'metadata was overwritten');
-  await until(() => !$('#undoToast').hidden);
-  click('#undoBtn'); await until(() => !window.fixture.db.videos[id].hidden);
+  await until(() => toastButton('Undo'));
+  toastButton('Undo').click(); await until(() => !window.fixture.db.videos[id].hidden);
+});
+await check('No native selects or OS dialogs anywhere in the dashboard', async () => {
+  assert(!document.querySelector('select'), 'a native <select> is rendered');
+  assert(document.querySelectorAll('.ui-select').length >= 4, 'kit selects missing');
+});
+await check('Selection: Mod toggles, Shift selects a new range, Mod+Shift adds one, Mod+A and Esc', async () => {
+  key('Digit1'); await until(() => document.body.dataset.view === 'channels');
+  key('Escape', { key: 'Escape' });
+  const rows = () => [...document.querySelectorAll('#channelGrid .channel-row')];
+  clickWith(rows()[1], MOD);
+  clickWith(rows()[4], { shiftKey: true });
+  assert(rows().filter(r => r.classList.contains('selected')).length === 4, 'shift range');
+  clickWith(rows()[7], { ...MOD, shiftKey: true });
+  clickWith(rows()[2], MOD);
+  assert(rows().filter(r => r.classList.contains('selected')).length === 6, 'mod+shift add range / mod toggle');
+  assert($('#selectionCount').textContent === '6 selected' && !$('#selectionCount').hidden, 'N selected indicator');
+  clickWith(rows()[10], { shiftKey: true });
+  assert(rows().filter(r => r.classList.contains('selected')).length === 9, 'shift starts a new range from the anchor');
+  key('KeyA', { ...MOD, key: 'a' });
+  assert($('#selectionCount').textContent === '180 selected', 'Mod+A must cover unrendered rows');
+  key('Escape', { key: 'Escape' });
+  assert($('#selectionCount').hidden && !document.querySelector('.channel-row.selected'), 'Esc did not clear the selection');
+});
+await check('Bulk menu edits keep the selection and Undo reverts them', async () => {
+  const rows = () => [...document.querySelectorAll('#channelGrid .channel-row')];
+  for (const i of [0, 1, 2]) clickWith(rows()[i], MOD);
+  const ids = rows().slice(0, 3).map(r => r.dataset.channelId);
+  rows()[0].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 300, clientY: 300 }));
+  assert($('.ui-menu-title')?.textContent === '3 channels', 'bulk menu title');
+  menuItem('Mark active').click();
+  await until(() => ids.every(id => window.fixture.db.channels[id].active), 'bulk edit not saved');
+  assert(rows().filter(r => r.classList.contains('selected')).length === 3, 'bulk edit dropped the selection');
+  toastButton('Undo').click();
+  await until(() => ids.every(id => !window.fixture.db.channels[id].active), 'undo did not revert');
+  rows()[5].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 300, clientY: 300 }));
+  assert(rows().filter(r => r.classList.contains('selected')).length === 1 && rows()[5].classList.contains('selected'), 'right-click outside the selection must reset it');
+  assert($('.ui-menu-title')?.textContent === window.fixture.db.channels[rows()[5].dataset.channelId].name, 'single menu title');
+  key('Escape', { key: 'Escape' }); key('Escape', { key: 'Escape' });
+});
+await check('Dragging rows onto a folder moves them, with undo', async () => {
+  const row = [...document.querySelectorAll('#channelGrid .channel-row')].find(r => window.fixture.db.channels[r.dataset.channelId].folderId === 'unsorted');
+  const id = row.dataset.channelId;
+  const transfer = new DataTransfer();
+  row.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  const folder = $('.folder-item[data-folder-id="science-1"]');
+  const over = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer });
+  folder.dispatchEvent(over);
+  assert(over.defaultPrevented && folder.classList.contains('drop-into'), 'real folder must accept the drop');
+  const virtual = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer });
+  $('.folder-item[data-folder-id="all"]').dispatchEvent(virtual);
+  assert(!virtual.defaultPrevented, 'All must refuse rows');
+  folder.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  row.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: transfer }));
+  await until(() => window.fixture.db.channels[id].folderId === 'science-1', 'drop did not move the row');
+  assert(document.querySelector('.ui-toast')?.textContent.includes('Moved'), 'no Moved toast');
+  toastButton('Undo').click();
+  await until(() => window.fixture.db.channels[id].folderId === 'unsorted', 'undo did not move it back');
+});
+await check('Tag popover toggles tags, stays open, and creates tags with Enter', async () => {
+  const row = $('#channelGrid .channel-row'), id = row.dataset.channelId;
+  row.querySelector('[data-role="add-tag"]').click();
+  await until(() => $('.tag-popover'));
+  assert(document.activeElement === $('.tag-popover [data-role="new-tag"]'), 'new tag field not focused');
+  $('.tag-popover [data-tag="tag-1"]').click();
+  await until(() => !window.fixture.db.channels[id].tags.includes('tag-1'), 'toggle off failed');
+  assert($('.tag-popover'), 'popover closed after a toggle');
+  const field = $('.tag-popover [data-role="new-tag"]');
+  field.value = 'Fresh tag';
+  field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await until(() => Object.values(window.fixture.db.tags).some(t => t.name === 'Fresh tag'), 'new tag not created');
+  const fresh = Object.keys(window.fixture.db.tags).find(t => window.fixture.db.tags[t].name === 'Fresh tag');
+  await until(() => window.fixture.db.channels[id].tags.includes(fresh), 'new tag not applied');
+  key('Escape', { key: 'Escape' });
+  assert(!$('.tag-popover'), 'Esc did not close the popover');
+});
+await check('A first subfolder takes its parent\'s channels; Undo reverts the whole edit', async () => {
+  const before = Object.values(window.fixture.db.channels).filter(c => c.folderId === 'science-1').length;
+  assert(before > 0, 'fixture folder is empty');
+  $('.folder-item[data-folder-id="science-1"]').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 200 }));
+  menuItem('New subfolder…').click();
+  await until(() => document.querySelector('dialog.ui-dialog[open] input'));
+  const dialog = document.querySelector('dialog.ui-dialog[open]');
+  dialog.querySelector('input').value = 'Physics';
+  dialog.querySelector('button[value="ok"]').click();
+  await until(() => Object.values(window.fixture.db.folders).some(f => f.name === 'Physics' && f.parentId === 'science-1'), 'subfolder not created');
+  const physics = Object.keys(window.fixture.db.folders).find(fid => window.fixture.db.folders[fid].name === 'Physics');
+  await until(() => Object.values(window.fixture.db.channels).filter(c => c.folderId === physics).length === before, 'channels not moved into the subfolder');
+  assert(!Object.values(window.fixture.db.channels).some(c => c.folderId === 'science-1'), 'the group still holds channels');
+  toastButton('Undo').click();
+  await until(() => !window.fixture.db.folders[physics], 'undo kept the folder');
+  await until(() => Object.values(window.fixture.db.channels).filter(c => c.folderId === 'science-1').length === before, 'undo did not move channels back');
+  key('Digit2'); await until(() => document.body.dataset.view === 'new');
 });
 await check('Settings fits the viewport and creates a local snapshot', async () => {
   click('#settingsBtn'); click('#settingsBackupsTab'); click('#createBackupBtn'); await until(() => $('.backup-row'));
@@ -214,7 +315,7 @@ await check('JSON export contains the library and excludes credentials', async (
 });
 await check('Tag-only sync is reviewable and creates a download recovery snapshot', async () => {
   click('#settingsCancel'); window.fixture.remote = structuredClone(window.fixture.db); window.fixture.remote.tags.t.name = 'Remote tag';
-  click('#quickDownloadBtn'); await until(() => !$('#syncDiffModal').hidden);
+  click('#quickDownloadBtn'); await until(() => isOpen('#syncDiffModal'));
   assert($('#syncDiffBody').textContent.includes('Tags — will overwrite'), 'tag changes missing');
   assert(!$('#syncDiffApply').disabled, 'tag-only apply disabled');
   click('#syncDiffApply'); await until(() => $('#statusText').textContent === 'Download complete.');
@@ -223,10 +324,10 @@ await check('Tag-only sync is reviewable and creates a download recovery snapsho
 });
 await check('Changed sources require a second sync review', async () => {
   window.fixture.remote.tags.t.name = 'Reviewed label';
-  click('#quickDownloadBtn'); await until(() => !$('#syncDiffModal').hidden);
+  click('#quickDownloadBtn'); await until(() => isOpen('#syncDiffModal'));
   window.fixture.remote.tags.t.name = 'Changed after review';
   click('#syncDiffApply'); await until(() => $('#syncDiffWarning').textContent.includes('changed since'));
-  assert(!$('#syncDiffModal').hidden, 'updated review was closed');
+  assert(isOpen('#syncDiffModal'), 'updated review was closed');
   assert(window.fixture.db.tags.t.name === 'Remote tag', 'unreviewed change applied');
   click('#syncDiffApply'); await until(() => $('#statusText').textContent === 'Download complete.');
 });
@@ -234,7 +335,7 @@ await check('Selecting channel removal recalculates videos; skip-all includes un
   const videos = Object.fromEntries(Array.from({ length: 620 }, (_, i) => [`x${i}`, { id: `x${i}`, channelId: 'c', title: `Video ${i}`, published: '2020-01-01', duration: 60 }]));
   await chrome.storage.local.set({ videos });
   window.fixture.remote = structuredClone(window.fixture.db); delete window.fixture.remote.channels.c;
-  click('#quickDownloadBtn'); await until(() => !$('#syncDiffModal').hidden);
+  click('#quickDownloadBtn'); await until(() => isOpen('#syncDiffModal'));
   const box = $('#syncDiffBody [data-remove-id]'); assert(box, 'missing channel removal');
   box.checked = true; box.dispatchEvent(new Event('change', { bubbles: true }));
   await until(() => $('#syncDiffBody summary')?.textContent.includes('620 video changes'));

@@ -15,8 +15,8 @@ ES modules and vanilla DOM. Load it unpacked from this directory.
 manifest.json                         MV3 manifest (module service worker + one content script)
 background.js                         service worker: message hub, scan diff, stats, Gist sync, alarm
 dashboard/
-  dashboard.html                      the whole UI (dashboard page + all modals + context menus)
-  dashboard.css                       theme tokens in :root, all styling
+  dashboard.html                      the whole UI (dashboard page + its <dialog>s)
+  dashboard.css                       MyTube brand block + app-specific layout (on top of the kit)
   dashboard.js                        UI logic: render, filter/sort, folders/tags, dialogs, events
 content-scripts/
   scrape-subscriptions.js             runs only on youtube.com/feed/channels; scrapes channel links
@@ -24,6 +24,7 @@ native-host/
   mytube-updater.py                   OPTIONAL, runs OUTSIDE the browser: native messaging host
                                         that git-pulls this checkout for the update banner
   install.sh                          registers it per browser profile (per device, one-time)
+shared/ui/                            VENDORED design-language kit (tokens, components, ui.js) — see "Design language"
 version.json                          build stamp (UTC), rewritten by .githooks/pre-commit
 .githooks/pre-commit                  stamps version.json; enable with `git config core.hooksPath .githooks`
 shared/library.js                    pure field patches, backup validation, stable serialization
@@ -82,6 +83,11 @@ videos:  { [videoId]: {
   viewCount,                // number | null — from RSS media:statistics (free), refreshed by the API
   duration,                 // seconds | null (API contentDetails); undefined = "not yet fetched"
   live,                     // "none" | "live" | "upcoming" (API snippet.liveBroadcastContent)
+  kind,                     // "video" | "short" | "live" | absent — category. "short" from an RSS
+                            //   /shorts/ link; any kind from the category playlist a fetch read
+                            //   it from. RSS's "video" is only a hint: it never overwrites a kind
+                            //   already set, and mergeVideo prefers short/live over it. Absent =
+                            //   unclassified, shown and filtered as "video" (videoKind())
   hidden,                   // bool — user-dismissed from the New feed; kept so a refresh won't re-add it
   saved,                    // bool — in Watch Later
   folderId,                 // which Watch Later list ("unsorted" default); only meaningful when saved
@@ -112,6 +118,8 @@ libraryBackups                                               // latest five loca
 controls: { enabled, bindings: { [actionId]: chord | null },   // per-device keyboard + mouse preferences, never synced/exported
   selectionModifier, wheelAdjustsNumbers }                    // "primary" (Ctrl/Meta) or "alt"; wheel option covers count/date fields
 colWidths                                                    // number[5] | absent — resized px widths of the 5 sized table columns
+jobProgress: { kind, done, total, startedAt }                // a refresh ("refresh") or video fetch ("fetch") over 2+ channels in
+                                                              //   progress; removed when it ends. Per-device, never synced/backed up
 pendingScan: { scannedAt, scannedCount, unresolved, added[], modified[], removed[] }
               // a scan awaiting review; never applied to `channels` until confirmed, never synced
 pendingPlaylistImport: { playlistId, title, fetchedAt, statedCount, scrapedCount, videos[] }
@@ -121,8 +129,9 @@ pendingPlaylistImport: { playlistId, title, fetchedAt, statedCount, scrapedCount
               // shortfall warns the user to re-scroll). Never applied until confirmed, never synced
 ```
 
-- **Folder nesting is one level deep.** A folder with children is a "parent";
-  channels only live in leaf folders. `unsorted` (labelled "Unfiled") is the
+- **Folder nesting is one level deep.** A folder with children is a "group";
+  channels only live in leaf folders (the worker repairs strays into a
+  "General" child — see "Design language"). `unsorted` (labelled "Unfiled") is the
   fixed home and can't be renamed, reparented or deleted.
 - **`folderSort` "custom"** is the only mode where folder drag-and-drop is
   active; the other modes are computed sorts.
@@ -140,9 +149,10 @@ and reply through `sendResponse` (async, so each returns `true`). Rejections bec
 | `DISCARD_SCAN` | — | `{ ok }` (clears `pendingScan`) |
 | `REFRESH_STATS` | `{ channelIds? }` (omit for all) | diagnostics, including `failures: [{id, name, error}]`: `{ ok, hasApiKey, queried, thumbsFilled, missingThumbs, apiFailures, lastError, trackedUpdates }` |
 | `REFRESH_SINGLE` | `{ channelId }` | same refresh diagnostics |
+| `CANCEL_JOB` | — | `{ ok }`; running refresh/fetch jobs stop at their next step and return `cancelled: true` |
 | `FILL_MISSING_AVATARS` | — | `{ ok, hasApiKey, missingBefore, thumbsFilled, missingAfter, apiFailures, lastError }` |
 | `FILL_VIDEO_DETAILS` | — | `{ ok, hasApiKey, queried, filled, apiFailures, lastError }` (fills video length/views) |
-| `FETCH_ALL_VIDEOS` | `{ channelIds }` | `{ ok, hasApiKey, channels, total, added, apiFailures, lastError, failures[] }` (deep-fetch full upload history; `failures` = `{ id, name, error }` per skipped channel) |
+| `FETCH_ALL_VIDEOS` | `{ channelIds, kinds?, limit? }` | `{ ok, hasApiKey, channels, total, added, byKind, apiFailures, lastError, failures[] }` (fetch uploads per category — `kinds` ⊆ `video`/`short`/`live`, omitted = plain uploads playlist; `limit` = newest N per playlist, null = full history; `failures` = `{ id, name, error }` per skipped channel) |
 | `PLAYLIST_SCAN_RESULT` | `{ playlistId, title, videos, statedCount, scrapedCount }` (from the injected scraper) | `{ ok, count }`; stashes `pendingPlaylistImport`, opens dashboard |
 | `APPLY_PLAYLIST_IMPORT` | `{ listName, moveIds }` | `{ ok, listId, added, moved }` (creates a Watch Later list, saves the reviewed playlist into it) |
 | `DISCARD_PLAYLIST_IMPORT` | — | `{ ok }` (clears `pendingPlaylistImport`) |
@@ -231,7 +241,8 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   - **New (RSS feed).** `fetchChannelVideos` parses the *full* `<entry>` list
     (not just the max date) for every `trackVideos` channel and upserts each into
     `videos` (`upsertChannelVideos`), preserving `watched` across refreshes;
-    `pruneVideos` caps history per channel and drops videos whose channel
+    `pruneVideos` caps history per channel *and kind* (so fetched Shorts/streams
+    don't push regular videos out) and drops videos whose channel
     untracked/vanished (saved ones survive; the cap also spares anything else
     `isUserTouched`). Normal RSS needs no API key or quota; recovering a missing
     RSS feed uses the configured key. Rendered
@@ -273,8 +284,22 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     `fetchedAll` (which exempts the channel from `VIDEO_KEEP_PER_CHANNEL` in
     `pruneVideos`) and `trackVideos`, persists per-channel as it goes (so a long
     job survives a worker restart), then runs `fillVideoDetails`. Triggered
-    per-channel/bulk (channel right-click → "Fetch all videos") or globally
-    ("Fetch full history" in the New toolbar, over all tracked channels).
+    per-channel/bulk (channel right-click → "Fetch videos…") or from the New
+    toolbar ("Fetch videos…", over the tracked channels in the selected folder or
+    all of them) — both open the same dialog (`openFetchVideosModal`).
+    **Fetching by category.** YouTube keeps undocumented per-category variants of
+    every uploads playlist: swap the `UU` prefix for `UULF` (long-form videos, no
+    Shorts), `UUSH` (Shorts) or `UULV` (past live streams) — `categoryPlaylistId`.
+    The dialog's `kinds` pages only those playlists and stamps each video's `kind`;
+    a 404 on one means the channel has nothing in that category and is *not* a
+    failure. `limit` (the dialog's "Latest 50") stops paging early and does **not**
+    set `fetchedAll` — only a full-history fetch does. Premieres also carry
+    `liveStreamingDetails` in the API, which is why streams are classified only
+    from `UULV`, never from `videos.list`.
+    **Filtering by category.** The Videos/Shorts/Streams chips in the video
+    toolbar (`activeKindFilters`/`excludedKindFilters`, two-sided like the tag
+    chips) filter both video views in `applyVideoChips`, and are reset by
+    `clearAllFilters` and counted in `anyFilterActiveInView`.
     **A channel that can't be read is named, not blamed on a playlist id.**
     `resolveUploadsPlaylists` returns `{ map, gone, error }`: an id the lookup
     *answered about but didn't list* is a channel that no longer exists
@@ -293,8 +318,8 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
     folder scope, selects `hidden` videos (including untracked/missing channels),
     and ignores the watched/live filters so they remain recoverable. Restore
     clears `hidden`; normal New-feed tracking/watched filters then apply.
-    `persistLibrary` offers Undo for video flag/list edits using the worker's
-    returned flags and timestamp. `UNDO_VIDEOS` compares that exact state before
+    `persistLibrary` offers Undo for every library edit (see "Design language");
+    video flag/list edits use the worker's returned flags and timestamp. `UNDO_VIDEOS` compares that exact state before
     restoring prior flags and stamping a new decision; metadata is retained.
     Menu actions resolve the current video by id when clicked; a refresh can
     replace the in-memory record while a menu is open.
@@ -506,18 +531,107 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   `selectionModifierPressed` serves channels and both video grids. The wheel
   preference guards count/date number fields and year selects. Neither controls
   nor their defaults belong in `SYNC_SETTING_KEYS`, backups, or library patches.
-- **Preserve the original visual layout.** The sidebar uses the original compact
-  view tabs, with scan/refresh above folders. Keep all arrangement, dimensions,
-  spacing, and table/video-card layout unchanged. Typography uses the shared
-  sans-serif family throughout, including native controls and numeric metadata;
-  Variables buttons keep the same 11px text as other chips. Action menus open by
-  right-clicking folders, channels, or videos; there are no duplicate dot buttons. Visual polish
-  may recolor, replace/add icons, and add transitions. Current icon overlays
-  preserve the original glyph footprint; transitions affect only color/shadow
-  and opacity, with `prefers-reduced-motion` disabling them. Do not introduce
-  scaling/sliding animations or `transition: all`. Keyboard preferences live in the
-  Settings Controls tab, styled with the existing theme. Settings tabs support
-  arrow-key navigation and keep Save/Cancel visible while content scrolls.
+- **The visual layout follows the design language** (see "Design language"):
+  sizes, components and gestures come from `design-language/DESIGN.md` and the
+  vendored kit. Transitions stay color/shadow/opacity only, disabled under
+  `prefers-reduced-motion`; no scaling/sliding animations or `transition: all`.
+
+## Design language
+
+The dashboard follows the shared organizer design language —
+`~/other-projects/design-language/DESIGN.md` is the source of truth (MyTube and
+MyGram are one product under two brands). Its kit is vendored into
+`shared/ui/` (`tokens.css`, `components.css`, `ui.js`, `KIT_VERSION`) by
+`~/other-projects/design-language/sync.sh`. **Never edit `shared/ui/` here**:
+change `design-language/kit/` and re-run `sync.sh <this checkout>` (keep kit
+changes additive — MyGram uses it too). `dashboard.html` loads tokens.css →
+components.css → dashboard.css, and dashboard.css only sets the MyTube brand
+block (`--accent #edbc6b`, `--accent-dim #584727`, `--accent-text #1a1408`) plus
+app-specific layout; buttons, inputs, chips, Selects, menus, dialogs, toasts,
+scrollbars, rows, avatars, dates and the marquee come from the kit. The mobile
+build copies `shared/ui/` too (`scripts/build-mobile.js`).
+
+- **No native controls** (§3): no `<select>`, `confirm()`, `alert()` or
+  `prompt()`. Selects are kit `createSelect` (folder sort, year filters,
+  selection modifier, dialog Selects) or `selectButtonHtml` + `openListbox`
+  (row language/folder cells, delegated in the channel-grid click handler).
+  Checkboxes/radios/switches are real inputs with `.ui-check`/`.ui-radio`/
+  `.ui-switch`; number fields are `bindNumberField` (drag, type, or the wheel when
+  `controls.wheelAdjustsNumbers`; the year Selects take the wheel too).
+  `tests/browser-fixture.js` makes `confirm`/`alert`/`prompt` throw.
+- **Dialogs** are `<dialog class="ui-dialog">` opened with kit `openDialog` and
+  wired once in `bindDialogs()` (`bindDialog`: backdrop/Esc close, focus returns;
+  `busy` refuses closing while a review applies (`applyingReview`) or a shortcut
+  is being recorded). Check `.open`, never `.hidden`. Folder/list/tag create and
+  rename are `promptDialog`s; every delete/clear/import/restore is a
+  `confirmDialog`. Esc on the scan / playlist review only sets it aside — the
+  `#reviewBanner` ("A scan is waiting for review. [Review]") brings it back;
+  Discard drops it. The only `.modal` overlay left is the mobile build's injected
+  save panel (generic Esc/focus code in `bindKeyboardControls` is for it).
+- **Menus** are kit `openMenu` (cascading flyouts, keyboard, Esc restores
+  focus): `showChannelContextMenu` (title = channel name), `showBulkContextMenu`
+  (title "N channels"), `showFolderContextMenu`, `showTagContextMenu`
+  (shift+right-click a tag chip: rename, color, delete), `showVideoContextMenu` /
+  `showVideoBulkContextMenu`. Right-click on a row outside the selection resets
+  the selection to that row first. Folder pickers in menus are
+  `folderMenuItems` (groups cascade into children; ✓ marks the current value).
+- **Undo for every library edit** (§9). `persistLibrary(values, { undo })`
+  takes the toast's description of the edit; every dashboard edit passes one.
+  It records `editChanges(baseline, values)` (shared/library.js) for
+  non-video collections and the worker-stamped flags for videos, then
+  `showUndo(label, …)`. Undo (`undoEdit`) runs `revertEdit`, which restores the
+  before-state only of records whose *edited fields* still equal the after-state
+  — a refresh or avatar landing meanwhile is neither reverted nor blocks the
+  undo; a record edited again or deleted meanwhile is skipped, never
+  resurrected — and sends that as a normal patch with `undo: false`; video flags
+  still go through `UNDO_VIDEOS`. One level; Mod+Z (`triggerUndo`) runs it. Scan/
+  sync applies, restores and settings are not undoable (they snapshot instead),
+  and restore/clear drop the pending undo (`hideUndo`).
+- **Edits are selection-aware.** `editChannels`/`editVideos` mutate state,
+  re-render, prune the selection to rows still in view, and persist once.
+  `setChannelFlag`, `moveChannels`, `setChannelLanguage`, `setChannelTag`,
+  `createTagOn`, `deleteChannels`, `setVideosWatched`, `setVideosHidden`,
+  `removeFromWatchLater`, `moveVideosToList` all take id lists; inline row/card
+  controls pass `channelSel.targetsFor(id)` / `videoSel.targetsFor(id)`, so on a
+  selected row they act on the whole selection. Bulk actions keep the selection.
+- **Selection** (§6) is two kit `Selection`s, `channelSel` and `videoSel`
+  (never persisted; cleared on view or folder change). Mod-click toggles,
+  Shift-click is a *new* range from the anchor, Mod+Shift-click adds the range;
+  Mod is the Controls selection modifier (`selectionModifierPressed`). Ranges
+  and Mod+A use the whole filtered list (`getFilteredChannels` /
+  `currentVideoOrder`), so unrendered rows count. `bindSelectionControls` attaches
+  the kit marquee to `#channelList` and both video grids (`.list-area` reaches
+  into the main padding and leaves 120px under the last row, so there's always
+  empty space to start from) and handles the fixed everyday keys: Mod+A selects
+  all in view, Esc clears the selection when no menu/dialog/popover is open.
+  `#selectionCount` shows "N selected". Mod+A and Esc are not in the recordable
+  catalog (`shared/controls.js` reserves Mod+A for the browser).
+- **Rows → folders drag** (§10): channel rows are `draggable`; the payload is
+  `CHANNEL_DRAG_TYPE` (the row or its selection), the ghost is a kit
+  `.drag-ghost` pill. Real non-group folders accept (`.drop-into`); All/Filed and
+  groups refuse. Folder drags use zones 25/50/25 (`computeFolderDropIntent`
+  returns `{ type, zone, valid }`): an invalid nesting still shows its indicator
+  and is refused on drop with the toast "Only one level of nesting."
+- **Groups hold no channels** (§11). `repairLibraryGroups` / `repairGroupItems`
+  (shared/library.js) move items filed directly in a folder with subfolders into
+  its child named "General" (created with the deterministic id
+  `general-<parentId>` so two devices create the same one). The worker runs it
+  after every `PATCH_LIBRARY`, on install, on a sync download and in
+  `validateBackup` (restore/import). Creating the first subfolder of a folder
+  that holds items (dialog or drag-nesting) moves those items into it.
+- **Tag popover** (`openTagPopover`, kit `openPopover`): every tag with ✓ when
+  all targets have it; clicks toggle and the popover stays open; the "+ New tag
+  (Enter)" field is always present and focused; × deletes a tag everywhere
+  (confirmed, undoable). It anchors to a point, since a toggle re-renders the
+  row it was opened from.
+- **Progress box** (§4). `REFRESH_STATS` and `FETCH_ALL_VIDEOS` over 2+
+  channels run inside the worker's `runJob`, which mirrors `jobProgress` and
+  checks `jobGeneration` between steps; `CANCEL_JOB` bumps it, so the job stops
+  at its next step and commits what it already read (`result.cancelled`).
+  `renderJobStatus` shows "Refreshing d/t · ~N min" + Stop while it runs, then the
+  result line ("Done · N failed") with × once a job this page started ends. A
+  fresh worker clears a stale `jobProgress` (jobs live in worker memory). Named
+  failures stay in `#refreshErrors` (kit `.ui-errors`) with Retry failed channels.
 
 ## Conventions
 
@@ -649,22 +763,24 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   miss either of the last two and the chip survives a folder switch or keeps
   "Clear filters" hidden while it's still hiding rows. This replaced a
   one-button cycle (off → only → not) that could only be reversed by clicking
-  through, and that tags/languages never had at all. Because right-click is now
+  through, and that tags/languages never had at all. The two sides must differ in
+  **shape**, not shade (one rule at the end of `dashboard.css`): a true
+  exclusion (tags, languages, video categories) is unfilled, dashed red, struck
+  through with a ✕; a chip that *renames* itself on right click (Inactive,
+  Unfinished, Untracked, Watched) is a dashed outline in its flag color — a ✕
+  there would read as a double negative. Both sides used to be tints of one
+  color, and a later "softened fills" block made them almost identical. Because right-click is now
   filter UI, the tag rename/delete menu moved to **shift**+right-click.
-- **Number filters scrub.** `setupNumberScrubbing()` gives every number input a
-  Unity-style horizontal drag and an FM-style wheel; the native spinners are
-  hidden in CSS. Two details that matter: the wheel listener is
-  `{ passive: false }` (otherwise the page scrolls under the cursor) and the
-  drag only begins after the pointer actually moves, so click-to-type survives.
-  Values are written through `setScrubValue`, which clamps to the input's
-  min/max and dispatches a real `input` event — the filter handlers listening
-  for typing are the only code path, scrubbing has none of its own.
-- **The year dropdowns come from the data.** `populateYearDropdowns()` lists only
-  years present in `lastVideoDate` (newest first), rebuilding when that set
-  changes — it's keyed on `yearOptionsKey` so the common render does nothing. A
-  rebuild preserves the current selection, and if the selected year no longer
-  exists it falls back to "—" **and fires `change`**, so the filter state can't
-  drift from what the dropdown shows.
+- **Number filters are kit NumberFields.** `setupNumberFields()` binds the
+  count and DD/MM inputs with `bindNumberField` (drag sideways, type, or the
+  wheel when `controls.wheelAdjustsNumbers`); its `onChange` is the only path
+  into the filter state.
+- **The year Selects come from the data.** `populateYearDropdowns()` lists only
+  years present in `lastVideoDate` (newest first) in the two kit Selects
+  (`yearSelects.after/before`), rebuilding when that set changes (keyed on
+  `yearOptionsKey`). A rebuild keeps the selection; if the year no longer exists
+  it falls back to "—" and re-reads the filter (`onDateFilterChange`), so the
+  filter state can't drift from what the Select shows.
 - **Two empty states.** `#emptyState` shows when the library is empty (zero
   channels); `#noResultsState` shows when the library is non-empty but the
   current folder + filters match nothing — with a **Clear filters** button
@@ -712,32 +828,14 @@ The dashboard also reacts to `chrome.storage.onChanged` so background writes
   jumps. The `≤720px` media query overrides the template wholesale (hides
   Variables), so resizing is a wide-window feature. The date cell is a CSS
   `container` (`container-type: inline-size`): under ~100px it swaps the wordy
-  `formatShortDate` span for the numeric `formatNumericDate` one (`DD/MM/YY`).
-- **Last Video is tinted by recency.** `dateAgeClass()` puts each date in a
-  bucket — this/last month, this year, the two years before, the two before
-  those, older — and the `.date-age-*` classes color it (blue → green → yellow →
-  orange → red, tokens in `:root`). Every bucket is measured against `new Date()`
-  at render time, so **never hardcode a year here**; the buckets have to slide
-  forward on their own. A missing/unparseable date gets no class on purpose.
-- **Multi-select** lives entirely in the dashboard: a module-level
-  `selectedChannelIds` Set (not in `state`, never persisted) plus a
-  `selectionAnchor` pivot. Ctrl/Cmd-click toggles one row; Shift-click
-  add/removes the whole run from the anchor (`handleSelectionClick`). The only
-  visual is the `.channel-row.selected` yellow ring — no checkboxes, no count.
-  `buildChannelRow` re-applies the class so selection survives the scroll pager;
-  `paintSelection()` toggles it on already-rendered rows without a re-render.
-  Right-clicking inside a selection of 2+ opens `showBulkContextMenu`, which
-  reuses `folderSubmenuItems` and runs `bulkMutate`/`bulkDelete` over the set
-  (move, language, add/remove tag, active/finished, delete). Any action clears the
-  selection; a plain (unmodified) left-click also clears it and opens the channel.
-- **Video cards have the same multi-select**, mirrored: `selectedVideoIds` +
-  `videoSelectionAnchor`, `handleVideoSelectionClick` (range order from
-  `currentVideoOrder`, i.e. the active view's filtered/sorted list),
-  `paintVideoSelection`, and `.video-card.selected` (same yellow ring). It works in
-  both the New and Watch Later grids; `videoCardHtml` re-applies the class.
-  `showVideoBulkContextMenu` offers mark watched/unwatched and, per view, remove
-  from feed (New → `hidden`) or move-to-list / remove-from-Watch-Later. Selection
-  is per-view (cleared on `setView`).
+  long date for the numeric `DD/MM/YY` one (kit `dateCellHtml`).
+- **Last Video is tinted by recency.** The cell is the kit's `dateCellHtml`
+  (`colored: true`): `ageClass()` buckets the date (this/last month, this year,
+  the two years before, the two before those, older → blue/green/yellow/orange/
+  red) against `new Date()` at render time, so **never hardcode a year**; a
+  missing date gets no class. The cell is a container: under 100px it shows
+  `DD/MM/YY`.
+- **Multi-select, menus, undo, drag-and-drop:** see "Design language" above.
 
 ## Cruft (not part of the extension)
 

@@ -1,6 +1,13 @@
 import { LANGUAGE_CATALOG, DEFAULT_LANGUAGES, canonicalLanguage, activeLanguages, languageCatalogMatches } from "../shared/languages.js";
 import { SHORTCUTS, normalizeControls, shortcutFromEvent, bindingError, shortcutConflict, formatShortcut, selectionModifierPressed } from "../shared/controls.js";
-import { RECORD_KEYS, VIDEO_FLAGS, recordPatch, clone, isPlaylistOverlayTitle } from "../shared/library.js";
+import { RECORD_KEYS, VIDEO_FLAGS, recordPatch, clone, isPlaylistOverlayTitle, editChanges, revertEdit } from "../shared/library.js";
+// The shared design language (DESIGN.md in ~/other-projects/design-language),
+// vendored by its sync.sh — never edit shared/ui here.
+import {
+  isMac, openMenu, closeFloating, floatingOpen, openListbox, openPopover, selectButtonHtml, createSelect,
+  confirmDialog, promptDialog, bindDialog, openDialog, toast, showUndo, hideUndo, triggerUndo,
+  bindNumberField, Selection, attachMarquee, avatarHtml, dateCellHtml, CHIP_TOOLTIP,
+} from "../shared/ui/ui.js";
 
 // dashboard.js — MyTube Organizer main panel logic
 
@@ -123,14 +130,13 @@ function langLabel(lang) {
   return lang ? `${langFlag(lang)} ${langName(lang)}` : "";
 }
 
-let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null, pendingPlaylistImport: null };
+let state = { channels: {}, folders: {}, tags: {}, videos: {}, videoFolders: {}, apiKey: "", gistToken: "", gistId: "", lastSyncedAt: null, pendingScan: null, pendingPlaylistImport: null, jobProgress: null };
 let libraryBaseline = Object.fromEntries(RECORD_KEYS.map(k => [k, {}]));
-let undoVideoChanges = null;
 let libraryEditSequence = 0;
 let pendingVideoPage = { signature: '', limit: 60, list: [], mode: 'new', container: null };
 let failedRefreshIds = [];
 let refreshRunning = false;
-const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
+const IS_MAC = isMac;
 let controls = normalizeControls();
 let controlsDraft = null;
 let recordingShortcut = null;
@@ -148,23 +154,39 @@ async function persistSettings(values) {
   if (!result.ok) throw new Error(result.error || 'Could not save settings.');
 }
 
-async function persistLibrary(values) {
+// Every dashboard edit to the library lands here: `values` holds the edited
+// collections (state.* mutated in place), diffed against the last stored copy
+// into field patches the worker applies under its write queue.
+//
+// Undo (DESIGN §9): `undo` is the toast's description of the edit ("Moved 3
+// channels to Science.") — every library edit passes one, so every edit is
+// undoable; `undo: false` is for the undo itself. Records the edit touched are
+// kept as before/after copies; undo puts back the before-state only of those
+// still exactly as the edit left them (revertEdit), so a refresh or an avatar
+// landing meanwhile is never reverted. Video flag edits keep their own
+// worker-side check (UNDO_VIDEOS against the stamped state the worker returned).
+async function persistLibrary(values, { undo = "Change saved." } = {}) {
   const editSequence = ++libraryEditSequence;
   const patches = {};
-  const undo = [];
+  const videoUndo = [];
+  const before = {}, after = {};
   for (const key of Object.keys(values)) {
     if (!RECORD_KEYS.includes(key)) continue;
     patches[key] = recordPatch(libraryBaseline[key], values[key]);
     if (key === 'videos') for (const change of patches[key]) {
       if (!change.create && !change.remove && VIDEO_FLAGS.some(k => Object.hasOwn(change.set || {}, k) || change.unset?.includes(k))) {
-        const before = libraryBaseline.videos[change.id], after = values.videos[change.id];
-        undo.push({ id: change.id, before: Object.fromEntries(VIDEO_FLAGS.map(k => [k, before[k] ?? null])),
-          after: Object.fromEntries(VIDEO_FLAGS.map(k => [k, after[k] ?? null])) });
+        const b = libraryBaseline.videos[change.id], a = values.videos[change.id];
+        videoUndo.push({ id: change.id, before: Object.fromEntries(VIDEO_FLAGS.map(k => [k, b[k] ?? null])),
+          after: Object.fromEntries(VIDEO_FLAGS.map(k => [k, a[k] ?? null])) });
       }
+    } else if (patches[key].length) {
+      before[key] = libraryBaseline[key];
+      after[key] = values[key];
     }
     libraryBaseline[key] = clone(values[key]);
   }
   if (!Object.values(patches).some(changes => changes.length)) return;
+  const recordUndo = Object.keys(after).length ? editChanges(before, after) : [];
   const result = await requestWorker('PATCH_LIBRARY', { patches });
   if (!result?.ok) {
     await loadState();
@@ -172,11 +194,33 @@ async function persistLibrary(values) {
     el.statusText.textContent = result?.error || 'Could not save changes.';
     return;
   }
-  if (undo.length && editSequence === libraryEditSequence) {
-    undoVideoChanges = undo.map(change => ({ ...change, after: result.videoStates[change.id] }));
-    el.undoMessage.textContent = `${undo.length === 1 ? 'Video updated' : `${undo.length} videos updated`}.`;
-    el.undoToast.hidden = false;
+  if (undo && editSequence === libraryEditSequence && (recordUndo.length || videoUndo.length)) {
+    const videoChanges = videoUndo.map(change => ({ ...change, after: result.videoStates[change.id] })).filter(change => change.after);
+    showUndo(undo, () => undoEdit(recordUndo, videoChanges));
   }
+}
+
+// Undo one edit: records first (a field patch from the current state back to
+// the before-state, for those still matching their after-state), then video
+// flags through the worker's stamped check. False → the toast says it can't.
+async function undoEdit(recordChanges, videoChanges) {
+  let undone = 0;
+  if (recordChanges.length) {
+    const keys = [...new Set(recordChanges.map(change => change.key))];
+    const { reverted } = revertEdit(state, recordChanges);
+    if (reverted) {
+      await persistLibrary(Object.fromEntries(keys.map(key => [key, state[key]])), { undo: false });
+      undone += reverted;
+    }
+  }
+  if (videoChanges.length) {
+    const result = await requestWorker('UNDO_VIDEOS', { changes: videoChanges });
+    if (result.ok) undone += videoChanges.length;
+    else el.statusText.textContent = result.error;
+  }
+  if (!undone) return false;
+  render();
+  return true;
 }
 
 let currentFolderId = "all";       // selected channel folder (Channels/New views)
@@ -186,6 +230,10 @@ let currentView = "channels";      // "channels" | "new" | "watchlater" | "remov
 // Same left/right-click rule as every other chip — see toggleChipFilter.
 let newWatchedFilter = "unwatched";        // New feed defaults to hiding watched
 let watchLaterWatchedFilter = "unwatched"; // …and so does Watch Later
+// Video category chips (Videos / Shorts / Streams), shared by both video
+// views. Two-sided like the tag chips: left = only these, right = not these.
+const activeKindFilters = new Set();
+const excludedKindFilters = new Set();
 let videoSortKey = "date";         // "date" | "length"
 let videoSortDir = "desc";         // "desc" | "asc"
 let videoDetailsRequested = false; // guards the one-shot auto length/view fetch
@@ -195,10 +243,10 @@ const activeTagFilters = new Set();
 const excludedTagFilters = new Set();
 const activeLangFilters = new Set();   // languages selected in the filter bar
 const excludedLangFilters = new Set(); // …and languages ruled out
-const selectedChannelIds = new Set(); // multi-select highlight (ctrl/shift click)
-let selectionAnchor = null;           // last clicked id, the shift-range pivot
-const selectedVideoIds = new Set();   // video multi-select (New / Watch Later)
-let videoSelectionAnchor = null;      // shift-range pivot for video cards
+// Multi-select (DESIGN §6), one kit Selection per surface: the channel rows,
+// and the video cards of whichever video view is showing. Never persisted.
+const channelSel = new Selection(() => paintSelection());
+const videoSel = new Selection(() => paintVideoSelection());
 let filterActive = "";             // "" = off, "only" = active, "not" = inactive (active:false)
 let filterFinished = "";           // "" = off, "only" = finished, "not" = unfinished
 let filterTracked = "";            // "" = off, "only" = tracked, "not" = untracked
@@ -225,8 +273,6 @@ const SORT_FIRST_DIR = { date: "desc", count: "desc", subs: "desc", folder: "asc
 let folderSort = "custom"; // "custom" | "alpha" | "count"
 const collapsedFolders = new Set();    // collapsed parent channel folders
 const collapsedVideoLists = new Set(); // collapsed parent Watch Later lists
-// what the folder modal is currently doing: create-folder | rename-folder | rename-tag
-let folderModalMode = { type: "create-folder", id: null };
 
 // Advanced filters
 let filterMinCount = null;
@@ -238,7 +284,6 @@ let filterBeforeDate = null; // ISO date string upper bound (inclusive)
 const PAGE_SIZE = 40;
 let channelPageSignature = "";
 let pendingChannels = []; // filtered channels not yet appended to the grid
-let pendingFolderOptions = []; // precomputed move-folder <option> data, rebuilt each render
 let scrollObserver = null;
 
 // Resizable table columns. The first five columns carry explicit px widths; the
@@ -251,17 +296,21 @@ const COL_MINS = [160, 84, 52, 78, 180];      // min px for the five sized colum
                                               //  more than the compact "2.3K" it used to show)
 const COL_FLEX_MIN = 110;                     // min px for the flexible Folder column
 const COL_GAP = 16;                           // must match the grid `gap`
-const COL_PAD_X = 28;                         // .list-table-header horizontal padding (14*2)
+const COL_PAD_X = 22;                         // .list-table-header horizontal padding (11*2)
 
 const el = {
   viewRemovedBtn: document.getElementById("viewRemovedBtn"),
   videoLoadMoreBtn: document.getElementById("videoLoadMoreBtn"),
   retryRefreshBtn: document.getElementById("retryRefreshBtn"),
   refreshErrors: document.getElementById("refreshErrors"),
-  undoToast: document.getElementById("undoToast"),
-  undoMessage: document.getElementById("undoMessage"),
-  undoBtn: document.getElementById("undoBtn"),
-  undoDismiss: document.getElementById("undoDismiss"),
+  jobStatus: document.getElementById("jobStatus"),
+  jobStatusText: document.getElementById("jobStatusText"),
+  jobStopBtn: document.getElementById("jobStopBtn"),
+  selectionCount: document.getElementById("selectionCount"),
+  reviewBanner: document.getElementById("reviewBanner"),
+  reviewBannerText: document.getElementById("reviewBannerText"),
+  reviewBannerBtn: document.getElementById("reviewBannerBtn"),
+  channelList: document.getElementById("channelList"),
   exportBackupBtn: document.getElementById("exportBackupBtn"),
   importBackupBtn: document.getElementById("importBackupBtn"),
   backupFileInput: document.getElementById("backupFileInput"),
@@ -270,7 +319,7 @@ const el = {
   backupStatus: document.getElementById("backupStatus"),
 
   folderList: document.getElementById("folderList"),
-  folderSortSelect: document.getElementById("folderSortSelect"),
+  folderSortSlot: document.getElementById("folderSortSlot"),
   folderSectionLabel: document.getElementById("folderSectionLabel"),
   tagFilterBar: document.getElementById("tagFilterBar"),
   channelGrid: document.getElementById("channelGrid"),
@@ -301,7 +350,7 @@ const el = {
   shortcutStatus: document.getElementById("shortcutStatus"),
   resetControlsBtn: document.getElementById("resetControlsBtn"),
   shortcutsEnabledInput: document.getElementById("shortcutsEnabledInput"),
-  selectionModifierInput: document.getElementById("selectionModifierInput"),
+  selectionModifierSlot: document.getElementById("selectionModifierSlot"),
   wheelAdjustsNumbersInput: document.getElementById("wheelAdjustsNumbersInput"),
   settingsStatus: document.getElementById("settingsStatus"),
   settingsBtn: document.getElementById("settingsBtn"),
@@ -326,17 +375,6 @@ const el = {
   syncDiffCancel: document.getElementById("syncDiffCancel"),
   settingsSave: document.getElementById("settingsSave"),
   settingsCancel: document.getElementById("settingsCancel"),
-  folderModal: document.getElementById("folderModal"),
-  folderModalTitle: document.getElementById("folderModalTitle"),
-  folderNameLabel: document.getElementById("folderNameLabel"),
-  folderNameInput: document.getElementById("folderNameInput"),
-  folderParentRow: document.getElementById("folderParentRow"),
-  folderParentSelect: document.getElementById("folderParentSelect"),
-  folderSave: document.getElementById("folderSave"),
-  folderCancel: document.getElementById("folderCancel"),
-  contextMenu: document.getElementById("contextMenu"),
-  contextSubmenu: document.getElementById("contextSubmenu"),
-  contextSubSubmenu: document.getElementById("contextSubSubmenu"),
   scrollSentinel: document.getElementById("scrollSentinel"),
   listTableHeader: document.getElementById("listTableHeader"),
   main: document.querySelector(".main"),
@@ -345,10 +383,10 @@ const el = {
   filterMaxCount: document.getElementById("filterMaxCount"),
   filterAfterDay: document.getElementById("filterAfterDay"),
   filterAfterMonth: document.getElementById("filterAfterMonth"),
-  filterAfterYear: document.getElementById("filterAfterYear"),
+  filterAfterYearSlot: document.getElementById("filterAfterYearSlot"),
   filterBeforeDay: document.getElementById("filterBeforeDay"),
   filterBeforeMonth: document.getElementById("filterBeforeMonth"),
-  filterBeforeYear: document.getElementById("filterBeforeYear"),
+  filterBeforeYearSlot: document.getElementById("filterBeforeYearSlot"),
   scanDiffModal: document.getElementById("scanDiffModal"),
   scanDiffSummary: document.getElementById("scanDiffSummary"),
   scanDiffWarning: document.getElementById("scanDiffWarning"),
@@ -371,11 +409,51 @@ const el = {
   videoSortLength: document.getElementById("videoSortLength"),
   videoMarkAllBtn: document.getElementById("videoMarkAllBtn"),
   videoFetchAllBtn: document.getElementById("videoFetchAllBtn"),
+  fetchVideosModal: document.getElementById("fetchVideosModal"),
+  fetchVideosScopeRow: document.getElementById("fetchVideosScopeRow"),
+  fetchVideosScopeAll: document.getElementById("fetchVideosScopeAll"),
+  fetchVideosScopeFolder: document.getElementById("fetchVideosScopeFolder"),
+  fetchVideosScopeFolderLabel: document.getElementById("fetchVideosScopeFolderLabel"),
+  fetchVideosSummary: document.getElementById("fetchVideosSummary"),
+  fetchVideosCancel: document.getElementById("fetchVideosCancel"),
+  fetchVideosStart: document.getElementById("fetchVideosStart"),
   videoFeed: document.getElementById("videoFeed"),
   videoEmptyState: document.getElementById("videoEmptyState"),
   watchLaterGrid: document.getElementById("watchLaterGrid"),
   watchLaterEmptyState: document.getElementById("watchLaterEmptyState"),
 };
+
+// Kit Selects that replace the old native <select>s (DESIGN §3). Created once
+// here, mounted into their slots in the markup.
+const YEAR_NONE = "—";
+const yearSelects = {
+  after: createSelect({ options: [{ value: YEAR_NONE, label: YEAR_NONE }], value: YEAR_NONE, className: "filter-select", ariaLabel: "Last video after: year", onChange: () => onDateFilterChange("after") }),
+  before: createSelect({ options: [{ value: YEAR_NONE, label: YEAR_NONE }], value: YEAR_NONE, className: "filter-select", ariaLabel: "Last video before: year", onChange: () => onDateFilterChange("before") }),
+};
+yearSelects.after.el.id = "filterAfterYear";
+yearSelects.before.el.id = "filterBeforeYear";
+el.filterAfterYearSlot.replaceWith(yearSelects.after.el);
+el.filterBeforeYearSlot.replaceWith(yearSelects.before.el);
+const FOLDER_SORTS = [
+  { value: "custom", label: "Custom" },
+  { value: "alpha", label: "A → Z" },
+  { value: "count-desc", label: "Count ↓" },
+  { value: "count-asc", label: "Count ↑" },
+];
+const folderSortSelect = createSelect({ options: FOLDER_SORTS, value: "custom", className: "bare", ariaLabel: "Folder order", align: "end", onChange: (value) => {
+  folderSort = value;
+  chrome.storage.local.set({ folderSort });
+  renderFolders();
+} });
+folderSortSelect.el.id = "folderSortSelect";
+el.folderSortSlot.replaceWith(folderSortSelect.el);
+const selectionModifierSelect = createSelect({
+  options: [{ value: "primary", label: `${isMac ? "⌘" : "Ctrl"} + click` }, { value: "alt", label: `${isMac ? "Option" : "Alt"} + click` }],
+  value: "primary", ariaLabel: "Select multiple items", align: "end",
+  onChange: (value) => { if (controlsDraft) controlsDraft.selectionModifier = value; },
+});
+selectionModifierSelect.el.id = "selectionModifierInput";
+el.selectionModifierSlot.replaceWith(selectionModifierSelect.el);
 
 export const dashboardReady = init();
 dashboardReady.catch(error => { el.statusText.textContent = `Could not open the library: ${error.message}`; });
@@ -398,17 +476,35 @@ function populateYearDropdowns() {
   if (key === yearOptionsKey) return;
   yearOptionsKey = key;
 
-  const html = ["—", ...years].map((y) => `<option value="${y}">${y}</option>`).join("");
-  for (const sel of [el.filterAfterYear, el.filterBeforeYear]) {
+  const options = [YEAR_NONE, ...years.map(String)].map((y) => ({ value: y, label: y }));
+  for (const [which, sel] of Object.entries(yearSelects)) {
     const previous = sel.value;
-    sel.innerHTML = html;
+    sel.setOptions(options);
     // Keep the selection when that year survives the rebuild; otherwise fall
-    // back to "—" (the filter's "no bound") and tell the listeners, so the
+    // back to "—" (the filter's "no bound") and re-read the filter, so the
     // filter state can't disagree with what the dropdown shows.
-    const kept = previous && [...sel.options].some((o) => o.value === previous);
-    sel.value = kept ? previous : "—";
-    if (!kept && previous && previous !== "—") sel.dispatchEvent(new Event("change", { bubbles: true }));
+    const kept = options.some((o) => o.value === previous);
+    if (!kept) {
+      sel.value = YEAR_NONE;
+      if (previous !== YEAR_NONE) onDateFilterChange(which);
+    }
   }
+}
+
+// A date bound from its DD / MM fields and year Select; no year = no bound.
+function readDateFilter(which) {
+  const [dayEl, monthEl] = which === "after" ? [el.filterAfterDay, el.filterAfterMonth] : [el.filterBeforeDay, el.filterBeforeMonth];
+  const year = yearSelects[which].value;
+  if (!year || year === YEAR_NONE) return null;
+  const mm = (monthEl.value || "1").padStart(2, "0");
+  const dd = (dayEl.value || "1").padStart(2, "0");
+  return `${year.padStart(4, "0")}-${mm}-${dd}`;
+}
+
+function onDateFilterChange(which) {
+  if (which === "after") filterAfterDate = readDateFilter("after");
+  else filterBeforeDate = readDateFilter("before");
+  renderGrid();
 }
 
 async function init() {
@@ -425,11 +521,13 @@ async function init() {
   render();
   bindEvents();
   setupColumnResize();
-  setupNumberScrubbing();
+  setupNumberFields();
+  renderJobStatus();
 
   // A scan / playlist import finished while the dashboard was closed — review it on open.
   if (state.pendingScan) openScanDiffModal(state.pendingScan);
-  if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
+  else if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
+  renderReviewBanner();
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
@@ -445,24 +543,26 @@ async function init() {
     if (changes.apiKey) state.apiKey = changes.apiKey.newValue || "";
     if (changes.languages) {
       LANGUAGES = activeLanguages(changes.languages.newValue);
-      activeLangFilters = new Set([...activeLangFilters].filter(l => LANGUAGES.includes(l)));
-      excludedLangFilters = new Set([...excludedLangFilters].filter(l => LANGUAGES.includes(l)));
+      for (const set of [activeLangFilters, excludedLangFilters]) for (const l of [...set]) if (!LANGUAGES.includes(l)) set.delete(l);
     }
     if (changes.pendingScan) {
       state.pendingScan = changes.pendingScan.newValue || null;
       if (state.pendingScan) openScanDiffModal(state.pendingScan);
-      else el.scanDiffModal.hidden = true;
+      else closeDialog(el.scanDiffModal);
+      renderReviewBanner();
     }
     if (changes.pendingPlaylistImport) {
       state.pendingPlaylistImport = changes.pendingPlaylistImport.newValue || null;
       if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
-      else el.playlistImportModal.hidden = true;
+      else closeDialog(el.playlistImportModal);
+      renderReviewBanner();
     }
+    if (changes.jobProgress) { state.jobProgress = changes.jobProgress.newValue || null; renderJobStatus(); }
     if (changes.lastSyncedAt) state.lastSyncedAt = changes.lastSyncedAt.newValue || null;
     if (changes.gistId) state.gistId = changes.gistId.newValue || '';
     if (changes.gistToken) state.gistToken = changes.gistToken.newValue || '';
     if (changes.controls) { controls = normalizeControls(changes.controls.newValue); renderShortcutHints(); }
-    if (changes.libraryBackups && !el.settingsModal.hidden) refreshBackupList();
+    if (changes.libraryBackups && el.settingsModal.open) refreshBackupList();
     if (changes.channels || changes.folders || changes.tags || changes.languages || changes.apiKey || changes.videoFolders) render();
     else if (changes.videos && currentView !== 'channels') {
       if (currentView === 'watchlater') renderFolders();
@@ -495,8 +595,9 @@ async function loadState() {
     "channels", "folders", "tags", "videos", "videoFolders", "apiKey", "gistToken", "gistId", "lastSyncedAt", "pendingScan",
     "pendingPlaylistImport",
     "sortDate", "sortCount", "sortSubs", "sortFolder", "sortPriority",
-    "folderSort", "languages", "currentView", "colWidths", "videoSort", "controls",
+    "folderSort", "languages", "currentView", "colWidths", "videoSort", "controls", "jobProgress",
   ]);
+  state.jobProgress = data.jobProgress || null;
   controls = normalizeControls(data.controls);
   state.channels = data.channels || {};
   state.folders = data.folders || defaultFolders();
@@ -544,7 +645,12 @@ function fdom() {
   if (currentView === "watchlater") {
     return {
       folders: state.videoFolders,
-      persist: () => persistLibrary({ videoFolders: state.videoFolders }),
+      isList: true,
+      noun: "list", itemNoun: "video",
+      // The items this tree files: saved videos (a removed save keeps no list).
+      items: () => Object.values(state.videos).filter((v) => v.saved),
+      // `withItems` when the edit also moved items between lists.
+      persist: (undo, withItems = false) => persistLibrary(withItems ? { videoFolders: state.videoFolders, videos: state.videos } : { videoFolders: state.videoFolders }, { undo }),
       counts: () => {
         const m = {};
         for (const v of Object.values(state.videos)) {
@@ -564,7 +670,10 @@ function fdom() {
   const trackedOnly = currentView === "new";
   return {
     folders: state.folders,
-    persist: () => persistLibrary({ folders: state.folders }),
+    isList: false,
+    noun: "folder", itemNoun: "channel",
+    items: () => Object.values(state.channels),
+    persist: (undo, withItems = false) => persistLibrary(withItems ? { folders: state.folders, channels: state.channels } : { folders: state.folders }, { undo }),
     counts: () => {
       const m = {};
       for (const c of Object.values(state.channels)) {
@@ -586,6 +695,7 @@ function fdom() {
 function render() {
   document.body.dataset.view = currentView;
   renderShortcutHints();
+  renderSelectionCount();
   el.viewChannelsBtn.classList.toggle("active", currentView === "channels");
   el.viewNewBtn.classList.toggle("active", currentView === "new");
   el.viewRemovedBtn.classList.toggle("active", currentView === "removed");
@@ -599,6 +709,7 @@ function render() {
   renderFolders();
 
   // Channel-grid surfaces
+  el.channelList.hidden = !channels;
   el.channelGrid.hidden = !channels;
   el.scrollSentinel.hidden = !channels;
   if (!channels) el.tagFilterBar.hidden = true;
@@ -641,7 +752,8 @@ async function setView(view) {
   searchQuery = "";
   el.searchInput.value = "";
   el.statusText.textContent = "";
-  clearVideoSelection(); // selection is per-view
+  videoSel.clear(); // selection is per-view
+  channelSel.clear();
   await chrome.storage.local.set({ currentView: view });
   render();
 }
@@ -672,12 +784,22 @@ function newFeedUniverse() {
   });
 }
 
-// The search box + watched chip: the two filters both video views share.
+// A video's category. `kind` comes from the RSS link (Shorts) or from the
+// category playlist a fetch read it from; anything unclassified is a video.
+function videoKind(v) {
+  return v.kind === "short" || v.kind === "live" ? v.kind : "video";
+}
+
+// The search box, watched chip and category chips — the filters both video
+// views share.
 function applyVideoChips(list, watchedFilter) {
   const q = searchQuery.trim().toLowerCase();
   return list.filter((v) => {
     if (watchedFilter === "unwatched" && v.watched) return false;
     if (watchedFilter === "watched" && !v.watched) return false;
+    const kind = videoKind(v);
+    if (activeKindFilters.size && !activeKindFilters.has(kind)) return false;
+    if (excludedKindFilters.has(kind)) return false;
     if (!q) return true;
     const author = state.channels[v.channelId]?.name || v.author;
     return `${v.title} ${author || ""}`.toLowerCase().includes(q);
@@ -746,6 +868,7 @@ function updateVideoSortButtons() {
 function renderVideoFeed() {
   renderFilterClears();
   renderWatchedChip(newWatchedFilter);
+  renderKindChips();
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
@@ -764,7 +887,7 @@ function renderVideoFeed() {
 
   if (!vids.length) {
     el.videoLoadMoreBtn.hidden = true;
-    const filtered = !!searchQuery.trim() || (currentView !== "removed" && newWatchedFilter !== "");
+    const filtered = !!searchQuery.trim() || anyKindFilter() || (currentView !== "removed" && newWatchedFilter !== "");
     el.videoFeed.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No videos match the current filters." : currentView === "removed" ? "No removed videos in this folder." : "No videos fetched yet — click Refresh Stats to pull them."}</p></div>`;
     return;
   }
@@ -814,7 +937,8 @@ function reconcileChildren(container, entries) {
 }
 
 function renderVideoList(list, mode, container) {
-  const signature = JSON.stringify([currentView, currentFolderId, currentListId, searchQuery, videoSortKey, videoSortDir, newWatchedFilter, watchLaterWatchedFilter]);
+  const signature = JSON.stringify([currentView, currentFolderId, currentListId, searchQuery, videoSortKey, videoSortDir, newWatchedFilter, watchLaterWatchedFilter,
+    [...activeKindFilters], [...excludedKindFilters]]);
   if (signature !== pendingVideoPage.signature) {
     pendingVideoPage.limit = 60;
     container.replaceChildren();
@@ -831,6 +955,7 @@ function renderVideoList(list, mode, container) {
     entries.push([`video:${video.id}`, videoCardHtml(video, mode)]);
   }
   reconcileChildren(container, entries);
+  renderSelectionCount();
   el.videoLoadMoreBtn.hidden = list.length <= pendingVideoPage.limit;
   el.videoLoadMoreBtn.textContent = `Load more (${Math.min(pendingVideoPage.limit, list.length)} of ${list.length})`;
 }
@@ -842,13 +967,16 @@ function videoCardHtml(v, mode) {
   const channelName = ch?.name || v.author || "";
   const channelUrl = videoChannelUrl(v);
   const avatarSrc = ch?.thumbnail || v.channelThumbnail || null;
+  const letter = escapeHtml(([...String(channelName || "?")][0] || "?").toUpperCase());
   const avatar = avatarSrc
-    ? `<img src="${escapeHtml(avatarSrc)}" alt="" />`
-    : `<span class="vc-avatar-fallback"></span>`;
+    ? `<img class="ui-avatar" src="${escapeHtml(avatarSrc)}" alt="" loading="lazy" draggable="false" data-letter="${letter}" />`
+    : avatarHtml(null, channelName);
   const when = v.published ? relativeTime(v.published) : "";
   const views = v.viewCount != null ? formatViews(v.viewCount) : "";
   const meta = [when, views].filter(Boolean).join(" · ");
   const durationBadge = v.duration != null ? `<span class="video-duration">${escapeHtml(formatDuration(v.duration))}</span>` : "";
+  const kind = videoKind(v);
+  const kindBadge = kind === "video" ? "" : `<span class="video-kind video-kind-${kind}">${KIND_LABELS[kind].one}</span>`;
   const actions = mode === "removed"
     ? `<button class="video-act" data-action="restore">Restore to New</button>`
     : mode === "watchlater"
@@ -857,16 +985,17 @@ function videoCardHtml(v, mode) {
     : `<button class="video-act" data-action="toggle-watched">${v.watched ? "Mark unwatched" : "Mark watched"}</button>
        <button class="video-act" data-action="hide" title="Remove from the New feed (won't come back)">Remove</button>`;
   return `
-    <div class="video-card${v.watched ? " watched" : ""}${selectedVideoIds.has(v.id) ? " selected" : ""}" data-video-id="${escapeHtml(v.id)}">
+    <div class="video-card${v.watched ? " watched" : ""}${videoSel.has(v.id) ? " selected" : ""}" data-video-id="${escapeHtml(v.id)}">
       <div class="video-thumb">
-        <img src="${escapeHtml(v.thumbnail)}" alt="" loading="lazy" />
+        <img src="${escapeHtml(v.thumbnail)}" alt="" loading="lazy" draggable="false" />
         ${durationBadge}
+        ${kindBadge}
         <span class="video-watched-badge">✓ watched</span>
       </div>
       <div class="video-meta">
-        <a class="video-title" href="https://www.youtube.com/watch?v=${encodeURIComponent(v.id)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</a>
+        <a class="video-title" href="https://www.youtube.com/watch?v=${encodeURIComponent(v.id)}" target="_blank" rel="noopener noreferrer" draggable="false" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</a>
         ${channelUrl
-          ? `<a class="video-channel" href="${escapeHtml(channelUrl)}" target="_blank" rel="noopener noreferrer" title="Open channel">${avatar}<span>${escapeHtml(channelName || "Open channel")}</span></a>`
+          ? `<a class="video-channel" href="${escapeHtml(channelUrl)}" target="_blank" rel="noopener noreferrer" draggable="false" title="Open channel">${avatar}<span>${escapeHtml(channelName || "Open channel")}</span></a>`
           : `<div class="video-channel" data-action="channel-unavailable">${avatar}<span>${escapeHtml(channelName || "Unknown channel")}</span></div>`}
         <div class="video-date">${escapeHtml(meta)}</div>
       </div>
@@ -925,6 +1054,7 @@ function getWatchLaterVideos() {
 function renderWatchLater() {
   renderFilterClears();
   renderWatchedChip(watchLaterWatchedFilter);
+  renderKindChips();
   updateVideoSortButtons();
   maybeFetchVideoDetails();
 
@@ -943,7 +1073,7 @@ function renderWatchLater() {
 
   if (!vids.length) {
     el.videoLoadMoreBtn.hidden = true;
-    const filtered = !!searchQuery.trim() || watchLaterWatchedFilter !== "";
+    const filtered = !!searchQuery.trim() || anyKindFilter() || watchLaterWatchedFilter !== "";
     el.watchLaterGrid.innerHTML = `<div class="empty-state" style="position:static"><p class="empty-title">No videos</p><p class="empty-body">${filtered ? "No saved videos match the current filters." : "This list is empty."}</p></div>`;
     return;
   }
@@ -973,13 +1103,6 @@ function relativeTime(iso) {
   return formatShortDate(iso);
 }
 
-// The user-owned fields of a video as one comparable string. An absent folderId
-// and "unsorted" are the same state (RSS videos carry none), so they compare
-// equal — same rule the sync diff uses.
-async function saveVideos() {
-  await persistLibrary({ videos: state.videos });
-}
-
 // Open a video on YouTube without changing its watched state.
 function openVideo(videoId, background) {
   const v = state.videos[videoId];
@@ -987,52 +1110,137 @@ function openVideo(videoId, background) {
   chrome.tabs.create({ url: `https://www.youtube.com/watch?v=${videoId}`, active: !background });
 }
 
-// Remove a video from Watch Later: clear `saved` and its list. A tracked
+// ---------- Video edits (selection-aware, undoable — §6, §9) ----------
+
+const videosNoun = (ids) => ids.length === 1 ? `“${state.videos[ids[0]]?.title || "video"}”` : plural(ids.length, "video");
+
+// Apply `mutate` to each video, repaint, persist as one undoable edit. The
+// selection is kept, minus cards the edit took out of the view.
+async function editVideos(ids, mutate, undo) {
+  const list = ids.map((id) => state.videos[id]).filter(Boolean);
+  if (!list.length) return;
+  list.forEach(mutate);
+  if (currentView === "watchlater") renderFolders();
+  renderCurrentView();
+  pruneVideoSelection();
+  await persistLibrary({ videos: state.videos }, { undo });
+}
+
+function pruneVideoSelection() {
+  if (!videoSel.size) return;
+  const visible = new Set(currentVideoOrder());
+  const kept = [...videoSel.ids].filter((id) => visible.has(id));
+  if (kept.length !== videoSel.size) videoSel.set(kept, visible.has(videoSel.anchor) ? videoSel.anchor : null);
+}
+
+const setVideosWatched = (ids, watched) =>
+  editVideos(ids, (v) => { v.watched = watched; }, `Marked ${videosNoun(ids)} ${watched ? "watched" : "unwatched"}.`);
+const setVideosHidden = (ids, hidden) =>
+  editVideos(ids, (v) => { v.hidden = hidden; }, hidden ? `Removed ${videosNoun(ids)} from the feed.` : `Restored ${videosNoun(ids)} to New.`);
+
+// Remove videos from Watch Later: clear `saved` and the list. A tracked
 // channel's video stays available in the New feed; a manually-saved one is left
 // behind as a `saved:false` record rather than deleted, because that record is
 // the only trace of the removal — delete it and the gist's older `saved:true`
 // merges the video back on the next sync. `pruneVideos` drops it once the
 // tombstone ages out (USER_STATE_TOMBSTONE_MS), and neither view shows it
 // meanwhile (Watch Later needs `saved`, the New feed needs a tracked channel).
-async function removeFromWatchLater(videoId) {
-  const v = state.videos[videoId];
-  if (!v) return;
-  v.saved = false;
-  delete v.folderId;
-  await saveVideos();
+function removeFromWatchLater(ids) {
+  return editVideos(ids, (v) => { v.saved = false; delete v.folderId; }, `Removed ${videosNoun(ids)} from Watch Later.`);
 }
 
-async function moveVideoToList(videoId, listId) {
-  const v = state.videos[videoId];
-  if (!v || !v.saved) return;
-  v.folderId = listId;
-  await saveVideos();
+function moveVideosToList(ids, listId) {
+  const moving = ids.filter((id) => state.videos[id]?.saved && (state.videos[id].folderId || "unsorted") !== listId);
+  if (!moving.length || !state.videoFolders[listId]) return;
+  return editVideos(moving, (v) => { v.folderId = listId; }, `Moved ${videosNoun(moving)} to ${folderLabel(listId, state.videoFolders)}.`);
 }
 
-// Deep-fetch the entire upload history of the given channels via the API (the
-// RSS refresh only sees the latest ~15). Needs a key; can take a while for big
-// catalogs, so it reports progress/outcome in the status line.
-async function fetchAllVideos(channelIds) {
+// Tracked channels, optionally narrowed to the selected channel folder.
+function trackedChannelIds(scopeFolderId) {
+  const inFolder = scopeFolderId ? folderScopeTest(scopeFolderId) : null;
+  return Object.values(state.channels)
+    .filter((c) => c.trackVideos && (!inFolder || inFolder(c.folderId)))
+    .map((c) => c.id);
+}
+
+// The fetch dialog: which categories (each read from its own category
+// playlist), how deep (latest N per category, or everything), and — from the
+// New toolbar — which tracked channels. `fixedIds` comes from a channel's
+// right-click menu and replaces the scope choice.
+let fetchVideosFixedIds = null;
+
+function openFetchVideosModal(fixedIds) {
+  if (!state.apiKey) {
+    el.statusText.textContent = "Fetching videos needs a YouTube API key — set one in Settings.";
+    return;
+  }
+  fetchVideosFixedIds = fixedIds;
+  const scoped = !fixedIds && currentFolderId !== "all";
+  el.fetchVideosScopeRow.hidden = !!fixedIds;
+  el.fetchVideosScopeFolder.disabled = !scoped;
+  el.fetchVideosScopeFolderLabel.textContent = scoped
+    ? `Tracked channels in “${currentFolderId === FILED_ID ? "Filed" : state.folders[currentFolderId]?.name || "this folder"}”`
+    : "Tracked channels in the selected folder";
+  (scoped ? el.fetchVideosScopeFolder : el.fetchVideosScopeAll).checked = true;
+  updateFetchVideosSummary();
+  openDialog(el.fetchVideosModal);
+}
+
+function readFetchVideosForm() {
+  const kinds = [...el.fetchVideosModal.querySelectorAll('input[name="fetchKind"]:checked')].map((i) => i.value);
+  const depth = el.fetchVideosModal.querySelector('input[name="fetchDepth"]:checked')?.value || "recent";
+  const channelIds = fetchVideosFixedIds ||
+    trackedChannelIds(el.fetchVideosScopeFolder.checked ? currentFolderId : null);
+  return { channelIds, kinds, limit: depth === "all" ? null : FETCH_RECENT_LIMIT };
+}
+
+const FETCH_RECENT_LIMIT = 50;
+
+// Rough cost so a full-history pull over many channels isn't a surprise: one
+// quota unit per 50-video page, per category, per channel — at minimum.
+function updateFetchVideosSummary() {
+  const { channelIds, kinds, limit } = readFetchVideosForm();
+  const n = channelIds.length;
+  const who = n === 1 ? `“${state.channels[channelIds[0]]?.name || "1 channel"}”` : `${n} channels`;
+  const what = kinds.map((k) => KIND_LABELS[k].many.toLowerCase()).join(" + ");
+  el.fetchVideosStart.disabled = !n || !kinds.length;
+  el.fetchVideosSummary.textContent = !kinds.length ? "Pick at least one category."
+    : !n ? "No tracked channels in this scope."
+    : limit
+      ? `Latest ${limit} ${what} from ${who} — about ${n * kinds.length} API units.`
+      : `Full history of ${what} from ${who} — at least ${n * kinds.length} API units, one more per 50 videos.`;
+}
+
+// Fetch uploads of the given channels via the API (the RSS refresh only sees
+// the latest ~15). Needs a key; can take a while for big catalogs, so it
+// reports progress/outcome in the status line. `kinds`/`limit` come from the
+// fetch dialog; without them it's the old plain full-history pull.
+async function fetchAllVideos(channelIds, { kinds, limit = null } = {}) {
   if (!channelIds.length) return;
   if (!state.apiKey) {
-    alert("Fetching all videos needs a YouTube API key — set one in Settings.");
+    el.statusText.textContent = "Fetching videos needs a YouTube API key — set one in Settings.";
     return;
   }
   const label = channelIds.length === 1
     ? `“${state.channels[channelIds[0]]?.name || "channel"}”`
     : `${channelIds.length} channels`;
-  el.statusText.textContent = `Fetching all videos from ${label}… (this can take a while)`;
+  const what = kinds ? kinds.map((k) => KIND_LABELS[k].many.toLowerCase()).join(", ") : "all videos";
+  el.statusText.textContent = `Fetching ${limit ? `latest ${what}` : what} from ${label}… (this can take a while)`;
   videoDetailsRequested = true; // the background fills lengths itself; suppress the auto-fetch
-  const res = await chrome.runtime.sendMessage({ type: "FETCH_ALL_VIDEOS", channelIds });
+  jobResult = null;
+  const res = await requestWorker("FETCH_ALL_VIDEOS", { channelIds, kinds, limit });
   await loadState();
   render();
+  if (channelIds.length > 1) setJobResult(res?.cancelled ? "Fetch stopped" : `Fetch done${res?.failures?.length ? ` · ${res.failures.length} failed` : ""}`, !!res?.failures?.length);
   if (res?.ok) {
-    el.statusText.textContent =
-      `Fetched ${res.total} video${res.total === 1 ? "" : "s"} from ${res.channels} channel${res.channels === 1 ? "" : "s"}` +
+    const split = kinds && kinds.length > 1
+      ? ` (${kinds.map((k) => `${res.byKind?.[k] || 0} ${KIND_LABELS[k].many.toLowerCase()}`).join(", ")})` : "";
+    el.statusText.textContent = (res.cancelled ? "Stopped. " : "") +
+      `Fetched ${res.total} video${res.total === 1 ? "" : "s"}${split} from ${res.channels} channel${res.channels === 1 ? "" : "s"}` +
       (res.failures?.length ? ` — ${describeFetchFailures(res.failures)}`
         : res.lastError ? ` — some requests failed: ${res.lastError}` : ".");
   } else if (res && res.hasApiKey === false) {
-    el.statusText.textContent = "Fetching all videos needs an API key (set one in Settings).";
+    el.statusText.textContent = "Fetching videos needs an API key (set one in Settings).";
   } else {
     el.statusText.textContent = "Fetch failed.";
   }
@@ -1133,6 +1341,8 @@ function getFolderAndDescendantIds(folderId, folders = state.folders) {
 // i.e. everything that *has* been filed away. Folder ids are always
 // slug + "-" + suffix (see the new-folder handler), so neither can collide.
 const FILED_ID = "filed";
+// The drag payload of channel rows dropped onto a sidebar folder (§10).
+const CHANNEL_DRAG_TYPE = "application/x-mytube-channels";
 const isVirtualFolderId = (id) => id === "all" || id === FILED_ID;
 // An absent folderId means Unfiled (RSS videos carry none) — normalize before
 // asking anything about it.
@@ -1149,14 +1359,8 @@ function folderScopeTest(selectedId, folders = state.folders) {
   return (folderId) => ids.has(folderId || "unsorted");
 }
 
-// Count channels in a folder and all its children
-function getFolderChannelCount(folderId) {
-  const allIds = getFolderAndDescendantIds(folderId);
-  return Object.values(state.channels).filter((c) => allIds.has(c.folderId)).length;
-}
-
 function renderFolders() {
-  if (el.folderSortSelect) el.folderSortSelect.value = folderSort;
+  if (folderSortSelect.value !== folderSort) folderSortSelect.value = folderSort;
 
   const d = fdom();
   const folders = d.folders;
@@ -1259,9 +1463,8 @@ function renderFolders() {
   for (const li of el.folderList.children) {
     li.tabIndex = 0;
     li.setAttribute('role', 'button');
-    li.setAttribute('aria-pressed', String(li.dataset.folderId === selected));
+    if (li.dataset.folderId === selected) li.setAttribute('aria-current', 'true');
     if (li.dataset.parentFolder) li.setAttribute('aria-expanded', String(!collapsed.has(li.dataset.folderId)));
-
   }
 }
 
@@ -1273,64 +1476,24 @@ function folderEmojiSlotHtml(folderId, emoji) {
   return `<span class="folder-emoji">${escapeHtml(emoji || "")}</span>`;
 }
 
+// The inline emoji field (folder menu → Set emoji…): a floating input next to
+// the folder; the first character typed is saved, ✕ clears it.
 function openEmojiInput(anchorEl, folderId) {
-  // Remove any existing picker
-  document.querySelector(".folder-emoji-picker")?.remove();
-
   const picker = document.createElement("div");
   picker.className = "folder-emoji-picker";
-
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "folder-emoji-input";
-  input.placeholder = "😀";
+  picker.innerHTML = `<input class="input folder-emoji-input" type="text" placeholder="😀" maxlength="4" aria-label="Folder emoji" /><button class="folder-emoji-clear" type="button" title="Clear emoji" aria-label="Clear emoji">✕</button>`;
+  const input = picker.querySelector("input");
   input.value = fdom().folders[folderId]?.emoji || "";
-  input.maxLength = 4; // room for one emoji (some are multi-codepoint)
-
-  const clearBtn = document.createElement("button");
-  clearBtn.className = "folder-emoji-clear";
-  clearBtn.textContent = "✕";
-  clearBtn.title = "Clear emoji";
-
-  picker.appendChild(input);
-  picker.appendChild(clearBtn);
-  document.body.appendChild(picker);
-
-  // Position below the slot
-  const rect = anchorEl.getBoundingClientRect();
-  picker.style.left = rect.left + "px";
-  picker.style.top = (rect.bottom + 4) + "px";
-
+  const popover = openPopover(anchorEl, picker);
   input.focus();
   input.select();
-
   const save = async (value) => {
+    popover.close();
     await setFolderEmoji(folderId, value);
-    picker.remove();
   };
-
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") save(input.value);
-    if (e.key === "Escape") picker.remove();
-  });
-
-  // Auto-save when a single emoji is typed
-  input.addEventListener("input", () => {
-    const chars = [...input.value.trim()];
-    if (chars.length >= 1) save(input.value);
-  });
-
-  clearBtn.addEventListener("click", () => save(""));
-
-  // Dismiss on outside click
-  setTimeout(() => {
-    document.addEventListener("click", function outside(e) {
-      if (!picker.contains(e.target)) {
-        picker.remove();
-        document.removeEventListener("click", outside);
-      }
-    });
-  }, 0);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") save(input.value); });
+  input.addEventListener("input", () => { if ([...input.value.trim()].length >= 1) save(input.value); });
+  picker.querySelector("button").addEventListener("click", () => save(""));
 }
 
 // Set or clear a folder's emoji (empty string clears). Emoji may be up to two
@@ -1340,10 +1503,11 @@ async function setFolderEmoji(folderId, value) {
   const folder = d.folders[folderId];
   if (!folder) return;
   const emoji = [...value.trim()].slice(0, 2).join("");
+  if ((folder.emoji || "") === emoji) return;
   if (emoji) folder.emoji = emoji;
   else delete folder.emoji;
-  await d.persist();
   renderFolders();
+  await d.persist(emoji ? `Emoji set on “${folder.name}”.` : `Emoji removed from “${folder.name}”.`);
 }
 
 // Whether a folder has any subfolders (i.e. is itself a parent).
@@ -1362,7 +1526,7 @@ function getSiblingIdsOrdered(parentId, folders = fdom().folders) {
 
 // Move `srcId` into `newParentId` (null = top-level), positioned just before
 // `beforeId` among the destination siblings (append when beforeId is null).
-// Renumbers the destination group's order values and persists.
+// Renumbers the destination group's order values. The caller persists.
 function applyFolderDrop(srcId, newParentId, beforeId) {
   const d = fdom();
   const src = d.folders[srcId];
@@ -1377,49 +1541,51 @@ function applyFolderDrop(srcId, newParentId, beforeId) {
   else siblings.push(srcId);
 
   siblings.forEach((id, i) => { d.folders[id].order = i; });
-  d.persist();
 }
 
-// Decide what a drop of `srcId` onto `targetId` means from where the cursor
-// sits within the target row: nest inside (middle) vs. reorder as a sibling
-// (top/bottom edge). Returns null when the drop isn't allowed.
+// What a drop of `srcId` onto `targetId` would do, from where the cursor sits
+// in the target row — zones 25 / 50 / 25 → before / inside / after (§10).
+// `valid: false` still carries the zone, so the indicator shows where it would
+// land; the drop itself is then refused with "Only one level of nesting."
+// Returns null only for a target that can't take any folder drop at all.
 function computeFolderDropIntent(srcId, targetId, clientY, targetEl) {
   const folders = fdom().folders;
   const src = folders[srcId];
   const target = folders[targetId];
   if (!src || !target || srcId === targetId) return null;
-  if (targetId === "unsorted") return null;   // pinned; never a drop target
-  if (target.parentId === srcId) return null; // can't drop a folder onto its own child
-
-  const srcHasChildren = folderHasChildren(srcId, folders);
-  const targetIsTopLevel = !target.parentId;
-  // 2-level max: only nest into a top-level folder, and never nest a folder
-  // that already has children of its own.
-  const canNest = targetIsTopLevel && !srcHasChildren;
+  // Unfiled is pinned first: dropping on it means "first among the top level".
+  if (targetId === "unsorted") return { type: "first", valid: !!src, zone: "after" };
 
   const rect = targetEl.getBoundingClientRect();
-  const y = clientY - rect.top;
-  const h = rect.height;
-
-  if (canNest) {
-    if (y < h * 0.25) return { type: "before" };
-    if (y > h * 0.75) return { type: "after" };
-    return { type: "inside" };
-  }
-
-  // No nesting here — the gesture can only reorder as a sibling of the target.
-  // A folder with children can't become a child, so reordering it next to a
-  // child folder (which would nest it one level down) is disallowed.
-  if (srcHasChildren && target.parentId) return null;
-  return { type: y < h * 0.5 ? "before" : "after" };
+  const y = (clientY - rect.top) / rect.height;
+  const type = y < 0.25 ? "before" : y > 0.75 ? "after" : "inside";
+  const srcHasChildren = folderHasChildren(srcId, folders);
+  // Two levels max: nest only into a top-level folder, never nest a group, and
+  // a group can't become a child by being reordered next to one either.
+  const valid = type === "inside"
+    ? !target.parentId && !srcHasChildren && target.parentId !== srcId
+    : !(srcHasChildren && target.parentId);
+  return { type, valid, zone: type === "inside" ? "into" : type };
 }
 
-function performFolderDrop(srcId, targetId, intent) {
+async function performFolderDrop(srcId, targetId, intent) {
   const d = fdom();
   const target = d.folders[targetId];
+  const src = d.folders[srcId];
+  if (!target || !src) return;
+  let movedItems = false;
   if (intent.type === "inside") {
+    // The first subfolder of a folder that holds items takes those items: a
+    // group holds none of its own (§11).
+    if (!folderHasChildren(targetId, d.folders)) {
+      for (const item of d.items()) {
+        if ((item.folderId || "unsorted") === targetId) { item.folderId = srcId; movedItems = true; }
+      }
+    }
     d.collapsed.delete(targetId); // reveal the newly nested child
     applyFolderDrop(srcId, targetId, null);
+  } else if (intent.type === "first") {
+    applyFolderDrop(srcId, null, getSiblingIdsOrdered(null, d.folders).filter((id) => id !== srcId)[0] || null);
   } else {
     const newParentId = target.parentId || null;
     if (intent.type === "before") {
@@ -1431,116 +1597,88 @@ function performFolderDrop(srcId, targetId, intent) {
     }
   }
   render();
+  await d.persist(intent.type === "inside" ? `Moved “${src.name}” into “${target.name}”.` : `Moved “${src.name}”.`, movedItems);
+}
+
+// The filter chips (DESIGN §7): left click = only these, right click =
+// exclude; tag/language chips carry their color dot, flag chips relabel when
+// excluded (Active → Inactive …) and wear their flag color.
+function chipHtml({ role, label, state, color = "", flag = "", attrs = "", title = CHIP_TOOLTIP }) {
+  const cls = ["chip", flag ? `flag flag-${flag}` : "", state === "in" ? "on" : state === "out" ? "out" : ""].filter(Boolean).join(" ");
+  const dot = color ? `<span class="dot" style="background:${escapeHtml(color)}"></span>` : "";
+  return `<span class="${cls}" data-role="${role}" ${attrs} role="button" tabindex="0" aria-pressed="${state ? "true" : "false"}" title="${escapeHtml(title)}">${dot}<span class="chip-label">${escapeHtml(label)}</span></span>`;
 }
 
 function renderTagFilters() {
   const bar = el.tagFilterBar;
-  bar.innerHTML = "";
 
   // Only offer variables actually present on channels in the current folder.
-  const channelsInFolder = Object.values(state.channels).filter(
-    (c) => currentFolderId === "all" ||
-      (currentFolderId === FILED_ID ? isFiledFolderId(c.folderId) : c.folderId === currentFolderId)
-  );
+  const inFolder = folderScopeTest(currentFolderId);
+  const channelsInFolder = Object.values(state.channels).filter((c) => !inFolder || inFolder(c.folderId));
   const usedTagIds = new Set(channelsInFolder.flatMap((c) => c.tags || []));
-  const tagEntries = Object.entries(state.tags).filter(([id]) => usedTagIds.has(id));
+  const tagEntries = Object.entries(state.tags).filter(([id]) => usedTagIds.has(id))
+    .sort((a, b) => a[1].name.localeCompare(b[1].name));
   const langs = [...new Set(channelsInFolder.map((c) => canonicalLanguage(c.language)).filter(l => LANGUAGES.includes(l)))].sort();
   const hasActive = channelsInFolder.some((c) => c.active);
   const hasFinished = channelsInFolder.some((c) => c.finished);
   const hasTracked = channelsInFolder.some((c) => c.trackVideos);
 
   bar.hidden = tagEntries.length === 0 && langs.length === 0 && !hasActive && !hasFinished && !hasTracked;
-  if (bar.hidden) return;
+  if (bar.hidden) { bar.innerHTML = ""; return; }
 
-  const label = document.createElement("span");
-  label.className = "tag-filter-label";
-  label.textContent = "Filter";
-  bar.appendChild(label);
-
+  const side = (include, exclude, key) => (include.has(key) ? "in" : exclude.has(key) ? "out" : "");
+  const flagSide = (value) => (value === "only" ? "in" : value === "not" ? "out" : "");
+  const html = ['<span class="filter-label">Filter</span>'];
   for (const [id, tag] of tagEntries) {
-    const included = activeTagFilters.has(id);
-    const chip = document.createElement("span");
-    chip.className = "tag-chip" + (included ? " active" : excludedTagFilters.has(id) ? " excluded" : "");
-    chip.textContent = tag.name;
-    chip.title = `${tag.name} — left click: only these · right click: exclude · shift+right click: rename or delete`;
-    chip.style.background = included ? tag.color : "";
-    chip.style.borderColor = tag.color;
-    if (!included) chip.style.color = excludedTagFilters.has(id) ? tag.color : "";
-    chip.dataset.tagId = id;
-    chip.dataset.role = "filter-tag";
-    bar.appendChild(chip);
+    html.push(chipHtml({ role: "filter-tag", label: tag.name, color: tag.color, state: side(activeTagFilters, excludedTagFilters, id),
+      attrs: `data-tag-id="${escapeHtml(id)}"`, title: `${tag.name} — ${CHIP_TOOLTIP} · Shift+right click: rename, color or delete` }));
   }
-
-  // Language chips
   for (const lang of langs) {
-    const included = activeLangFilters.has(lang);
-    const excluded = excludedLangFilters.has(lang);
-    const chip = document.createElement("span");
-    chip.className = "tag-chip filter-lang-chip" + (included ? " active" : excluded ? " excluded" : "");
-    chip.textContent = langLabel(lang);
-    chip.title = `${langName(lang)} — left click: only these · right click: exclude`;
-    const color = langColor(lang);
-    chip.style.background = included ? color : "";
-    chip.style.borderColor = color;
-    if (!included) chip.style.color = excluded ? color : "";
-    chip.dataset.lang = lang;
-    chip.dataset.role = "filter-lang";
-    bar.appendChild(chip);
+    html.push(chipHtml({ role: "filter-lang", label: langLabel(lang), color: langColor(lang), state: side(activeLangFilters, excludedLangFilters, lang),
+      attrs: `data-lang="${escapeHtml(lang)}"` }));
   }
-
-  // Active / Finished: the two-sided chips whose *label* flips, since "not
-  // active" has its own name. Left click = Active, right click = Inactive.
-  if (hasActive) {
-    const chip = document.createElement("span");
-    const cls = filterActive === "only" ? " on-active" : filterActive === "not" ? " off-active" : "";
-    chip.className = "tag-chip var-toggle" + cls;
-    chip.textContent = filterActive === "not" ? "Inactive" : "Active";
-    chip.title = "Left click: only active channels · right click: only inactive ones";
-    chip.dataset.role = "filter-active";
-    bar.appendChild(chip);
-  }
-  if (hasFinished) {
-    const chip = document.createElement("span");
-    const cls = filterFinished === "only" ? " on-finished" : filterFinished === "not" ? " off-finished" : "";
-    chip.className = "tag-chip var-toggle" + cls;
-    chip.textContent = filterFinished === "not" ? "Unfinished" : "Finished";
-    chip.title = "Left click: only finished channels · right click: only unfinished ones";
-    chip.dataset.role = "filter-finished";
-    bar.appendChild(chip);
-  }
-  // Tracked: the same two-sided chip for the flag that decides which channels
-  // feed the New tab. Its "not" side is the useful one — it's how you find the
-  // channels a full-history fetch or the feed is silently skipping.
-  if (hasTracked) {
-    const chip = document.createElement("span");
-    const cls = filterTracked === "only" ? " on-track" : filterTracked === "not" ? " off-track" : "";
-    chip.className = "tag-chip var-toggle" + cls;
-    chip.textContent = filterTracked === "not" ? "Untracked" : "Tracked";
-    chip.title = "Left click: only tracked channels · right click: only untracked ones";
-    chip.dataset.role = "filter-tracked";
-    bar.appendChild(chip);
-  }
+  if (hasActive) html.push(chipHtml({ role: "filter-active", flag: "active", label: filterActive === "not" ? "Inactive" : "Active", state: flagSide(filterActive) }));
+  if (hasFinished) html.push(chipHtml({ role: "filter-finished", flag: "finished", label: filterFinished === "not" ? "Unfinished" : "Finished", state: flagSide(filterFinished) }));
+  // Tracked: its "not" side is how you find the channels a full-history fetch
+  // or the feed is silently skipping.
+  if (hasTracked) html.push(chipHtml({ role: "filter-tracked", flag: "track", label: filterTracked === "not" ? "Untracked" : "Tracked", state: flagSide(filterTracked) }));
+  bar.innerHTML = html.join("");
 }
 
 // The video views' watched chip, which flips label like Active/Finished does:
 // left click narrows to unwatched, right click to watched.
 function renderWatchedChip(mode) {
   const chip = el.videoUnwatchedChip;
-  chip.textContent = mode === "watched" ? "Watched" : "Unwatched";
-  chip.title = "Left click: only unwatched · right click: only watched";
+  chip.querySelector(".chip-label").textContent = mode === "watched" ? "Watched" : "Unwatched";
+  chip.title = "Left click: only unwatched · Right click: only watched";
   chip.classList.toggle("on", mode === "unwatched");
-  chip.classList.toggle("on-neg", mode === "watched");
+  chip.classList.toggle("out", mode === "watched");
+  chip.setAttribute("aria-pressed", String(!!mode));
+}
+
+const KIND_LABELS = {
+  video: { one: "Video", many: "Videos" },
+  short: { one: "Short", many: "Shorts" },
+  live: { one: "Stream", many: "Streams" },
+};
+
+function anyKindFilter() {
+  return activeKindFilters.size > 0 || excludedKindFilters.size > 0;
+}
+
+function renderKindChips() {
+  for (const chip of el.videoFilters.querySelectorAll('[data-role="filter-kind"]')) {
+    const kind = chip.dataset.kind;
+    chip.classList.toggle("on", activeKindFilters.has(kind));
+    chip.classList.toggle("out", excludedKindFilters.has(kind));
+    chip.setAttribute("aria-pressed", String(activeKindFilters.has(kind) || excludedKindFilters.has(kind)));
+    chip.title = `${KIND_LABELS[kind].many} — ${CHIP_TOOLTIP}`;
+  }
 }
 
 function renderGrid() {
   renderFilterClears();
   pendingChannels = getFilteredChannels();
-  // Precompute the leaf-folder <option> data once per render; buildChannelRow
-  // (called lazily per scroll page) then only applies each row's `selected`.
-  // Parent folders with children are excluded — channels live only in leaf folders.
-  pendingFolderOptions = buildOrderedFolderList()
-    .filter(({ id }) => !folderHasChildren(id))
-    .map(({ id, f, isChild }) => ({ id, label: `${isChild ? "  " : ""}${escapeHtml(f.name)}` }));
   const signature = JSON.stringify([currentFolderId, searchQuery, filterActive, filterFinished, filterTracked,
     [...activeTagFilters], [...excludedTagFilters], [...activeLangFilters], [...excludedLangFilters],
     filterMinCount, filterMaxCount, filterAfterDate, filterBeforeDate, sortPriority, sortDate, sortCount, sortSubs, sortFolder]);
@@ -1570,6 +1708,7 @@ function renderGrid() {
   const entries = pendingChannels.splice(0, loaded).map(ch => [`channel:${ch.id}`, buildChannelRow(ch).outerHTML]);
   reconcileChildren(el.channelGrid, entries);
   setupScrollObserver();
+  renderSelectionCount();
 }
 
 // Append the next batch of channels, then keep the sentinel positioned after them.
@@ -1638,103 +1777,29 @@ function toggleTriState(current, negative, positiveValue = "only", negativeValue
   return current === want ? "" : want;
 }
 
-// ---------- Number scrubbing ----------
-// The filter fields are 44–68px boxes whose native spinner arrows are ~6px of
-// target. So they also take the two gestures people already know from elsewhere:
-// **drag** left/right across the field like a Unity inspector, or **point and
-// scroll** like the old Football Manager spinners. Typing still works — a drag
-// only starts once the pointer has actually moved.
-const SCRUB_PX_PER_STEP = 6;
-
-function setupNumberScrubbing() {
-  const fields = [
-    el.filterMinCount, el.filterMaxCount,
-    el.filterAfterDay, el.filterAfterMonth,
-    el.filterBeforeDay, el.filterBeforeMonth,
-  ];
-  for (const input of fields) enableNumberScrub(input);
-  // The year pickers are <select>s, so scrolling walks their options instead.
-  for (const sel of [el.filterAfterYear, el.filterBeforeYear]) enableSelectWheel(sel);
-}
-
-function numberBounds(input) {
-  return {
-    min: input.min !== "" ? Number(input.min) : -Infinity,
-    max: input.max !== "" ? Number(input.max) : Infinity,
-  };
-}
-
-// Where an empty field starts counting from: its own min, or 0 when unbounded.
-function scrubBase(input) {
-  const { min } = numberBounds(input);
-  return min === -Infinity ? 0 : min;
-}
-
-// Write the value back clamped, and fire `input` so the filter handlers that
-// already listen to typing pick it up — scrubbing isn't a separate code path.
-function setScrubValue(input, value) {
-  const { min, max } = numberBounds(input);
-  const clamped = Math.min(max, Math.max(min, Math.round(value)));
-  if (String(clamped) === input.value) return;
-  input.value = String(clamped);
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-}
-
-function enableNumberScrub(input) {
-  input.classList.add("scrubbable");
-
-  // Hover is enough — no click first. passive:false because the page would
-  // otherwise scroll out from under the cursor as the value changes.
-  input.addEventListener("wheel", (e) => {
-    if (!controls.wheelAdjustsNumbers) return;
-    e.preventDefault();
-    const dir = e.deltaY < 0 ? 1 : -1;
-    // An empty field lands on its base value on the first notch, not base±1.
-    const from = input.value === "" ? scrubBase(input) - dir : Number(input.value);
-    setScrubValue(input, from + dir);
-  }, { passive: false });
-
-  let startX = 0, startValue = 0, dragging = false, moved = false;
-
-  input.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0) return;
-    dragging = true;
-    moved = false;
-    startX = e.clientX;
-    startValue = input.value === "" ? scrubBase(input) : Number(input.value);
-  });
-
-  input.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
-    const steps = Math.round((e.clientX - startX) / SCRUB_PX_PER_STEP);
-    if (!steps && !moved) return; // still a click, not a drag
-    if (!moved) {
-      moved = true;
-      input.classList.add("scrubbing"); // ew-resize cursor + no text selection
-      input.setPointerCapture(e.pointerId); // keep the drag alive outside the box
-    }
-    setScrubValue(input, startValue + steps);
-  });
-
-  const endDrag = (e) => {
-    if (!dragging) return;
-    dragging = false;
-    input.classList.remove("scrubbing");
-    if (input.hasPointerCapture?.(e.pointerId)) input.releasePointerCapture(e.pointerId);
-  };
-  input.addEventListener("pointerup", endDrag);
-  input.addEventListener("pointercancel", endDrag);
-}
-
-function enableSelectWheel(select) {
-  select.addEventListener("wheel", (e) => {
-    if (!controls.wheelAdjustsNumbers) return;
-    e.preventDefault();
-    const next = select.selectedIndex + (e.deltaY < 0 ? -1 : 1);
-    if (next < 0 || next >= select.options.length) return;
-    select.selectedIndex = next;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-  }, { passive: false });
+// ---------- Number fields (§3, §7) ----------
+// The count and DD/MM filter fields are kit NumberFields: no spinner arrows;
+// type, drag sideways, or — with the Controls wheel setting on — point and
+// scroll. The year Selects take the wheel too (one year per notch).
+function setupNumberFields() {
+  const wheel = () => controls.wheelAdjustsNumbers;
+  const count = (input, set) => bindNumberField(input, { min: 0, wheel, onChange: (value) => { set(value); renderGrid(); } });
+  count(el.filterMinCount, (value) => { filterMinCount = value; });
+  count(el.filterMaxCount, (value) => { filterMaxCount = value; });
+  for (const [which, day, month] of [["after", el.filterAfterDay, el.filterAfterMonth], ["before", el.filterBeforeDay, el.filterBeforeMonth]]) {
+    bindNumberField(day, { min: 1, max: 31, wheel, onChange: () => onDateFilterChange(which) });
+    bindNumberField(month, { min: 1, max: 12, wheel, onChange: () => onDateFilterChange(which) });
+    const sel = yearSelects[which];
+    sel.el.addEventListener("wheel", (e) => {
+      if (!wheel()) return;
+      e.preventDefault();
+      const values = sel.options.filter((o) => !o.group).map((o) => o.value);
+      const next = values.indexOf(sel.value) + (e.deltaY < 0 ? -1 : 1);
+      if (next < 0 || next >= values.length) return;
+      sel.value = values[next];
+      onDateFilterChange(which);
+    }, { passive: false });
+  }
 }
 
 // "12 of 240 videos" while something is filtered, "240 videos" when nothing is.
@@ -1757,8 +1822,8 @@ function renderCurrentView() {
 function renderFilterClears() {
   el.searchClear.hidden = !searchQuery.trim();
   el.clearCountBtn.hidden = filterMinCount === null && filterMaxCount === null;
-  el.clearAfterBtn.hidden = !dateFilterSet(el.filterAfterDay, el.filterAfterMonth, el.filterAfterYear);
-  el.clearBeforeBtn.hidden = !dateFilterSet(el.filterBeforeDay, el.filterBeforeMonth, el.filterBeforeYear);
+  el.clearAfterBtn.hidden = !dateFilterSet(el.filterAfterDay, el.filterAfterMonth, yearSelects.after);
+  el.clearBeforeBtn.hidden = !dateFilterSet(el.filterBeforeDay, el.filterBeforeMonth, yearSelects.before);
   el.clearAllFiltersBtn.hidden = !anyFilterActiveInView();
 }
 
@@ -1773,7 +1838,7 @@ function dateFilterSet(dayEl, monthEl, yearEl) {
 function anyFilterActiveInView() {
   if (currentView === "channels") return anyFilterActive();
   const watched = currentView === "watchlater" ? watchLaterWatchedFilter : newWatchedFilter;
-  return !!searchQuery.trim() || watched === "watched";
+  return !!searchQuery.trim() || watched === "watched" || anyKindFilter();
 }
 
 function clearCountFilter() {
@@ -1789,7 +1854,7 @@ function clearDateFilter(which) {
   const after = which === "after";
   (after ? [el.filterAfterDay, el.filterAfterMonth] : [el.filterBeforeDay, el.filterBeforeMonth])
     .forEach((input) => (input.value = ""));
-  (after ? el.filterAfterYear : el.filterBeforeYear).value = "—";
+  yearSelects[which].value = YEAR_NONE;
   if (after) filterAfterDate = null;
   else filterBeforeDate = null;
   renderGrid();
@@ -1834,14 +1899,16 @@ function clearAllFilters() {
   el.filterMaxCount.value = "";
   el.filterAfterDay.value = "";
   el.filterAfterMonth.value = "";
-  el.filterAfterYear.value = "—";
+  yearSelects.after.value = YEAR_NONE;
   el.filterBeforeDay.value = "";
   el.filterBeforeMonth.value = "";
-  el.filterBeforeYear.value = "—";
+  yearSelects.before.value = YEAR_NONE;
   // "Clear" means nothing is hidden — including the watched chip, even though
   // it *starts* on "unwatched" when the dashboard opens.
   newWatchedFilter = "";
   watchLaterWatchedFilter = "";
+  activeKindFilters.clear();
+  excludedKindFilters.clear();
   render();
 }
 
@@ -1977,68 +2044,268 @@ function updateSortHeaders() {
 
 function buildChannelRow(ch) {
   const row = document.createElement("div");
-  row.className = "channel-row";
-  if (selectedChannelIds.has(ch.id)) row.classList.add("selected");
+  row.className = "channel-row ui-row";
+  if (channelSel.has(ch.id)) row.classList.add("selected");
   row.dataset.channelId = ch.id;
   row.dataset.renderKey = `channel:${ch.id}`;
+  row.draggable = true;
 
+  const flag = (role, key, label, title) =>
+    `<button type="button" class="chip flag flag-${role === "toggle-track" ? "track" : key}${ch[key] ? " on" : ""}" data-role="${role}" aria-pressed="${!!ch[key]}" title="${title}"><span class="chip-label">${label}</span></button>`;
   row.innerHTML = `
     <div class="channel-head">
       ${thumbHtml(ch)}
       <div class="channel-name-wrap">
-        <a class="channel-name" href="https://www.youtube.com/channel/${encodeURIComponent(ch.id)}/videos" target="_blank" rel="noopener noreferrer" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</a>
+        <a class="channel-name" href="https://www.youtube.com/channel/${encodeURIComponent(ch.id)}/videos" target="_blank" rel="noopener noreferrer" draggable="false" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</a>
         <div class="channel-handle">${escapeHtml(ch.handle || ch.id)}</div>
       </div>
     </div>
-    <div class="row-date ${dateAgeClass(ch.lastVideoDate)}" title="${escapeHtml(formatDateTime(ch.lastVideoDate))}"><span class="date-long">${formatShortDate(ch.lastVideoDate)}</span><span class="date-short">${formatNumericDate(ch.lastVideoDate)}</span></div>
-    <div class="row-count">${ch.videoCount ?? "—"}</div>
+    ${dateCellHtml(ch.lastVideoDate, { colored: true, className: "row-date" })}
+    <div class="row-count">${ch.videoCount != null ? ch.videoCount.toLocaleString() : "—"}</div>
     <div class="row-subs" title="${escapeHtml(subscriberTitle(ch.subscriberCount))}">${formatSubscribers(ch.subscriberCount)}</div>
     <div class="channel-tags channel-vars">
-      <select class="var-lang${ch.language ? " has-lang" : ""}" data-role="set-language" title="Language"${ch.language ? ` style="border-color:${langColor(ch.language)};color:${langColor(ch.language)}"` : ""}>
-        ${languageOptionsHtml(ch)}
-      </select>
-      <button type="button" class="tag-chip var-toggle${ch.active ? " on-active" : ""}" data-role="toggle-active" aria-pressed="${!!ch.active}" title="Active — flag channels you're following">Active</button>
-      <button type="button" class="tag-chip var-toggle${ch.finished ? " on-finished" : ""}" data-role="toggle-finished" aria-pressed="${!!ch.finished}" title="Finished — flag channels you consider done">Finished</button>
-      <button type="button" class="tag-chip var-toggle${ch.trackVideos ? " on-track" : ""}" data-role="toggle-track" aria-pressed="${!!ch.trackVideos}" title="Track — pull this channel's new uploads into the Videos feed">Track</button>
+      ${languageButtonHtml(ch)}
+      ${flag("toggle-active", "active", "Active", "Active — flag channels you're following")}
+      ${flag("toggle-finished", "finished", "Finished", "Finished — flag channels you consider done")}
+      ${flag("toggle-track", "trackVideos", "Track", "Track — pull this channel's new uploads into the New feed")}
       ${tagChipsHtml(ch)}
-      <button type="button" class="tag-chip add-tag" data-role="add-tag">+ tag</button>
+      <button type="button" class="chip add" data-role="add-tag" aria-haspopup="menu">+ tag</button>
     </div>
     <div class="channel-controls">
-      <select class="folder-select" data-role="move-folder" aria-label="Folder for ${escapeHtml(ch.name)}">${folderOptionsHtml(ch)}</select>
+      ${selectButtonHtml({ label: folderLabel(ch.folderId), className: "folder-select", attrs: `data-role="move-folder" aria-label="Folder for ${escapeHtml(ch.name)}"` })}
     </div>
   `;
   return row;
 }
 
-// Flip one of the three per-channel flags (active / finished / trackVideos).
-// The row's chips and the right-click menu both land here, so the one thing
+// ---------- Channel edits (selection-aware, each one undoable — §5, §9) ----------
+
+const plural = (n, one, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+// "“Veritasium”" for one channel, "3 channels" for several — the undo toasts.
+const channelsNoun = (ids) => ids.length === 1 ? `“${state.channels[ids[0]]?.name || "channel"}”` : plural(ids.length, "channel");
+
+// Inline edits on a selected row apply to the whole selection.
+const rowTargets = (id) => channelSel.targetsFor(id);
+
+// Apply `mutate` to each channel, repaint at once, then persist as one
+// undoable edit. Bulk edits keep the selection (so edits can be chained) —
+// only rows the edit took out of the view leave it.
+async function editChannels(ids, mutate, undo) {
+  const list = ids.map((id) => state.channels[id]).filter(Boolean);
+  if (!list.length) return;
+  list.forEach(mutate);
+  render();
+  pruneChannelSelection();
+  await persistLibrary({ channels: state.channels }, { undo });
+}
+
+function pruneChannelSelection() {
+  if (!channelSel.size) return;
+  const visible = new Set(getFilteredChannels().map((c) => c.id));
+  const kept = [...channelSel.ids].filter((id) => visible.has(id));
+  if (kept.length !== channelSel.size) channelSel.set(kept, visible.has(channelSel.anchor) ? channelSel.anchor : null);
+}
+
+const FLAG_WORDS = { active: ["active", "inactive"], finished: ["finished", "unfinished"], trackVideos: ["tracked", "untracked"] };
+
+// Set one of the three per-channel flags (active / finished / trackVideos).
+// Row chips, the single menu and the bulk menu all land here, so the one thing
 // that isn't just a boolean — turning Track on has to fetch that channel's
-// uploads right away, or the feed stays empty until the next scheduled refresh
-// — can't be implemented in one place and forgotten in the other. The UI
-// repaints off the storage write, via the onChanged listener in init().
-async function toggleChannelFlag(channelId, key) {
-  const ch = state.channels[channelId];
-  if (!ch) return;
-  ch[key] = !ch[key];
-  await persistLibrary({ channels: state.channels });
-  if (key === "trackVideos" && ch.trackVideos) {
-    chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId });
+// uploads right away, or the feed stays empty until the next refresh — can't
+// be implemented in one place and forgotten in another.
+async function setChannelFlag(ids, key, value) {
+  const changed = ids.filter((id) => state.channels[id] && !!state.channels[id][key] !== value);
+  if (!changed.length) return;
+  await editChannels(changed, (ch) => { ch[key] = value; }, `Marked ${channelsNoun(changed)} ${FLAG_WORDS[key][value ? 0 : 1]}.`);
+  if (key === "trackVideos" && value) {
+    if (changed.length === 1) chrome.runtime.sendMessage({ type: "REFRESH_SINGLE", channelId: changed[0] });
+    else requestWorker("REFRESH_STATS", { channelIds: changed });
   }
 }
 
-function thumbHtml(ch) {
-  return ch.thumbnail
-    ? `<img class="channel-thumb" src="${escapeHtml(ch.thumbnail)}" alt="" />`
-    : `<div class="channel-thumb"></div>`;
+async function moveChannels(ids, folderId) {
+  const moving = ids.filter((id) => state.channels[id] && (state.channels[id].folderId || "unsorted") !== folderId);
+  if (!moving.length || !state.folders[folderId]) return;
+  await editChannels(moving, (ch) => { ch.folderId = folderId; }, `Moved ${channelsNoun(moving)} to ${folderLabel(folderId)}.`);
 }
 
-function folderOptionsHtml(ch) {
-  // pendingFolderOptions holds the {id, label} for each leaf folder, built once
-  // per render in renderGrid(); only the per-row `selected` choice differs here.
-  return pendingFolderOptions
-    .map(({ id, label }) =>
-      `<option value="${id}" ${ch.folderId === id ? "selected" : ""}>${label}</option>`
-    )
+async function setChannelLanguage(ids, lang) {
+  const language = lang || null;
+  const changing = ids.filter((id) => state.channels[id] && (state.channels[id].language || null) !== language);
+  if (!changing.length) return;
+  await editChannels(changing, (ch) => { ch.language = language; },
+    language ? `Set ${channelsNoun(changing)} to ${langName(language)}.` : `Cleared the language of ${channelsNoun(changing)}.`);
+}
+
+async function setChannelTag(ids, tagId, on) {
+  const tag = state.tags[tagId];
+  const changing = ids.filter((id) => state.channels[id] && !!state.channels[id].tags?.includes(tagId) !== on);
+  if (!tag || !changing.length) return;
+  await editChannels(changing, (ch) => {
+    ch.tags = on ? [...(ch.tags || []), tagId] : (ch.tags || []).filter((t) => t !== tagId);
+  }, on ? `Tagged ${channelsNoun(changing)} “${tag.name}”.` : `Removed “${tag.name}” from ${channelsNoun(changing)}.`);
+}
+
+// An existing tag by name (case-insensitive), else a new one. Mutates
+// state.tags only; the caller persists it with whatever uses it.
+function ensureTag(name) {
+  const existing = Object.keys(state.tags).find((id) => state.tags[id].name.toLowerCase() === name.toLowerCase());
+  if (existing) return existing;
+  const id = slugify(name) + "-" + Date.now().toString(36).slice(-3);
+  state.tags[id] = { name, color: nextTagColor() };
+  return id;
+}
+
+async function createTagOn(ids, name) {
+  const created = !Object.values(state.tags).some((t) => t.name.toLowerCase() === name.toLowerCase());
+  const tagId = ensureTag(name);
+  for (const id of ids) {
+    const ch = state.channels[id];
+    if (ch && !ch.tags?.includes(tagId)) ch.tags = [...(ch.tags || []), tagId];
+  }
+  render();
+  await persistLibrary({ tags: state.tags, channels: state.channels },
+    { undo: created ? `Created tag “${name}”.` : `Tagged ${channelsNoun(ids)} “${state.tags[tagId].name}”.` });
+}
+
+async function deleteChannels(ids) {
+  const list = ids.filter((id) => state.channels[id]);
+  if (!list.length) return;
+  const ok = await confirmDialog({
+    title: list.length === 1 ? `Delete “${state.channels[list[0]].name}”?` : `Delete ${plural(list.length, "channel")}?`,
+    text: `${list.length === 1 ? "It leaves" : "They leave"} MyTube along with folder and tags. A new scan would add ${list.length === 1 ? "it" : "them"} back while you're still subscribed. Undo is available right after.`,
+    okLabel: "Delete", danger: true,
+  });
+  if (!ok) return;
+  const label = `Deleted ${channelsNoun(list)}.`;
+  for (const id of list) delete state.channels[id];
+  channelSel.set([...channelSel.ids].filter((id) => state.channels[id]), null);
+  render();
+  await persistLibrary({ channels: state.channels }, { undo: label });
+}
+
+function openChannel(id, background = false) {
+  chrome.tabs.create({ url: `https://www.youtube.com/channel/${encodeURIComponent(id)}/videos`, active: !background });
+}
+
+// ---------- Tag popover (§5) ----------
+
+// "+ tag" on a row (or Tags… in its menu): every tag, ✓ when all targets have
+// it; a click toggles it on all of them and the popover stays open. The
+// "+ New tag (Enter)" field is always there and focused; × deletes a tag
+// everywhere (after a confirm).
+function openTagPopover(ids, at) {
+  // Anchor to a point: a toggle re-renders the row, replacing the "+ tag"
+  // button the popover would otherwise be measured against.
+  if (at instanceof Element) { const r = at.getBoundingClientRect(); at = { x: r.left, y: r.bottom + 4 }; }
+  const pop = document.createElement("div");
+  pop.className = "tag-popover";
+  pop.setAttribute("role", "menu");
+  pop.setAttribute("aria-label", "Tags");
+  const paint = () => {
+    const channels = ids.map((id) => state.channels[id]).filter(Boolean);
+    const tags = Object.entries(state.tags).sort((a, b) => a[1].name.localeCompare(b[1].name));
+    pop.innerHTML = `${ids.length > 1 ? `<div class="ui-menu-title">${escapeHtml(plural(ids.length, "channel"))}</div>` : ""}
+      ${tags.map(([id, t]) => {
+        const all = channels.length > 0 && channels.every((c) => c.tags?.includes(id));
+        return `<div class="ui-menu-item" role="menuitemcheckbox" tabindex="0" aria-checked="${all}" data-tag="${escapeHtml(id)}">
+          <span class="check">${all ? "✓" : ""}</span><span class="dot" style="background:${escapeHtml(t.color)}"></span>
+          <span class="grow">${escapeHtml(t.name)}</span><button type="button" class="tag-pop-x" data-delete="${escapeHtml(id)}" title="Delete tag everywhere" aria-label="Delete tag ${escapeHtml(t.name)}">×</button></div>`;
+      }).join("") || '<div class="tag-pop-empty">No tags yet</div>'}
+      <div class="ui-menu-sep"></div>
+      <input class="input" data-role="new-tag" type="text" autocomplete="off" placeholder="+ New tag (Enter)" aria-label="New tag" />`;
+  };
+  paint();
+  const popover = openPopover(at, pop);
+  const focusField = () => pop.querySelector('[data-role="new-tag"]').focus();
+  focusField();
+  pop.addEventListener("click", async (e) => {
+    const del = e.target.closest("[data-delete]");
+    if (del) { popover.close(); await deleteTag(del.dataset.delete); return; }
+    const item = e.target.closest("[data-tag]");
+    if (!item) return;
+    await setChannelTag(ids, item.dataset.tag, item.getAttribute("aria-checked") !== "true");
+    paint();
+    popover.place();
+    pop.querySelector(`[data-tag="${CSS.escape(item.dataset.tag)}"]`)?.focus();
+  });
+  pop.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter" && e.target.dataset.role === "new-tag") {
+      e.preventDefault();
+      const name = e.target.value.trim();
+      if (!name) return;
+      await createTagOn(ids, name);
+      paint();
+      popover.place();
+      focusField();
+    } else if ((e.key === "Enter" || e.key === " ") && e.target.dataset.tag) {
+      e.preventDefault();
+      e.target.click();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const items = [...pop.querySelectorAll("[data-tag], [data-role=\"new-tag\"]")];
+      const i = items.indexOf(document.activeElement);
+      items[(i + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+      e.preventDefault();
+    }
+  });
+}
+
+// 40px avatar; a missing (or broken — see the image error handler) photo
+// shows a circle with the first letter (§5).
+function thumbHtml(ch) {
+  const letter = escapeHtml(([...String(ch.name || "?")][0] || "?").toUpperCase());
+  return ch.thumbnail
+    ? `<img class="channel-thumb ui-avatar" src="${escapeHtml(ch.thumbnail)}" alt="" loading="lazy" draggable="false" data-letter="${letter}" />`
+    : avatarHtml(null, ch.name, "channel-thumb ui-avatar");
+}
+
+// "📚 Science" — a folder as the row's Select and the menus show it.
+function folderLabel(folderId, folders = state.folders) {
+  const f = folders[folderId || "unsorted"];
+  if (!f) return "Unfiled";
+  return `${f.emoji ? `${f.emoji} ` : ""}${f.name}`;
+}
+
+// Every folder an item may live in (§5, §11): groups hold no items, so a group
+// appears only as a heading over its indented children. `folders` defaults to
+// the channel folders; pass state.videoFolders for Watch Later lists.
+function folderListboxOptions(folders = state.folders) {
+  const options = [];
+  for (const [id, f] of getTopLevelFoldersOrdered(folders)) {
+    const children = getChildFolderIds(id, folders).sort((a, b) => (folders[a].order ?? 0) - (folders[b].order ?? 0));
+    if (!children.length) { options.push({ value: id, label: folderLabel(id, folders) }); continue; }
+    options.push({ group: folderLabel(id, folders) });
+    for (const cid of children) options.push({ value: cid, label: folderLabel(cid, folders), indent: true });
+  }
+  return options;
+}
+
+// The Variables cell's language Select: flag + name, the language color on its
+// border/text when set; an assignment no longer active reads "Inactive".
+function languageButtonHtml(ch) {
+  const current = canonicalLanguage(ch.language);
+  const active = LANGUAGES.includes(current);
+  const color = active ? langColor(current) : "";
+  return selectButtonHtml({
+    label: active ? langLabel(current) : current ? "Inactive" : "",
+    placeholder: "lang…", className: `var-lang pill${active ? " has-lang" : ""}`, color,
+    attrs: `data-role="set-language" aria-label="Language"`, title: current && !active ? `${langName(current)} (inactive)` : "Language",
+  });
+}
+
+function languageListboxOptions() {
+  return [
+    { value: "", label: "— none —" },
+    ...LANGUAGES.map((language) => ({ value: language, label: langLabel(language), color: langColor(language) })),
+  ];
+}
+
+// Row tag chips (§5): neutral, the tag's color as a dot; a click removes it.
+function tagChipsHtml(ch) {
+  return (ch.tags || [])
+    .map((tid) => [tid, state.tags[tid]])
+    .filter(([, t]) => t)
+    .map(([tid, t]) => `<button type="button" class="chip row-tag" data-role="remove-tag" data-tag-id="${escapeHtml(tid)}" title="Remove"><span class="dot" style="background:${escapeHtml(t.color)}"></span><span class="chip-label">${escapeHtml(t.name)}</span></button>`)
     .join("");
 }
 
@@ -2070,49 +2337,7 @@ function buildOrderedFolderList() {
   return result;
 }
 
-function languageOptionsHtml(ch) {
-  const current = canonicalLanguage(ch.language);
-  const active = LANGUAGES.includes(current);
-  return `<option value="" ${active ? "" : "selected"}>${current && !active ? "Inactive" : "lang…"}</option>` +
-    LANGUAGES.map(language => `<option value="${escapeHtml(language)}" ${language === current ? "selected" : ""}>${escapeHtml(langLabel(language))}</option>`).join("");
-}
-
-function tagChipsHtml(ch) {
-  return (ch.tags || [])
-    .map((tid) => state.tags[tid])
-    .filter(Boolean)
-    .map(
-      (t) =>
-        `<span class="tag-chip" style="border-color:${t.color};color:${t.color}" data-role="remove-tag" data-tag-name="${escapeHtml(t.name)}">${escapeHtml(t.name)} ×</span>`
-    )
-    .join("");
-}
-
 // ---------- Helpers ----------
-
-// Recency bucket for the Last Video cell, as a CSS class. Everything is measured
-// against *today*, never a fixed year, so the buckets keep sliding forward on
-// their own: this month and last month are "current", then it's calendar-year
-// distance — this year, the two years before it, the two before those, and
-// everything older. An unknown date gets no class and stays the plain text color
-// (missing ≠ ancient).
-function dateAgeClass(iso) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d)) return "";
-  const now = new Date();
-
-  // Whole months between the two month-starts: 0 = this month, 1 = last month.
-  // Future dates (a scheduled premiere) come out negative and count as current.
-  const monthsAgo = (now.getFullYear() - d.getFullYear()) * 12 + (now.getMonth() - d.getMonth());
-  if (monthsAgo <= 1) return "date-age-current";
-
-  const yearsAgo = now.getFullYear() - d.getFullYear();
-  if (yearsAgo <= 0) return "date-age-year";   // earlier this year
-  if (yearsAgo <= 2) return "date-age-recent"; // the previous two years
-  if (yearsAgo <= 4) return "date-age-old";    // the two before those
-  return "date-age-stale";
-}
 
 function formatShortDate(iso) {
   if (!iso) return "—";
@@ -2120,27 +2345,6 @@ function formatShortDate(iso) {
   if (isNaN(date)) return "—";
   return date.toLocaleDateString(undefined, {
     year: "numeric", month: "short", day: "numeric",
-  });
-}
-
-// Compact all-numeric date for a narrow date column, e.g. "06/07/07"
-// (day/month/year, two digits each). Mirrors formatShortDate's "—" for empty.
-function formatNumericDate(iso) {
-  if (!iso) return "—";
-  const date = new Date(iso);
-  if (isNaN(date)) return "—";
-  const p2 = (n) => String(n).padStart(2, "0");
-  return `${p2(date.getDate())}/${p2(date.getMonth() + 1)}/${p2(date.getFullYear() % 100)}`;
-}
-
-// Full date + time for tooltips, e.g. "Jul 3, 2026, 2:15 PM"
-function formatDateTime(iso) {
-  if (!iso) return "Unknown";
-  const date = new Date(iso);
-  if (isNaN(date)) return "Unknown";
-  return date.toLocaleString(undefined, {
-    year: "numeric", month: "short", day: "numeric",
-    hour: "numeric", minute: "2-digit",
   });
 }
 
@@ -2197,6 +2401,7 @@ async function catchUpOnOpen() {
 async function runRefresh(channelIds) {
   if (refreshRunning) return;
   refreshRunning = true;
+  jobResult = null;
   el.refreshBtn.disabled = el.retryRefreshBtn.disabled = true;
   el.statusText.textContent = 'Refreshing…';
   try {
@@ -2206,12 +2411,52 @@ async function runRefresh(channelIds) {
     el.retryRefreshBtn.hidden = !failedRefreshIds.length;
     el.refreshErrors.hidden = !failures.length;
     el.refreshErrors.innerHTML = failures.length ? `<summary>${failures.length} refresh failure${failures.length === 1 ? '' : 's'}</summary><ul>${failures.map(f => `<li>${escapeHtml(f.name)}: ${escapeHtml(f.error)}</li>`).join('')}</ul>` : '';
-    el.statusText.textContent = failures.length ? `Updated with ${failures.length} failed request${failures.length === 1 ? '' : 's'}. Retry failed channels below.`
+    el.statusText.textContent = res.cancelled ? 'Refresh stopped. Channels already read were updated.'
+      : failures.length ? `Updated with ${failures.length} failed request${failures.length === 1 ? '' : 's'}. Retry failed channels below.`
       : res.ok ? `Updated ${new Date().toLocaleTimeString()}.${res.hasApiKey ? '' : ' Counts and durations need an API key.'}`
       : res.error || res.lastError || 'Refresh failed. Try again.';
+    if ((res.queried || 0) > 1) setJobResult(res.cancelled ? 'Stopped' : `Done${failures.length ? ` · ${failures.length} failed` : ''}`, failures.length > 0);
   } finally {
     refreshRunning = false;
     el.refreshBtn.disabled = el.retryRefreshBtn.disabled = false;
+  }
+}
+
+// ---------- Progress box (§4) ----------
+// While the worker runs a refresh or a video fetch over several channels it
+// mirrors `jobProgress` ({ kind, done, total, startedAt }); the box under
+// Refresh Stats shows it with Stop (CANCEL_JOB — the job stops at its next
+// step and keeps what it already read). When a job this page started ends, the
+// box shows its result with × to dismiss; failures are listed under the topbar.
+let jobResult = null; // { text, failed } once a job this page started finished
+
+function setJobResult(text, failed = false) {
+  jobResult = { text, failed };
+  renderJobStatus();
+}
+
+function renderJobStatus() {
+  const job = state.jobProgress;
+  const box = el.jobStatus;
+  if (job) {
+    const left = Math.max(0, job.total - job.done);
+    const elapsed = Date.now() - (job.startedAt || Date.now());
+    const eta = job.done > 0 ? Math.ceil((elapsed / job.done) * left / 60000) : 0;
+    el.jobStatusText.textContent = `${job.kind === 'fetch' ? 'Fetching videos' : 'Refreshing'} ${job.done}/${job.total}${eta ? ` · ~${eta} min` : ''}`;
+    el.jobStopBtn.textContent = 'Stop';
+    el.jobStopBtn.title = job.kind === 'fetch' ? 'Stop fetching videos' : 'Stop the refresh';
+    el.jobStopBtn.setAttribute('aria-label', el.jobStopBtn.title);
+    box.classList.remove('paused');
+    box.hidden = false;
+  } else if (jobResult) {
+    el.jobStatusText.textContent = jobResult.text;
+    el.jobStopBtn.textContent = '×';
+    el.jobStopBtn.title = 'Dismiss';
+    el.jobStopBtn.setAttribute('aria-label', 'Dismiss');
+    box.classList.toggle('paused', !!jobResult.failed);
+    box.hidden = false;
+  } else {
+    box.hidden = true;
   }
 }
 
@@ -2357,7 +2602,7 @@ async function checkRemoteChangesOnOpen() {
 }
 
 function anyReviewOpen() {
-  return !el.scanDiffModal.hidden || !el.playlistImportModal.hidden || !el.syncDiffModal.hidden;
+  return el.scanDiffModal.open || el.playlistImportModal.open || el.syncDiffModal.open;
 }
 
 function renderSyncStatus() {
@@ -2400,7 +2645,8 @@ function openScanDiffModal(scan) {
   el.scanDiffBody.appendChild(buildDiffSection("Not seen in this scan", "del", removed, true));
 
   el.scanDiffApply.disabled = added.length === 0 && modified.length === 0 && removed.length === 0;
-  el.scanDiffModal.hidden = false;
+  openDialog(el.scanDiffModal);
+  renderReviewBanner();
 }
 
 // ---------- Playlist import review dialog ----------
@@ -2436,7 +2682,8 @@ function openPlaylistImportModal(pending) {
   el.playlistImportBody.appendChild(buildPlaylistSection("Already in Watch Later — tick to move here", "mod", dupes, true));
 
   el.playlistImportApply.disabled = vids.length === 0;
-  el.playlistImportModal.hidden = false;
+  openDialog(el.playlistImportModal);
+  renderReviewBanner();
 }
 
 // One section of the import review. `movable` rows carry a "move into this list"
@@ -2467,7 +2714,7 @@ function buildPlaylistSection(title, kind, items, movable) {
     const row = document.createElement(movable ? "label" : "div");
     row.className = "scan-diff-row";
     row.innerHTML = movable
-      ? `<input type="checkbox" data-move-id="${escapeHtml(it.id)}" />${text}`
+      ? `<input class="ui-check" type="checkbox" data-move-id="${escapeHtml(it.id)}" />${text}`
       : text;
     list.appendChild(row);
   }
@@ -2556,7 +2803,7 @@ function openSyncDiffModal(diff, { keepChoices = false } = {}) {
 
   el.syncDiffApply.textContent = isUpload ? "Apply upload" : "Apply download";
   el.syncDiffApply.disabled = totalChanges === 0;
-  el.syncDiffModal.hidden = false;
+  openDialog(el.syncDiffModal);
 }
 
 // Only the keys in SYNC_SETTING_KEYS reach this section — view preferences
@@ -2667,7 +2914,7 @@ function buildSyncVideoSection(title, vids, dest) {
   details.appendChild(summary);
   const all = document.createElement('label');
   all.className = 'scan-diff-row scan-diff-selectall';
-  all.innerHTML = `<input type="checkbox" data-role="select-all-videos" ${!syncSkipAllVideos && !syncSkipVideoIds.size ? 'checked' : ''} /> Apply video changes — uncheck to keep all videos unchanged ${escapeHtml(dest)}`;
+  all.innerHTML = `<input class="ui-check" type="checkbox" data-role="select-all-videos" ${!syncSkipAllVideos && !syncSkipVideoIds.size ? 'checked' : ''} /> Apply video changes — uncheck to keep all videos unchanged ${escapeHtml(dest)}`;
   details.appendChild(all);
   all.querySelector('input').indeterminate = !syncSkipAllVideos && syncSkipVideoIds.size > 0;
   const list = document.createElement('div');
@@ -2682,7 +2929,7 @@ function buildSyncVideoSection(title, vids, dest) {
     for (const item of items.slice(shown, shown + 100)) {
       const row = document.createElement('label');
       row.className = 'scan-diff-row';
-      row.innerHTML = `<input type="checkbox" data-video-id="${escapeHtml(item.id)}" ${!syncSkipAllVideos && !syncSkipVideoIds.has(item.id) ? 'checked' : ''} /><span class="scan-diff-text"><b>${escapeHtml(item.title)}</b><span class="scan-diff-sub">${escapeHtml([item.author, describeVideoChange(item)].filter(Boolean).join(' · '))}</span></span>`;
+      row.innerHTML = `<input class="ui-check" type="checkbox" data-video-id="${escapeHtml(item.id)}" ${!syncSkipAllVideos && !syncSkipVideoIds.has(item.id) ? 'checked' : ''} /><span class="scan-diff-text"><b>${escapeHtml(item.title)}</b><span class="scan-diff-sub">${escapeHtml([item.author, describeVideoChange(item)].filter(Boolean).join(' · '))}</span></span>`;
       fragment.appendChild(row);
     }
     list.appendChild(fragment);
@@ -2748,7 +2995,7 @@ function buildDiffSection(title, kind, items, checkable, defaultChecked = false)
     const all = document.createElement("label");
     all.className = "scan-diff-row scan-diff-selectall";
     all.innerHTML =
-      `<input type="checkbox" data-role="select-all-removals"${defaultChecked ? " checked" : ""} /> <span>Select all for removal</span>`;
+      `<input class="ui-check" type="checkbox" data-role="select-all-removals"${defaultChecked ? " checked" : ""} /> <span>Select all for removal</span>`;
     sec.appendChild(all);
   }
 
@@ -2766,7 +3013,7 @@ function buildDiffSection(title, kind, items, checkable, defaultChecked = false)
     row.className = "scan-diff-row scan-diff-row-link";
     if (it.id) row.dataset.channelId = it.id;
     row.innerHTML = checkable
-      ? `<input type="checkbox" data-remove-id="${escapeHtml(it.id)}"${defaultChecked ? " checked" : ""} />${text}`
+      ? `<input class="ui-check" type="checkbox" data-remove-id="${escapeHtml(it.id)}"${defaultChecked ? " checked" : ""} />${text}`
       : text;
     list.appendChild(row);
   }
@@ -2779,11 +3026,16 @@ function buildDiffSection(title, kind, items, checkable, defaultChecked = false)
 function bindEvents() {
   bindRecoveryControls();
   bindKeyboardControls();
+  bindDialogs();
+  bindSelectionControls();
+  // A broken avatar becomes the first-letter circle (§5).
   document.addEventListener('error', event => {
     const image = event.target;
-    if (!(image instanceof HTMLImageElement)) return;
+    if (!(image instanceof HTMLImageElement) || !image.classList.contains('ui-avatar')) return;
     const fallback = document.createElement('span');
-    fallback.className = image.classList.contains('channel-thumb') ? 'channel-thumb' : 'vc-avatar-fallback';
+    fallback.className = image.className;
+    fallback.setAttribute('aria-hidden', 'true');
+    fallback.textContent = image.dataset.letter || '?';
     image.replaceWith(fallback);
   }, true);
   el.viewRemovedBtn.addEventListener('click', () => setView('removed'));
@@ -2795,6 +3047,8 @@ function bindEvents() {
     if (event.target.matches('.folder-item') && ['Enter', ' '].includes(event.key)) { event.preventDefault(); event.target.click(); }
   });
 
+  // A group only opens/closes; any other entry selects it. Changing folder
+  // clears the chip filters and the selection (§6, §7).
   el.folderList.addEventListener("click", (e) => {
     const li = e.target.closest(".folder-item");
     if (!li) return;
@@ -2806,17 +3060,29 @@ function bindEvents() {
       renderFolders();
       return;
     }
+    if (d.selected === li.dataset.folderId) return;
     d.select(li.dataset.folderId);
     if (currentView !== "watchlater") resetVariableFilters(); // channel filters are per-folder-view
+    channelSel.clear();
+    videoSel.clear();
     render();
   });
 
-  // Folder drag-and-drop (custom sort only), delegated on the list so the
-  // per-render innerHTML rebuild doesn't re-attach listeners on every row.
+  // Drag and drop onto the sidebar (§10), delegated on the list so the
+  // per-render rebuild doesn't re-attach listeners:
+  //  - channel rows (or the selection they're part of) onto a real folder that
+  //    can hold channels — not All/Filed, not a group;
+  //  - folders onto folders (Custom sort only): zones 25/50/25 → before /
+  //    into / after. An invalid nesting still shows where it would land and is
+  //    refused on drop.
   let folderDragSrcId = null;
-  const clearFolderDragIndicators = () => {
-    el.folderList.querySelectorAll(".folder-item").forEach((x) =>
-      x.classList.remove("drag-over", "drag-before", "drag-after"));
+  const clearDropMarks = () => {
+    el.folderList.querySelectorAll(".drop-into, .drop-before, .drop-after").forEach((x) =>
+      x.classList.remove("drop-into", "drop-before", "drop-after"));
+  };
+  const rowDropTarget = (li) => {
+    const id = li.dataset.folderId;
+    return currentView === "channels" && state.folders[id] && !folderHasChildren(id, state.folders) ? id : null;
   };
 
   el.folderList.addEventListener("dragstart", (e) => {
@@ -2830,41 +3096,72 @@ function bindEvents() {
   });
 
   el.folderList.addEventListener("dragend", (e) => {
-    const li = e.target.closest(".folder-item");
-    if (li) li.classList.remove("dragging");
-    clearFolderDragIndicators();
+    e.target.closest(".folder-item")?.classList.remove("dragging");
+    clearDropMarks();
     folderDragSrcId = null;
   });
 
   el.folderList.addEventListener("dragover", (e) => {
-    if (!folderDragSrcId) return;
     const li = e.target.closest(".folder-item");
+    clearDropMarks();
     if (!li) return;
+    if (e.dataTransfer.types.includes(CHANNEL_DRAG_TYPE)) {
+      if (!rowDropTarget(li)) return; // no preventDefault: the drop is refused
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      li.classList.add("drop-into");
+      return;
+    }
+    if (!folderDragSrcId) return;
     const intent = computeFolderDropIntent(folderDragSrcId, li.dataset.folderId, e.clientY, li);
-    if (!intent) return; // invalid target — no preventDefault, so the drop is refused
+    if (!intent) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    clearFolderDragIndicators();
-    li.classList.add(
-      intent.type === "inside" ? "drag-over" :
-      intent.type === "before" ? "drag-before" : "drag-after"
-    );
+    li.classList.add(`drop-${intent.zone}`);
   });
 
   el.folderList.addEventListener("dragleave", (e) => {
-    const li = e.target.closest(".folder-item");
-    if (li) li.classList.remove("drag-over", "drag-before", "drag-after");
+    if (!el.folderList.contains(e.relatedTarget)) clearDropMarks();
   });
 
   el.folderList.addEventListener("drop", (e) => {
-    if (!folderDragSrcId) return;
     const li = e.target.closest(".folder-item");
+    clearDropMarks();
     if (!li) return;
+    const rows = e.dataTransfer.getData(CHANNEL_DRAG_TYPE);
+    if (rows) {
+      const folderId = rowDropTarget(li);
+      if (!folderId) return;
+      e.preventDefault();
+      moveChannels(JSON.parse(rows), folderId);
+      return;
+    }
+    if (!folderDragSrcId) return;
     const intent = computeFolderDropIntent(folderDragSrcId, li.dataset.folderId, e.clientY, li);
-    clearFolderDragIndicators();
     if (!intent) return;
     e.preventDefault();
+    if (!intent.valid) { toast("Only one level of nesting.", { error: true }); return; }
     performFolderDrop(folderDragSrcId, li.dataset.folderId, intent);
+  });
+
+  // Rows drag onto folders: the row, or the whole selection it's part of.
+  el.channelGrid.addEventListener("dragstart", (e) => {
+    const row = e.target.closest(".channel-row");
+    if (!row) return;
+    const ids = rowTargets(row.dataset.channelId);
+    e.dataTransfer.setData(CHANNEL_DRAG_TYPE, JSON.stringify(ids));
+    e.dataTransfer.effectAllowed = "move";
+    const ghost = document.createElement("div");
+    ghost.className = "drag-ghost";
+    ghost.textContent = ids.length > 1 ? plural(ids.length, "channel") : state.channels[ids[0]]?.name || "1 channel";
+    document.body.appendChild(ghost);
+    e.dataTransfer.setDragImage(ghost, 12, 12);
+    setTimeout(() => ghost.remove(), 0);
+    closeFloating();
+    for (const id of ids) el.channelGrid.querySelector(`[data-channel-id="${CSS.escape(id)}"]`)?.classList.add("dragging");
+  });
+  el.channelGrid.addEventListener("dragend", () => {
+    el.channelGrid.querySelectorAll(".channel-row.dragging").forEach((row) => row.classList.remove("dragging"));
   });
 
   // One entry point for both mouse buttons: `negative` is what right-clicking
@@ -2936,14 +3233,19 @@ function bindEvents() {
     }
     renderActiveVideoView();
   };
-  el.videoFilters.addEventListener("click", (e) => {
-    if (e.target.dataset.role !== "filter-unwatched") return;
-    toggleWatchedChip(false);
-  });
+  const activateVideoChip = (target, negative) => {
+    target = target.closest("[data-role]");
+    const role = target?.dataset.role;
+    if (role === "filter-unwatched") toggleWatchedChip(negative);
+    else if (role === "filter-kind") {
+      toggleChipFilter(activeKindFilters, excludedKindFilters, target.dataset.kind, negative);
+      renderActiveVideoView();
+    } else return false;
+    return true;
+  };
+  el.videoFilters.addEventListener("click", (e) => activateVideoChip(e.target, false));
   el.videoFilters.addEventListener("contextmenu", (e) => {
-    if (e.target.dataset.role !== "filter-unwatched") return;
-    e.preventDefault();
-    toggleWatchedChip(true);
+    if (activateVideoChip(e.target, true)) e.preventDefault();
   });
 
   // Video sort buttons: click an inactive key to switch to it (defaulting to
@@ -2959,185 +3261,86 @@ function bindEvents() {
 
   el.videoMarkAllBtn.addEventListener("click", async () => {
     const vids = currentView === "watchlater" ? getWatchLaterVideos() : getFilteredVideos();
-    if (!vids.length) return;
-    if (!confirm(`Mark all ${vids.length} shown video${vids.length === 1 ? "" : "s"} as watched?`)) return;
-    for (const v of vids) v.watched = true;
-    await saveVideos();
+    const ids = vids.filter((v) => !v.watched).map((v) => v.id);
+    if (!ids.length) { toast("Every video shown is already watched."); return; }
+    const ok = await confirmDialog({ title: `Mark ${plural(ids.length, "video")} as watched?`, text: "Every unwatched video shown in this view is marked watched. Undo is available right after.", okLabel: "Mark watched" });
+    if (ok) await setVideosWatched(ids, true);
   });
 
   el.videoFetchAllBtn.addEventListener("click", () => {
-    const tracked = Object.values(state.channels).filter((c) => c.trackVideos).map((c) => c.id);
+    const tracked = trackedChannelIds(null);
     if (!tracked.length) {
       el.statusText.textContent = "No tracked channels — turn on Track first.";
       return;
     }
-    if (!confirm(`Fetch the full upload history of all ${tracked.length} tracked channel${tracked.length === 1 ? "" : "s"}? This can use significant API quota for large catalogs.`)) return;
-    fetchAllVideos(tracked);
+    openFetchVideosModal(null);
+  });
+  el.fetchVideosModal.addEventListener("change", updateFetchVideosSummary);
+  el.fetchVideosCancel.addEventListener("click", () => el.fetchVideosModal.close());
+  el.fetchVideosStart.addEventListener("click", () => {
+    const opts = readFetchVideosForm();
+    if (!opts.channelIds.length || !opts.kinds.length) return;
+    el.fetchVideosModal.close();
+    fetchAllVideos(opts.channelIds, opts);
   });
 
-  // Suppress the browser's text-selection smear when shift-clicking cards.
-  const suppressShiftSmear = (e) => {
-    if (e.shiftKey && e.target.closest(".video-card")) e.preventDefault();
+  // Video cards (New / Removed / Watch Later): the selection gestures (§6),
+  // the card's own buttons (on a selected card they act on the selection),
+  // and a plain click opens the video and clears the selection.
+  const onVideoClick = async (e) => {
+    const card = e.target.closest(".video-card");
+    if (!card) return;
+    const id = card.dataset.videoId;
+    const v = state.videos[id];
+    if (!v) return;
+    const mod = selectionModifierPressed(e, controls);
+    if (mod || e.shiftKey) {
+      e.preventDefault();
+      videoSel.click(id, currentVideoOrder(), { mod, shift: e.shiftKey });
+      return;
+    }
+    const action = e.target.closest("[data-action]")?.dataset.action;
+    const targets = videoSel.targetsFor(id);
+    if (action === "restore") return setVideosHidden(targets, false);
+    if (action === "hide") return setVideosHidden(targets, true);
+    if (action === "toggle-watched") return setVideosWatched(targets, !v.watched);
+    if (action === "remove") return removeFromWatchLater(targets);
+    if (action) return;
+    if (videoSel.size) videoSel.clear();
+    if (!e.target.closest("a[href]")) openVideo(id, false);
   };
-  el.videoFeed.addEventListener("mousedown", suppressShiftSmear);
-  el.watchLaterGrid.addEventListener("mousedown", suppressShiftSmear);
-
-  // New feed card: modifier-click selects; action buttons act; plain click opens.
-  el.videoFeed.addEventListener("click", async (e) => {
-    const card = e.target.closest(".video-card");
-    if (!card) return;
-    const id = card.dataset.videoId;
-    const v = state.videos[id];
-    if (!v) return;
-    if (selectionModifierPressed(e, controls) || e.shiftKey) {
-      e.preventDefault();
-      handleVideoSelectionClick(id, e);
-      return;
-    }
-    if (e.target.closest('[data-action="restore"]')) {
-      v.hidden = false;
-      await saveVideos();
-      return;
-    }
-    if (e.target.closest('[data-action="toggle-watched"]')) {
-      v.watched = !v.watched;
-      await saveVideos();
-      return;
-    }
-    if (e.target.closest('[data-action="hide"]')) {
-      v.hidden = true; // dismissed — filtered out and never re-shown by a refresh
-      await saveVideos();
-      return;
-    }
-    if (e.target.closest("[data-action]")) return;
-    if (selectedVideoIds.size) clearVideoSelection();
-    if (!e.target.closest("a[href]")) openVideo(id, false);
-  });
-  el.videoFeed.addEventListener("auxclick", (e) => {
+  const onVideoAuxClick = (e) => {
     if (e.button !== 1) return;
     const card = e.target.closest(".video-card");
     if (!card || e.target.closest("[data-action]")) return;
     e.preventDefault();
     if (e.target.closest("a[href]")) { chrome.tabs.create({ url: e.target.closest("a[href]").href, active: false }); return; }
     openVideo(card.dataset.videoId, true);
-  });
-  // Right-click a New-feed card → bulk menu if inside a 2+ selection, else single.
-  el.videoFeed.addEventListener("contextmenu", (e) => {
+  };
+  // Right-click: inside a multi-selection → the bulk menu; otherwise the
+  // selection resets to that card and its own menu shows (§8). Actions look the
+  // video up again when clicked — a refresh can replace the record meanwhile.
+  const onVideoContextMenu = (e) => {
     const card = e.target.closest(".video-card");
     if (!card) return;
     e.preventDefault();
     const id = card.dataset.videoId;
     const v = state.videos[id];
     if (!v) return;
-    if (selectedVideoIds.size > 1 && selectedVideoIds.has(id)) {
-      showVideoBulkContextMenu(e.clientX, e.clientY, [...selectedVideoIds]);
-      return;
-    }
-    if (currentView === 'removed') {
-      showContextMenu(e.clientX, e.clientY, [{ label: 'Restore to New', action: () => bulkVideoMutate([id], current => { current.hidden = false; }) }]);
-      return;
-    }
-    const markWatched = !v.watched;
-    showContextMenu(e.clientX, e.clientY, [
-      {
-        label: v.watched ? "Mark unwatched" : "Mark watched",
-        action: () => bulkVideoMutate([id], current => { current.watched = markWatched; }),
-      },
-      { separator: true },
-      {
-        label: "Remove",
-        danger: true,
-        action: () => bulkVideoMutate([id], current => { current.hidden = true; }),
-      },
-    ]);
-  });
-
-  // Watch Later card: modifier-click selects; action buttons act; plain opens.
-  el.watchLaterGrid.addEventListener("click", async (e) => {
-    const card = e.target.closest(".video-card");
-    if (!card) return;
-    const id = card.dataset.videoId;
-    if (selectionModifierPressed(e, controls) || e.shiftKey) {
-      e.preventDefault();
-      handleVideoSelectionClick(id, e);
-      return;
-    }
-    if (e.target.closest('[data-action="toggle-watched"]')) {
-      const v = state.videos[id];
-      if (v) { v.watched = !v.watched; await saveVideos(); }
-      return;
-    }
-    if (e.target.closest('[data-action="remove"]')) {
-      await removeFromWatchLater(id);
-      return;
-    }
-    if (e.target.closest("[data-action]")) return;
-    if (selectedVideoIds.size) clearVideoSelection();
-    if (!e.target.closest("a[href]")) openVideo(id, false);
-  });
-  el.watchLaterGrid.addEventListener("auxclick", (e) => {
-    if (e.button !== 1) return;
-    const card = e.target.closest(".video-card");
-    if (!card || e.target.closest("[data-action]")) return;
-    e.preventDefault();
-    if (e.target.closest("a[href]")) { chrome.tabs.create({ url: e.target.closest("a[href]").href, active: false }); return; }
-    openVideo(card.dataset.videoId, true);
-  });
-  // Right-click a saved video → bulk menu if inside a 2+ selection, else single.
-  el.watchLaterGrid.addEventListener("contextmenu", (e) => {
-    const card = e.target.closest(".video-card");
-    if (!card) return;
-    e.preventDefault();
-    const id = card.dataset.videoId;
-    const v = state.videos[id];
-    if (!v) return;
-    if (selectedVideoIds.size > 1 && selectedVideoIds.has(id)) {
-      showVideoBulkContextMenu(e.clientX, e.clientY, [...selectedVideoIds]);
-      return;
-    }
-    showContextMenu(e.clientX, e.clientY, [
-      { label: "Move to list", submenu: () => buildListSubmenu(id, v) },
-      { separator: true },
-      { label: "Remove from Watch Later", danger: true, action: () => removeFromWatchLater(id) },
-    ]);
-  });
-
-  el.clearFiltersBtn.addEventListener("click", clearAllFilters);
-
-  el.filterMinCount.addEventListener("input", (e) => {
-    filterMinCount = e.target.value !== "" ? parseInt(e.target.value, 10) : null;
-    renderGrid();
-  });
-  el.filterMaxCount.addEventListener("input", (e) => {
-    filterMaxCount = e.target.value !== "" ? parseInt(e.target.value, 10) : null;
-    renderGrid();
-  });
-
-  function readDateFilter(dayEl, monthEl, yearEl) {
-    const year = yearEl.value;
-    const day = dayEl.value;
-    const month = monthEl.value;
-    if (!year || year === "—") return null;
-    const yy = year.padStart(4, "0");
-    const mm = (month || "1").padStart(2, "0");
-    const dd = (day || "1").padStart(2, "0");
-    return `${yy}-${mm}-${dd}`;
+    const at = { x: e.clientX, y: e.clientY };
+    if (videoSel.has(id) && videoSel.size > 1) { showVideoBulkContextMenu(at, [...videoSel.ids]); return; }
+    videoSel.set([id], id);
+    showVideoContextMenu(at, id);
+  };
+  for (const grid of [el.videoFeed, el.watchLaterGrid]) {
+    grid.addEventListener("click", onVideoClick);
+    grid.addEventListener("auxclick", onVideoAuxClick);
+    grid.addEventListener("contextmenu", onVideoContextMenu);
+    // Shift-click never smears a text selection across cards.
+    grid.addEventListener("mousedown", (e) => { if (e.shiftKey && e.target.closest(".video-card")) e.preventDefault(); });
   }
 
-  const onAfterChange = () => {
-    filterAfterDate = readDateFilter(el.filterAfterDay, el.filterAfterMonth, el.filterAfterYear);
-    renderGrid();
-  };
-  const onBeforeChange = () => {
-    filterBeforeDate = readDateFilter(el.filterBeforeDay, el.filterBeforeMonth, el.filterBeforeYear);
-    renderGrid();
-  };
-  el.filterAfterDay.addEventListener("input", onAfterChange);
-  el.filterAfterMonth.addEventListener("input", onAfterChange);
-  el.filterAfterYear.addEventListener("change", onAfterChange);
-  el.filterBeforeDay.addEventListener("input", onBeforeChange);
-  el.filterBeforeMonth.addEventListener("input", onBeforeChange);
-  el.filterBeforeYear.addEventListener("change", onBeforeChange);
+  el.clearFiltersBtn.addEventListener("click", clearAllFilters);
 
   el.listTableHeader.addEventListener("click", (e) => {
     if (e.target.closest(".col-resizer")) return; // a resize drag, not a sort
@@ -3157,18 +3360,24 @@ function bindEvents() {
     renderGrid();
   });
 
-  el.folderSortSelect.addEventListener("change", () => {
-    folderSort = el.folderSortSelect.value;
-    chrome.storage.local.set({ folderSort });
-    renderFolders();
-  });
-
   el.scanBtn.addEventListener("click", () => {
     chrome.tabs.create({ url: "https://www.youtube.com/feed/channels" });
   });
 
   el.refreshBtn.addEventListener('click', () => runRefresh());
   el.retryRefreshBtn.addEventListener('click', () => runRefresh(failedRefreshIds));
+  // Stop while a job runs; × dismisses a finished job's result line.
+  el.jobStopBtn.addEventListener('click', async () => {
+    if (state.jobProgress) {
+      el.jobStopBtn.disabled = true;
+      await requestWorker('CANCEL_JOB');
+      el.jobStopBtn.disabled = false;
+      el.jobStatusText.textContent = 'Stopping…';
+    } else {
+      jobResult = null;
+      renderJobStatus();
+    }
+  });
 
   el.fillAvatarsBtn.addEventListener("click", async () => {
     // Persist a just-typed key so the fill works without a separate Save first.
@@ -3200,141 +3409,76 @@ function bindEvents() {
     return msg;
   }
 
-  function isInteractiveTarget(t) {
-    return t.closest(".tag-chip, select, .tag-picker, button, a[href]");
-  }
+  const isInteractiveTarget = (t) => t.closest(".chip, .ui-select, button, a[href], input");
 
-  // Folder change / tag add-remove / row clicks
-  // Suppress the browser's text-selection smear when shift-clicking rows.
+  // Rows (§5, §6): the selection gestures first, then the row's own controls —
+  // each acting on the whole selection when the row is part of it — and a
+  // plain click anywhere else opens the channel and clears the selection.
   el.channelGrid.addEventListener("mousedown", (e) => {
-    if (e.shiftKey && e.target.closest("[data-channel-id]")) e.preventDefault();
+    if (e.shiftKey && e.target.closest("[data-channel-id]")) e.preventDefault(); // no shift-click smear
   });
 
   el.channelGrid.addEventListener("click", async (e) => {
-    const channelCard = e.target.closest("[data-channel-id]");
-    if (!channelCard) return;
-    const channelId = channelCard.dataset.channelId;
-
-    // Modifier click drives multi-select instead of any row action.
-    if (selectionModifierPressed(e, controls) || e.shiftKey) {
-      e.preventDefault();
-      handleSelectionClick(channelId, e);
-      return;
-    }
-
-    if (e.target.dataset.role === "remove-tag") {
-      const tagName = e.target.dataset.tagName;
-      const tagId = Object.keys(state.tags).find((id) => state.tags[id].name === tagName);
-      if (tagId) {
-        state.channels[channelId].tags = state.channels[channelId].tags.filter((t) => t !== tagId);
-        await persistLibrary({ channels: state.channels });
-      }
-      return;
-    }
-
-    if (e.target.dataset.role === "add-tag") {
-      openTagPicker(e.target, channelId);
-      return;
-    }
-
-    const toggleKey = { "toggle-active": "active", "toggle-finished": "finished", "toggle-track": "trackVideos" }[e.target.dataset.role];
-    if (toggleKey) {
-      await toggleChannelFlag(channelId, toggleKey);
-      return;
-    }
-
-    // Left-click anywhere on the row that isn't a tag/select opens the channel
-    if (!isInteractiveTarget(e.target)) {
-      if (selectedChannelIds.size) clearSelection();
-      chrome.tabs.create({ url: `https://www.youtube.com/channel/${channelId}/videos` });
-    }
-  });
-
-  // Middle-click: open in background tab without leaving the dashboard
-  el.channelGrid.addEventListener("auxclick", (e) => {
-    if (e.button !== 1) return;
-    const channelCard = e.target.closest("[data-channel-id]");
-    if (!channelCard) return;
-    if (!isInteractiveTarget(e.target)) {
-      e.preventDefault();
-      chrome.tabs.create({ url: `https://www.youtube.com/channel/${channelCard.dataset.channelId}/videos`, active: false });
-    }
-  });
-
-  // Right-click menu on channel cards/rows
-  el.channelGrid.addEventListener("contextmenu", (e) => {
-    const channelCard = e.target.closest("[data-channel-id]");
-    if (!channelCard) return;
-    e.preventDefault();
-    const channelId = channelCard.dataset.channelId;
+    const row = e.target.closest("[data-channel-id]");
+    if (!row) return;
+    const channelId = row.dataset.channelId;
     const ch = state.channels[channelId];
     if (!ch) return;
 
-    // Right-clicking inside a multi-selection acts on the whole set.
-    if (selectedChannelIds.size > 1 && selectedChannelIds.has(channelId)) {
-      showBulkContextMenu(e.clientX, e.clientY, [...selectedChannelIds]);
+    const mod = selectionModifierPressed(e, controls);
+    if (mod || e.shiftKey) {
+      e.preventDefault();
+      channelSel.click(channelId, getFilteredChannels().map((c) => c.id), { mod, shift: e.shiftKey });
       return;
     }
 
-    showContextMenu(e.clientX, e.clientY, [
-      {
-        label: "Move to folder",
-        submenu: () => buildFolderSubmenu(channelId, ch),
-      },
-      {
-        label: "Set language",
-        submenu: () =>
-          languageSubmenuItems(
-            (lang) => setChannelLanguage(channelId, lang),
-            (l) => (canonicalLanguage(ch.language) || null) === l,
-            [ch.language]
-          ),
-      },
-      {
-        label: ch.active ? "Mark inactive" : "Mark active",
-        action: () => toggleChannelFlag(channelId, "active"),
-      },
-      {
-        label: ch.finished ? "Mark unfinished" : "Mark finished",
-        action: () => toggleChannelFlag(channelId, "finished"),
-      },
-      {
-        label: ch.trackVideos ? "Stop tracking videos" : "Track videos",
-        action: () => toggleChannelFlag(channelId, "trackVideos"),
-      },
-      {
-        label: ch.fetchedAll ? "Re-fetch all videos" : "Fetch all videos",
-        action: () => fetchAllVideos([channelId]),
-      },
-      { separator: true },
-      {
-        label: "Delete channel",
-        danger: true,
-        action: () => deleteChannel(channelId),
-      },
-    ]);
+    const control = e.target.closest("[data-role]");
+    const role = control?.dataset.role;
+    const targets = rowTargets(channelId);
+    if (role === "remove-tag") { await setChannelTag(targets, control.dataset.tagId, false); return; }
+    if (role === "add-tag") { openTagPopover(targets, control); return; }
+    const flagKey = { "toggle-active": "active", "toggle-finished": "finished", "toggle-track": "trackVideos" }[role];
+    if (flagKey) { await setChannelFlag(targets, flagKey, !ch[flagKey]); return; }
+    if (role === "set-language") {
+      if (control.getAttribute("aria-expanded") === "true") { closeFloating(); return; }
+      const current = canonicalLanguage(ch.language);
+      openListbox(control, { options: languageListboxOptions(), value: LANGUAGES.includes(current) ? current : "", minWidth: false,
+        onPick: (value) => setChannelLanguage(targets, value || null) });
+      return;
+    }
+    if (role === "move-folder") {
+      if (control.getAttribute("aria-expanded") === "true") { closeFloating(); return; }
+      openListbox(control, { options: folderListboxOptions(), value: ch.folderId || "unsorted", onPick: (value) => moveChannels(targets, value) });
+      return;
+    }
+
+    if (!isInteractiveTarget(e.target)) {
+      if (channelSel.size) channelSel.clear();
+      openChannel(channelId);
+    }
   });
 
-  el.channelGrid.addEventListener("change", async (e) => {
-    const channelCard = e.target.closest("[data-channel-id]");
-    if (!channelCard) return;
-    const channelId = channelCard.dataset.channelId;
+  // Middle-click: open in a background tab without leaving the dashboard.
+  el.channelGrid.addEventListener("auxclick", (e) => {
+    if (e.button !== 1) return;
+    const row = e.target.closest("[data-channel-id]");
+    if (!row || isInteractiveTarget(e.target)) return;
+    e.preventDefault();
+    openChannel(row.dataset.channelId, true);
+  });
 
-    if (e.target.dataset.role === "set-language") {
-      const ch = state.channels[channelId];
-      if (!ch) return;
-      const value = e.target.value;
-      ch.language = value || null;
-      await persistLibrary({ channels: state.channels });
-      render();
-      return;
-    }
-
-    if (e.target.dataset.role !== "move-folder") return;
-    state.channels[channelId].folderId = e.target.value;
-    await persistLibrary({ channels: state.channels });
-    renderFolders();
-    if (currentFolderId !== "all") renderGrid();
+  // Right-click (§8): inside a multi-selection → the bulk menu; otherwise the
+  // selection resets to that row and the row's own menu shows.
+  el.channelGrid.addEventListener("contextmenu", (e) => {
+    const row = e.target.closest("[data-channel-id]");
+    if (!row) return;
+    e.preventDefault();
+    const channelId = row.dataset.channelId;
+    if (!state.channels[channelId]) return;
+    const at = { x: e.clientX, y: e.clientY };
+    if (channelSel.has(channelId) && channelSel.size > 1) { showBulkContextMenu(at, [...channelSel.ids]); return; }
+    channelSel.set([channelId], channelId);
+    showChannelContextMenu(at, channelId, row);
   });
 
   el.languageSearch.addEventListener("input", renderLanguageCatalog);
@@ -3351,7 +3495,7 @@ function bindEvents() {
   });
   // Settings modal
   el.settingsBtn.addEventListener("click", () => openSettings());
-  el.settingsCancel.addEventListener("click", () => { recordingShortcut = null; el.settingsModal.hidden = true; });
+  el.settingsCancel.addEventListener("click", () => el.settingsModal.close());
   el.settingsSave.addEventListener("click", async () => {
     if (recordingShortcut) { sayShortcut('Finish recording or press Escape before saving.', true); return; }
     const parsed = [...languagesDraft];
@@ -3360,9 +3504,10 @@ function bindEvents() {
       await persistSettings({ apiKey: el.apiKeyInput.value.trim(), gistToken: el.gistTokenInput.value.trim(), languages: parsed });
       await chrome.storage.local.set({ controls: normalizeControls(controlsDraft) });
       controls = normalizeControls(controlsDraft);
-      el.settingsModal.hidden = true;
       await loadState();
       render();
+      el.settingsSave.disabled = false;
+      el.settingsModal.close();
       el.statusText.textContent = 'Settings saved.';
     } catch (error) { el.settingsStatus.textContent = `Could not save: ${error.message}`; }
     finally { el.settingsSave.disabled = false; }
@@ -3374,7 +3519,7 @@ function bindEvents() {
   // where the token comes from: inside Settings it may have just been typed and
   // not saved yet, everywhere else `state` is the only truth there is.
   async function startSyncFlow(direction) {
-    const inSettings = !el.settingsModal.hidden;
+    const inSettings = el.settingsModal.open;
     if (inSettings) {
       state.gistToken = el.gistTokenInput.value.trim();
       await persistSettings({ gistToken: state.gistToken });
@@ -3397,7 +3542,7 @@ function bindEvents() {
       say(diff?.error || "Failed to fetch diff.");
       return;
     }
-    el.settingsModal.hidden = true;
+    if (inSettings) el.settingsModal.close();
     openSyncDiffModal(diff);
   }
 
@@ -3406,89 +3551,34 @@ function bindEvents() {
   el.quickUploadBtn.addEventListener("click", () => startSyncFlow("upload"));
   el.quickDownloadBtn.addEventListener("click", () => startSyncFlow("download"));
 
-  // New folder / rename modal
-  el.addFolderBtn.addEventListener("click", () => openFolderModal("create-folder"));
-  el.folderCancel.addEventListener("click", () => (el.folderModal.hidden = true));
-  el.folderSave.addEventListener("click", async () => {
-    const name = el.folderNameInput.value.trim();
-    if (!name) return;
-    const { type, id } = folderModalMode;
-    if (type === "rename-tag" && state.tags[id]) {
-      state.tags[id].name = name;
-      await persistLibrary({ tags: state.tags });
-    } else if (type === "rename-folder") {
-      const d = fdom();
-      if (d.folders[id]) { d.folders[id].name = name; await d.persist(); }
-    } else if (type === "create-folder") {
-      const d = fdom();
-      const newId = slugify(name) + "-" + Date.now().toString(36).slice(-4);
-      const parentId = el.folderParentSelect.value || null;
-      const siblings = Object.values(d.folders).filter((f) =>
-        parentId ? f.parentId === parentId : !f.parentId
-      );
-      const folderData = { name, order: siblings.length };
-      if (parentId) folderData.parentId = parentId;
-      d.folders[newId] = folderData;
-      await d.persist();
-    }
-    el.folderModal.hidden = true;
-    render();
-  });
+  el.addFolderBtn.addEventListener("click", () => createFolder());
 
-  // Right-click menu on folders (channel folders or Watch Later lists per view)
+  // Right-click on a folder (channel folders or Watch Later lists per view);
+  // All, Filed and the pinned Unfiled have no actions.
   el.folderList.addEventListener("contextmenu", (e) => {
     const li = e.target.closest(".folder-item");
     if (!li) return;
     e.preventDefault();
     const id = li.dataset.folderId;
-    if (isVirtualFolderId(id) || id === "unsorted") return; // virtual / pinned home — no actions
-    const folder = fdom().folders[id];
-    const isChild = !!folder?.parentId;
-    const menuItems = [
-      { label: "Rename…", action: () => openFolderModal("rename-folder", id) },
-      {
-        label: folder?.emoji ? "Change emoji…" : "Set emoji…",
-        action: () => openEmojiInput(li, id),
-      },
-    ];
-    if (folder?.emoji) {
-      menuItems.push({ label: "Remove emoji", action: () => setFolderEmoji(id, "") });
-    }
-    // Only allow subfolders one level deep (top-level folders can have children)
-    if (!isChild) {
-      menuItems.push({ label: "New subfolder…", action: () => openFolderModal("create-folder", null, id) });
-    }
-    menuItems.push({ label: "Delete", danger: true, action: () => deleteFolder(id) });
-    showContextMenu(e.clientX, e.clientY, menuItems);
+    if (isVirtualFolderId(id) || id === "unsorted") return;
+    showFolderContextMenu({ x: e.clientX, y: e.clientY }, id, li);
   });
 
-  // Right-click on a filter chip excludes it. Renaming/deleting a tag moved to
-  // **shift**+right-click, since plain right-click is now half the filter UI
-  // (the chip's tooltip says so, and the "+ tag" dropdown still deletes too).
+  // Right-click on a filter chip excludes it. A tag's menu (rename, color,
+  // delete) is on **shift**+right-click, since plain right-click is half the
+  // filter UI.
   el.tagFilterBar.addEventListener("contextmenu", (e) => {
     const chip = e.target.closest("[data-role]");
     if (!chip) return;
     const tagId = chip.dataset.role === "filter-tag" ? chip.dataset.tagId : null;
     if (tagId && e.shiftKey) {
       e.preventDefault();
-      showContextMenu(e.clientX, e.clientY, [
-        { label: "Rename…", action: () => openFolderModal("rename-tag", tagId) },
-        { label: "Delete", danger: true, action: () => deleteTag(tagId) },
-      ]);
+      showTagContextMenu({ x: e.clientX, y: e.clientY }, tagId);
       return;
     }
     if (activateFilterChip(chip, true)) e.preventDefault();
   });
 
-  // Context menu dismissal
-  document.addEventListener("click", event => { if (!event.target.closest(".context-menu, .context-submenu")) hideContextMenu(); });
-  document.addEventListener("scroll", hideContextMenu, true);
-  window.addEventListener("blur", hideContextMenu);
-
-  // Escape closes menu + modals; Enter submits the open modal
-  el.folderNameInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") el.folderSave.click();
-  });
   el.apiKeyInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") el.settingsSave.click();
   });
@@ -3497,13 +3587,17 @@ function bindEvents() {
   });
 
   el.clearDataBtn.addEventListener('click', async () => {
-    if (!confirm('Clear all channels, folders, tags, videos, and Watch Later lists? A local recovery snapshot will be saved first. Settings stay on this device.')) return;
+    const ok = await confirmDialog({ title: 'Clear the library?', text: 'Clear all channels, folders, tags, videos, and Watch Later lists? A local recovery snapshot will be saved first. Settings stay on this device.', okLabel: 'Clear library', danger: true });
+    if (!ok) return;
     const res = await requestWorker('CLEAR_LIBRARY');
     if (!res.ok) { el.backupStatus.textContent = res.error; return; }
+    hideUndo();
     await loadState();
     currentFolderId = currentListId = 'all';
+    channelSel.clear();
+    videoSel.clear();
     clearAllFilters();
-    el.settingsModal.hidden = true;
+    el.settingsModal.close();
     el.statusText.textContent = 'Library cleared. Restore it from Settings → Local backups.';
   });
 
@@ -3532,9 +3626,11 @@ function bindEvents() {
     ).map((box) => box.dataset.removeId);
     el.scanDiffApply.disabled = true;
     el.statusText.textContent = "Applying scan…";
-    const res = await chrome.runtime.sendMessage({ type: "APPLY_SCAN", removeIds });
+    applyingReview = true;
+    const res = await requestWorker("APPLY_SCAN", { removeIds });
+    applyingReview = false;
     el.scanDiffApply.disabled = false;
-    el.scanDiffModal.hidden = true;
+    closeDialog(el.scanDiffModal);
     await loadState();
     render();
     el.statusText.textContent = res?.ok
@@ -3542,9 +3638,11 @@ function bindEvents() {
       : res?.error || "Could not apply scan.";
   });
 
+  // Discard drops the pending scan; Esc / a backdrop click only sets it aside
+  // (the review banner brings it back).
   el.scanDiffCancel.addEventListener("click", async () => {
-    el.scanDiffModal.hidden = true;
-    await chrome.runtime.sendMessage({ type: "DISCARD_SCAN" });
+    closeDialog(el.scanDiffModal);
+    await requestWorker("DISCARD_SCAN");
   });
 
   // Playlist import dialog
@@ -3555,16 +3653,19 @@ function bindEvents() {
     const newListName = el.playlistImportName.value.trim();
     el.playlistImportApply.disabled = true;
     el.statusText.textContent = "Importing playlist…";
-    const res = await chrome.runtime.sendMessage({ type: "APPLY_PLAYLIST_IMPORT", listName: newListName, moveIds });
+    applyingReview = true;
+    const res = await requestWorker("APPLY_PLAYLIST_IMPORT", { listName: newListName, moveIds });
+    applyingReview = false;
     el.playlistImportApply.disabled = false;
-    el.playlistImportModal.hidden = true;
+    closeDialog(el.playlistImportModal);
     await loadState();
     if (res?.ok) {
       currentView = "watchlater";
       currentListId = res.listId;
       searchQuery = "";
       el.searchInput.value = "";
-      clearVideoSelection();
+      videoSel.clear();
+      channelSel.clear();
       await chrome.storage.local.set({ currentView });
       el.statusText.textContent = `Imported ${res.added + res.moved} video${res.added + res.moved === 1 ? "" : "s"} into the list.`;
     } else {
@@ -3574,8 +3675,8 @@ function bindEvents() {
   });
 
   el.playlistImportCancel.addEventListener("click", async () => {
-    el.playlistImportModal.hidden = true;
-    await chrome.runtime.sendMessage({ type: "DISCARD_PLAYLIST_IMPORT" });
+    closeDialog(el.playlistImportModal);
+    await requestWorker("DISCARD_PLAYLIST_IMPORT");
   });
 
   // Channel removals affect video pruning, so refresh the complete preview.
@@ -3622,9 +3723,11 @@ function bindEvents() {
     el.syncDiffApply.disabled = true;
     el.statusText.textContent = direction === "upload" ? "Uploading…" : "Downloading…";
 
+    applyingReview = true;
     const res = direction === "upload"
       ? await requestWorker("APPLY_UPLOAD", { removeFromGistIds: removeIds, skipVideoIds, reviewToken: pendingSyncDiff.reviewToken, skipAllVideos: syncSkipAllVideos })
       : await requestWorker("APPLY_DOWNLOAD", { removeLocalIds: removeIds, skipVideoIds, reviewToken: pendingSyncDiff.reviewToken, skipAllVideos: syncSkipAllVideos });
+    applyingReview = false;
 
     el.syncDiffApply.disabled = false;
     if (res?.stale) {
@@ -3634,8 +3737,7 @@ function bindEvents() {
       el.statusText.textContent = 'Review updated changes.';
       return;
     }
-    el.syncDiffModal.hidden = true;
-    pendingSyncDiff = null;
+    closeDialog(el.syncDiffModal);
 
     if (res?.ok) {
       state.gistId = res.gistId;
@@ -3648,25 +3750,43 @@ function bindEvents() {
     }
   });
 
-  el.syncDiffCancel.addEventListener("click", () => {
-    syncReviewRequest++;
-    el.syncDiffModal.hidden = true;
-    pendingSyncDiff = null;
-  });
+  el.syncDiffCancel.addEventListener("click", () => closeDialog(el.syncDiffModal));
+}
 
-  // Clicking the dark backdrop closes a modal
-  for (const modal of [el.settingsModal, el.folderModal]) {
-    modal.addEventListener("mousedown", (e) => {
-      if (e.target === modal) modal.hidden = true;
-    });
-  }
-  el.syncDiffModal.addEventListener("mousedown", (e) => {
-    if (e.target === el.syncDiffModal) {
-      syncReviewRequest++;
-      el.syncDiffModal.hidden = true;
-      pendingSyncDiff = null;
-    }
+// ---------- Dialogs (§13) ----------
+// Kit dialogs: <dialog class="ui-dialog"> opened with showModal() (focus trap,
+// top layer), backdrop click and Esc close, focus returns to the opener. Busy
+// dialogs (an apply in flight, a shortcut being recorded) refuse to close.
+let applyingReview = false;
+
+function closeDialog(dialog) {
+  if (dialog.open) dialog.close();
+}
+
+function bindDialogs() {
+  bindDialog(el.settingsModal, { busy: () => !!recordingShortcut || escapeEndedRecording || el.settingsSave.disabled });
+  // The Escape that cancelled a recording is spent once its key comes back up.
+  document.addEventListener('keyup', (e) => { if (e.key === 'Escape') escapeEndedRecording = false; }, true);
+  el.settingsModal.addEventListener("close", () => { stopShortcutRecording(); recordingShortcut = null; });
+  bindDialog(el.fetchVideosModal);
+  for (const dialog of [el.scanDiffModal, el.playlistImportModal, el.syncDiffModal]) bindDialog(dialog, { busy: () => applyingReview });
+  // Closing the sync review in any way forgets it; a newer preview request
+  // still in flight is dropped.
+  el.syncDiffModal.addEventListener("close", () => { syncReviewRequest++; pendingSyncDiff = null; });
+  for (const dialog of [el.scanDiffModal, el.playlistImportModal]) dialog.addEventListener("close", renderReviewBanner);
+  el.reviewBannerBtn.addEventListener("click", () => {
+    if (state.pendingScan) openScanDiffModal(state.pendingScan);
+    else if (state.pendingPlaylistImport) openPlaylistImportModal(state.pendingPlaylistImport);
   });
+}
+
+// "A scan is waiting for review. [Review]" — shown while a pending scan or
+// playlist import was set aside with Esc (§13).
+function renderReviewBanner() {
+  const scan = state.pendingScan && !el.scanDiffModal.open;
+  const playlist = state.pendingPlaylistImport && !el.playlistImportModal.open;
+  el.reviewBanner.hidden = !scan && !playlist;
+  el.reviewBannerText.textContent = scan ? "A scan is waiting for review." : playlist ? "A playlist import is waiting for review." : "";
 }
 
 function renderShortcutHints() {
@@ -3681,7 +3801,7 @@ function renderLanguageCatalog() {
   const catalog = [...LANGUAGE_CATALOG, ...custom].filter(language => languageCatalogMatches(language, el.languageSearch.value));
   el.languageSelection.textContent = languagesDraft.size ? [...languagesDraft].join(" · ") : "No active languages";
   el.languageCatalog.innerHTML = catalog.length ? catalog.map(language => `
-    <label class="language-choice"><input type="checkbox" value="${escapeHtml(language.name)}" ${languagesDraft.has(language.name) ? "checked" : ""}>
+    <label class="language-choice"><input class="ui-check" type="checkbox" value="${escapeHtml(language.name)}" ${languagesDraft.has(language.name) ? "checked" : ""}>
     <span><strong>${escapeHtml(langLabel(language.name))}</strong><small>${escapeHtml(language.native)}</small></span></label>`).join("")
     : '<p class="field-hint">No matching languages.</p>';
 }
@@ -3700,7 +3820,9 @@ function openSettings(tab = 'general') {
   renderControlsSettings();
   sayShortcut('Use letters, numbers, or punctuation, with optional modifiers. Escape cancels recording.');
   selectSettingsTab(tab);
-  el.settingsModal.hidden = false;
+  escapeEndedRecording = false;
+  openDialog(el.settingsModal);
+  document.querySelector(`[data-settings-tab="${tab}"]`)?.focus();
   refreshBackupList();
 }
 
@@ -3722,7 +3844,13 @@ function sayShortcut(message, error = false) {
 
 function renderControlsSettings() {
   el.shortcutsEnabledInput.checked = controlsDraft.enabled;
-  el.selectionModifierInput.value = controlsDraft.selectionModifier;
+  selectionModifierSelect.value = controlsDraft.selectionModifier;
+  // "Everyday controls" names the selection modifier the user picked; Select
+  // all is always ⌘/Ctrl+A.
+  const modName = controlsDraft.selectionModifier === 'alt' ? (IS_MAC ? 'Option' : 'Alt') : (IS_MAC ? '⌘' : 'Ctrl');
+  document.querySelectorAll('.controls-reference .mod-label').forEach((label, i, all) => {
+    label.textContent = i === all.length - 1 ? (IS_MAC ? '⌘' : 'Ctrl') : modName;
+  });
   el.wheelAdjustsNumbersInput.checked = controlsDraft.wheelAdjustsNumbers;
   let group = '';
   el.shortcutList.innerHTML = SHORTCUTS.map(action => {
@@ -3731,6 +3859,10 @@ function renderControlsSettings() {
     return `${heading}<div class="shortcut-row"><span>${action.label}</span><button type="button" class="shortcut-record" data-record-shortcut="${action.id}" aria-label="Change shortcut for ${action.label}">${escapeHtml(formatShortcut(controlsDraft.bindings[action.id], IS_MAC))}</button><button type="button" class="shortcut-clear" data-clear-shortcut="${action.id}" aria-label="Disable shortcut for ${action.label}" ${controlsDraft.bindings[action.id] ? '' : 'disabled'}>Clear</button></div>`;
   }).join('');
 }
+
+// Escape cancels a recording — and must not also close Settings, whatever
+// order the browser runs the keydown and the dialog's cancel in.
+let escapeEndedRecording = false;
 
 function stopShortcutRecording() {
   if (!recordingShortcut) return;
@@ -3743,7 +3875,7 @@ function stopShortcutRecording() {
 function bindShortcutSettings() {
   const tabs = [...document.querySelectorAll('[data-settings-tab]')];
   tabs.forEach((button, index) => {
-    button.addEventListener('click', () => selectSettingsTab(button.dataset.settingsTab));
+    button.addEventListener('click', () => { selectSettingsTab(button.dataset.settingsTab); button.focus(); });
     button.addEventListener('keydown', event => {
       if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault();
@@ -3752,7 +3884,6 @@ function bindShortcutSettings() {
     });
   });
   el.shortcutsEnabledInput.addEventListener('change', () => { controlsDraft.enabled = el.shortcutsEnabledInput.checked; });
-  el.selectionModifierInput.addEventListener('change', () => { controlsDraft.selectionModifier = el.selectionModifierInput.value; });
   el.wheelAdjustsNumbersInput.addEventListener('change', () => { controlsDraft.wheelAdjustsNumbers = el.wheelAdjustsNumbersInput.checked; });
   el.resetControlsBtn.addEventListener('click', () => {
     stopShortcutRecording(); controlsDraft = normalizeControls(); renderControlsSettings();
@@ -3777,11 +3908,11 @@ function bindShortcutSettings() {
     if (recordingShortcut && event.target.dataset.recordShortcut !== recordingShortcut) stopShortcutRecording();
   });
   document.addEventListener('keydown', event => {
-    if (!recordingShortcut || el.settingsModal.hidden) return;
+    if (!recordingShortcut || !el.settingsModal.open) return;
     if (event.key === 'Tab') { stopShortcutRecording(); return; }
     event.preventDefault(); event.stopImmediatePropagation();
     if (event.repeat || event.isComposing) return;
-    if (event.key === 'Escape') { stopShortcutRecording(); sayShortcut('Recording cancelled. Your shortcut is unchanged.'); return; }
+    if (event.key === 'Escape') { escapeEndedRecording = true; stopShortcutRecording(); sayShortcut('Recording cancelled. Your shortcut is unchanged.'); return; }
     const id = recordingShortcut;
     const binding = ['Backspace', 'Delete'].includes(event.key) ? null : shortcutFromEvent(event, IS_MAC);
     if (!binding && !['Backspace', 'Delete'].includes(event.key)) return;
@@ -3795,45 +3926,33 @@ function bindShortcutSettings() {
   }, true);
 }
 
+// Typing in a field never triggers a shortcut.
+const isTypingTarget = (target) => target.isContentEditable || !!target.closest?.('input, textarea, select, [role="textbox"]');
+// Menus, listboxes, popovers and dialogs own the keyboard while open.
+const overlayOpen = () => floatingOpen() || !!document.querySelector('dialog[open], .modal:not([hidden])');
+
 function runKeyboardShortcut(event) {
   if (!controls.enabled || event.defaultPrevented || event.repeat || event.isComposing) return;
-  if (event.target.isContentEditable || event.target.closest('input, textarea, select, [role="textbox"]')) return;
-  if (document.querySelector('.modal:not([hidden]), .context-menu:not([hidden]), .context-submenu:not([hidden]), .emoji-picker')) return;
+  if (isTypingTarget(event.target) || overlayOpen()) return;
   const binding = shortcutFromEvent(event, IS_MAC);
   if (!binding) return;
   const action = SHORTCUTS.find(action => controls.bindings[action.id] === binding);
   if (!action) return;
-  if (action.id === 'undo' && (el.undoToast.hidden || el.undoBtn.disabled)) return;
   if (action.id === 'refresh' && el.refreshBtn.disabled) return;
+  // Mod+Z undoes the last edit — whatever the undo toast describes (§9).
+  if (action.id === 'undo') { if (triggerUndo()) event.preventDefault(); return; }
   event.preventDefault();
   if (action.id === 'search') { el.searchInput.focus(); el.searchInput.select(); }
   else if (['channels', 'new', 'watchlater', 'removed'].includes(action.id)) setView(action.id);
   else if (action.id === 'settings' || action.id === 'controls') openSettings(action.id === 'controls' ? 'controls' : 'general');
   else if (action.id === 'refresh') el.refreshBtn.click();
-  else if (action.id === 'undo') el.undoBtn.click();
   else if (action.id === 'clearFilters') clearAllFilters();
 }
 
 function bindKeyboardControls() {
   bindShortcutSettings();
-  for (const menu of [el.contextMenu, el.contextSubmenu, el.contextSubSubmenu]) {
-    menu.setAttribute('role', 'menu');
-    new MutationObserver(() => menu.querySelectorAll('button').forEach(button => button.setAttribute('role', 'menuitem'))).observe(menu, { childList: true });
-    menu.addEventListener('keydown', event => {
-      const buttons = [...menu.querySelectorAll('button')];
-      const index = buttons.indexOf(document.activeElement);
-      if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
-        event.preventDefault();
-        const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
-          : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
-        buttons[next]?.focus();
-      } else if (event.key === 'ArrowRight' && document.activeElement?.classList.contains('has-submenu')) {
-        event.preventDefault(); document.activeElement.click();
-      } else if (event.key === 'ArrowLeft' && menu !== el.contextMenu) {
-        event.preventDefault(); menu.hidden = true; menu._opener?.focus();
-      }
-    });
-  }
+  // The mobile build's injected "Save from YouTube" panel is the one legacy
+  // `.modal` overlay left: give it Esc, a focus trap and focus restore.
   const modals = [...document.querySelectorAll('.modal')];
   const focusable = modal => [...modal.querySelectorAll('button:not(:disabled), input:not([type="hidden"]):not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex="0"]')].filter(node => node.tabIndex >= 0 && node.getClientRects().length);
   for (const modal of modals) {
@@ -3847,30 +3966,21 @@ function bindKeyboardControls() {
   document.addEventListener('keydown', event => {
     if (event.defaultPrevented || event.isComposing) return;
     const modal = modals.findLast(node => !node.hidden);
-    if (event.key === 'Escape') {
-      if (!el.contextMenu.hidden) {
-        event.preventDefault(); const opener = el.contextMenu._opener; hideContextMenu(); opener?.focus(); return;
-      }
-      if (modal) {
-        event.preventDefault(); modal.hidden = true;
-        if (modal === el.syncDiffModal) { pendingSyncDiff = null; syncReviewRequest++; }
-      }
-    }
+    if (event.key === 'Escape' && modal) { event.preventDefault(); modal.hidden = true; return; }
     if (event.key === 'Tab' && modal) {
       const nodes = focusable(modal), first = nodes[0], last = nodes.at(-1);
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
     }
-    const chip = event.target.closest('span.tag-chip[data-role], button.tag-chip[data-role^="filter-"]');
+    // Filter chips: Enter/Space = only these, Shift+Enter = exclude (§7).
+    const chip = event.target.closest?.('.chip[data-role^="filter-"]');
     if (chip && ['Enter', ' '].includes(event.key)) {
       event.preventDefault();
       chip.dispatchEvent(new MouseEvent(event.shiftKey ? 'contextmenu' : 'click', { bubbles: true, cancelable: true }));
+      return;
     }
     runKeyboardShortcut(event);
   });
-  new MutationObserver(() => {
-    el.tagFilterBar.querySelectorAll('span.tag-chip[data-role]').forEach(chip => { chip.tabIndex = 0; chip.setAttribute('role', 'button'); chip.setAttribute('aria-pressed', String(chip.classList.contains('active') || chip.classList.contains('on'))); });
-  }).observe(el.tagFilterBar, { childList: true, subtree: true });
 }
 
 async function refreshBackupList() {
@@ -3882,16 +3992,6 @@ async function refreshBackupList() {
 }
 
 function bindRecoveryControls() {
-
-  el.undoDismiss.addEventListener('click', () => { el.undoToast.hidden = true; undoVideoChanges = null; });
-  el.undoBtn.addEventListener('click', async () => {
-    if (!undoVideoChanges) return;
-    el.undoBtn.disabled = true;
-    const result = await requestWorker('UNDO_VIDEOS', { changes: undoVideoChanges });
-    el.undoBtn.disabled = false;
-    el.statusText.textContent = result.ok ? 'Video changes undone.' : result.error;
-    if (result.ok) { undoVideoChanges = null; el.undoToast.hidden = true; }
-  });
   el.exportBackupBtn.addEventListener('click', async () => {
     const result = await requestWorker('EXPORT_BACKUP');
     if (!result.ok) { el.backupStatus.textContent = result.error; return; }
@@ -3918,7 +4018,9 @@ function bindRecoveryControls() {
       const backup = JSON.parse(await file.text());
       const preview = await requestWorker('PREVIEW_BACKUP', { backup });
       if (!preview.ok) throw new Error(preview.error);
-      if (!confirm(`Replace this device’s library with ${preview.counts.channels} channels, ${preview.counts.videos} videos, ${preview.counts.folders} folders, ${preview.counts.videoFolders} Watch Later lists, and ${preview.counts.tags} tags from “${file.name}”? The current library will be saved as a recovery snapshot first.`)) return;
+      const ok = await confirmDialog({ title: 'Import this backup?', okLabel: 'Replace library',
+        text: `Replace this device’s library with ${preview.counts.channels} channels, ${preview.counts.videos} videos, ${preview.counts.folders} folders, ${preview.counts.videoFolders} Watch Later lists, and ${preview.counts.tags} tags from “${file.name}”? The current library will be saved as a recovery snapshot first.` });
+      if (!ok) return;
       const result = await requestWorker('RESTORE_BACKUP', { backup });
       if (!result.ok) throw new Error(result.error);
       await finishRestore();
@@ -3931,7 +4033,10 @@ function bindRecoveryControls() {
   });
   el.backupList.addEventListener('click', async event => {
     const button = event.target.closest('[data-backup-id]');
-    if (!button || !confirm(`Restore ${button.parentElement.querySelector('span').textContent}? The current library will be saved as a recovery snapshot first.`)) return;
+    if (!button) return;
+    const ok = await confirmDialog({ title: 'Restore this snapshot?', okLabel: 'Restore',
+      text: `${button.parentElement.querySelector('span').firstChild.textContent} — ${button.parentElement.querySelector('small').textContent}. The current library will be saved as a recovery snapshot first.` });
+    if (!ok) return;
     button.disabled = true;
     const result = await requestWorker('RESTORE_BACKUP', { backupId: button.dataset.backupId });
     if (!result.ok) { button.disabled = false; el.backupStatus.textContent = result.error; return; }
@@ -3940,666 +4045,339 @@ function bindRecoveryControls() {
 }
 
 async function finishRestore() {
-  undoVideoChanges = null;
-  el.undoToast.hidden = true;
+  hideUndo();
   await loadState();
   currentFolderId = currentListId = 'all';
+  channelSel.clear();
+  videoSel.clear();
   clearAllFilters();
   el.backupStatus.textContent = 'Library restored on this device. Sync remains manual.';
   await refreshBackupList();
 }
 
-// ---------- Folder / tag management ----------
+// ---------- Folder / tag management (§11; every edit undoable, §9) ----------
 
-function openFolderModal(type, id = null, defaultParentId = null) {
-  folderModalMode = { type, id };
+const newFolderId = (name) => (slugify(name) || "folder") + "-" + Date.now().toString(36).slice(-4);
+
+// New folder / list (sidebar button, or a folder's "New subfolder…"). Groups
+// hold no items, so the first subfolder of a folder that holds items takes them.
+async function createFolder(parentId = null) {
   const d = fdom();
-  const isList = currentView === "watchlater";
-  const noun = isList ? "list" : "folder";
-  const Noun = isList ? "List" : "Folder";
-  const texts = {
-    "create-folder": { title: `New ${noun}`, label: `${Noun} name`, save: "Create", value: "" },
-    "rename-folder": { title: `Rename ${noun}`, label: `${Noun} name`, save: "Save", value: d.folders[id]?.name || "" },
-    "rename-tag": { title: "Rename tag", label: "Tag name", save: "Save", value: state.tags[id]?.name || "" },
-  };
-  const t = texts[type];
-  el.folderModalTitle.textContent = t.title;
-  el.folderNameLabel.textContent = t.label;
-  el.folderSave.textContent = t.save;
-  el.folderNameInput.value = t.value;
-
-  // Show parent selector only when creating a folder
-  const isCreate = type === "create-folder";
-  el.folderParentRow.hidden = !isCreate;
-  if (isCreate) {
-    // Populate with top-level folders (excluding unsorted, which can't be a parent)
-    const parentOptions = Object.entries(d.folders)
-      .filter(([fid, f]) => !f.parentId && fid !== "unsorted")
-      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0))
-      .map(([fid, f]) => `<option value="${fid}"${defaultParentId === fid ? " selected" : ""}>${escapeHtml(f.name)}</option>`)
-      .join("");
-    el.folderParentSelect.innerHTML = `<option value="">— None (top-level)</option>${parentOptions}`;
-    el.folderParentSelect.value = defaultParentId || "";
+  const parents = getTopLevelFoldersOrdered(d.folders).filter(([id]) => id !== "unsorted");
+  const result = await promptDialog({
+    title: parentId ? `New sub${d.noun} in “${d.folders[parentId]?.name || ""}”` : `New ${d.noun}`,
+    placeholder: d.isList ? "e.g. Tutorials, Music, Later" : "e.g. Gaming, Science, Music",
+    okLabel: "Create",
+    select: parentId ? null : {
+      label: `Inside ${d.noun} (optional)`,
+      options: [{ value: "", label: "— None (top-level)" }, ...parents.map(([id]) => ({ value: id, label: folderLabel(id, d.folders) }))],
+      value: "",
+    },
+    validate: (name) => (name ? "" : `Enter a ${d.noun} name.`),
+  });
+  if (!result) return;
+  const parent = parentId || result.selectValue || null;
+  if (parent && !d.folders[parent]) return;
+  const id = newFolderId(result.value);
+  const siblings = Object.values(d.folders).filter((f) => (parent ? f.parentId === parent : !f.parentId));
+  d.folders[id] = { name: result.value, order: siblings.length, ...(parent ? { parentId: parent } : {}) };
+  let movedItems = false;
+  if (parent && !siblings.length) {
+    for (const item of d.items()) {
+      if ((item.folderId || "unsorted") === parent) { item.folderId = id; movedItems = true; }
+    }
+    d.collapsed.delete(parent);
   }
-
-  el.folderModal.hidden = false;
-  el.folderNameInput.focus();
-  el.folderNameInput.select();
+  render();
+  await d.persist(`Created ${d.noun} “${result.value}”.`, movedItems);
 }
 
-// Delete a folder/list from the active domain: its items move to Unfiled and
-// its subfolders are promoted to top-level.
-async function deleteFolder(id) {
+async function renameFolder(id) {
   const d = fdom();
-  const isList = currentView === "watchlater";
   const folder = d.folders[id];
   if (!folder || id === "unsorted") return;
+  const result = await promptDialog({ title: `Rename ${d.noun}`, value: folder.name, okLabel: "Save",
+    validate: (name) => (name ? "" : `Enter a ${d.noun} name.`) });
+  if (!result || result.value === folder.name || !d.folders[id]) return;
+  const old = folder.name;
+  d.folders[id].name = result.value;
+  render();
+  await d.persist(`Renamed “${old}” to “${result.value}”.`);
+}
 
+async function moveFolderToTopLevel(id) {
+  const d = fdom();
+  const folder = d.folders[id];
+  if (!folder?.parentId) return;
+  applyFolderDrop(id, null, null);
+  render();
+  await d.persist(`Moved “${folder.name}” to the top level.`);
+}
+
+// Delete a folder/list from the active domain: its items (and its
+// subfolders' items) move to Unfiled and its subfolders become top-level.
+async function deleteFolder(id) {
+  const d = fdom();
+  const folder = d.folders[id];
+  if (!folder || id === "unsorted") return;
   const childIds = getChildFolderIds(id, d.folders);
   const gone = new Set([id, ...childIds]);
-  const itemFolderId = (it) => (isList ? it.folderId || "unsorted" : it.folderId);
-  const items = isList ? Object.values(state.videos).filter((v) => v.saved) : Object.values(state.channels);
-  const totalCount = items.filter((it) => gone.has(itemFolderId(it))).length;
-
-  let msg = `Delete ${isList ? "list" : "folder"} "${folder.name}"?`;
-  if (childIds.length) {
-    msg += ` Its ${childIds.length} sub${isList ? "list" : "folder"}${childIds.length === 1 ? "" : "s"} will become top-level.`;
-  }
-  if (totalCount) {
-    const itemNoun = isList ? "video" : "channel";
-    msg += ` ${totalCount} ${itemNoun}${totalCount === 1 ? "" : "s"} will move to Unfiled.`;
-  }
-  if (!confirm(msg)) return;
-
-  // Move items to unsorted
-  for (const it of items) {
-    if (gone.has(itemFolderId(it))) it.folderId = "unsorted";
-  }
-  // Promote children to top-level
+  const items = d.items().filter((it) => gone.has(it.folderId || "unsorted"));
+  const parts = [];
+  if (items.length) parts.push(`Its ${plural(items.length, d.itemNoun)} move to Unfiled`);
+  if (childIds.length) parts.push(`${parts.length ? "s" : "S"}ub${d.noun}s become top-level`);
+  const ok = await confirmDialog({ title: `Delete “${folder.name}”?`, text: parts.length ? `${parts.join("; ")}.` : `The ${d.noun} is empty.`, okLabel: "Delete", danger: true });
+  if (!ok || !d.folders[id]) return;
+  for (const it of items) it.folderId = "unsorted";
   for (const childId of childIds) delete d.folders[childId].parentId;
   delete d.folders[id];
   if (d.selected === id || childIds.includes(d.selected)) d.select("all");
-
-  if (isList) {
-    await persistLibrary({ videos: state.videos, videoFolders: state.videoFolders });
-  } else {
-    await persistLibrary({ channels: state.channels, folders: state.folders });
-  }
   render();
+  await d.persist(`Deleted ${d.noun} “${folder.name}”.`, true);
+}
+
+async function renameTag(id) {
+  const tag = state.tags[id];
+  if (!tag) return;
+  const result = await promptDialog({ title: "Rename tag", value: tag.name, okLabel: "Save",
+    validate: (name) => (!name ? "Enter a tag name." : Object.entries(state.tags).some(([tid, t]) => tid !== id && t.name.toLowerCase() === name.toLowerCase()) ? "Another tag already has that name." : "") });
+  if (!result || result.value === tag.name || !state.tags[id]) return;
+  const old = tag.name;
+  state.tags[id].name = result.value;
+  render();
+  await persistLibrary({ tags: state.tags }, { undo: `Renamed tag “${old}” to “${result.value}”.` });
+}
+
+async function setTagColor(id, color) {
+  const tag = state.tags[id];
+  if (!tag || tag.color === color) return;
+  tag.color = color;
+  render();
+  await persistLibrary({ tags: state.tags }, { undo: `Changed the color of “${tag.name}”.` });
 }
 
 async function deleteTag(id) {
   const tag = state.tags[id];
   if (!tag) return;
-  if (!confirm(`Delete tag "${tag.name}"? It will be removed from all channels.`)) return;
-
+  const used = Object.values(state.channels).filter((ch) => ch.tags?.includes(id)).length;
+  const ok = await confirmDialog({ title: `Delete tag “${tag.name}”?`,
+    text: used ? `It's removed from ${plural(used, "channel")}.` : "No channel uses it.", okLabel: "Delete", danger: true });
+  if (!ok || !state.tags[id]) return;
   for (const ch of Object.values(state.channels)) {
     if (ch.tags?.includes(id)) ch.tags = ch.tags.filter((t) => t !== id);
   }
   delete state.tags[id];
   activeTagFilters.delete(id);
-  await persistLibrary({ channels: state.channels, tags: state.tags });
+  excludedTagFilters.delete(id);
   render();
+  await persistLibrary({ channels: state.channels, tags: state.tags }, { undo: `Deleted tag “${tag.name}”.` });
 }
 
-// ---------- Context menu ----------
+// ---------- Context menus (§8; kit openMenu) ----------
 
-function showContextMenu(x, y, items) {
-  const menu = el.contextMenu;
-  menu._opener = document.activeElement;
-  menu.innerHTML = "";
-  hideSubmenu();
-
-  for (const item of items) {
-    if (item.separator) {
-      const sep = document.createElement("div");
-      sep.className = "context-menu-separator";
-      menu.appendChild(sep);
-      continue;
-    }
-
-    const btn = document.createElement("button");
-    btn.textContent = item.label;
-    if (item.danger) btn.classList.add("danger");
-
-    if (item.submenu) {
-      btn.classList.add("has-submenu");
-      btn.addEventListener('click', event => {
-        event.stopPropagation();
-        const rect = btn.getBoundingClientRect();
-        showSubmenu(rect.right, rect.top, item.submenu());
-        el.contextSubmenu._opener = btn;
-        el.contextSubmenu.querySelector('button')?.focus();
-      });
-      btn.setAttribute('aria-haspopup', 'menu');
-      btn.addEventListener("mouseenter", () => {
-        const btnRect = btn.getBoundingClientRect();
-        showSubmenu(btnRect.right, btnRect.top, item.submenu());
-      });
-    } else {
-      btn.addEventListener("mouseenter", hideSubmenu);
-      btn.addEventListener("click", () => {
-        hideContextMenu();
-        item.action();
-      });
-    }
-
-    menu.appendChild(btn);
-  }
-
-  menu.hidden = false;
-  // keep the menu inside the viewport
-  const rect = menu.getBoundingClientRect();
-  menu.style.left = Math.min(x, window.innerWidth - rect.width - 8) + "px";
-  menu.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
-}
-
-// Reveal `node` and clamp it into the viewport near (x, y). Shared by the two
-// submenu levels, which position identically.
-function positionSubmenu(node, x, y) {
-  node.hidden = false;
-  const rect = node.getBoundingClientRect();
-  const left = x + 4;
-  const adjustedLeft = left + rect.width + 8 > window.innerWidth ? x - rect.width - 4 : left;
-  node.style.left = Math.max(4, adjustedLeft) + "px";
-  node.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
-}
-
-function showSubmenu(x, y, items) {
-  const sub = el.contextSubmenu;
-  sub.innerHTML = "";
-  hideSubSubmenu();
-
-  for (const item of items) {
-    const btn = document.createElement("button");
-    btn.textContent = item.label;
-    if (item.active) btn.classList.add("active-folder");
-
-    if (item.submenu) {
-      btn.classList.add("has-submenu");
-      btn.addEventListener('click', event => {
-        event.stopPropagation();
-        const rect = btn.getBoundingClientRect();
-        showSubSubmenu(rect.right, rect.top, item.submenu());
-        el.contextSubSubmenu._opener = btn;
-        el.contextSubSubmenu.querySelector('button')?.focus();
-      });
-      btn.setAttribute('aria-haspopup', 'menu');
-      btn.addEventListener("mouseenter", () => {
-        const r = btn.getBoundingClientRect();
-        showSubSubmenu(r.right, r.top, item.submenu());
-      });
-    } else {
-      btn.addEventListener("mouseenter", hideSubSubmenu);
-      btn.addEventListener("click", () => {
-        hideContextMenu();
-        item.action();
-      });
-    }
-
-    sub.appendChild(btn);
-  }
-
-  positionSubmenu(sub, x, y);
-}
-
-function showSubSubmenu(x, y, items) {
-  const sub = el.contextSubSubmenu;
-  sub.innerHTML = "";
-  for (const item of items) {
-    const btn = document.createElement("button");
-    btn.textContent = item.label;
-    if (item.active) btn.classList.add("active-folder");
-    btn.addEventListener("click", () => {
-      hideContextMenu();
-      item.action();
-    });
-    sub.appendChild(btn);
-  }
-  positionSubmenu(sub, x, y);
-}
-
-function hideSubSubmenu() {
-  el.contextSubSubmenu.hidden = true;
-}
-
-function hideSubmenu() {
-  el.contextSubmenu.hidden = true;
-  hideSubSubmenu();
-}
-
-function hideContextMenu() {
-  el.contextMenu.hidden = true;
-  hideSubmenu();
-}
-
-// Generic folder-picker submenu. `onPick(folderId)` fires on choice; `isActive`
-// (optional) marks the currently-selected destination. Only leaf folders are
-// valid targets — parents nest their children in a further submenu. `folders`
-// defaults to channel folders; pass state.videoFolders for Watch Later lists.
-function folderSubmenuItems(onPick, isActive = () => false, folders = state.folders) {
-  return getTopLevelFoldersOrdered(folders).map(([id, f]) => {
-    const children = Object.entries(folders)
-      .filter(([, cf]) => cf.parentId === id)
-      .sort((a, b) => (a[1].order ?? 0) - (b[1].order ?? 0));
-
-    if (children.length === 0) {
-      return { label: f.name, active: isActive(id), action: () => onPick(id) };
-    }
+// A folder picker submenu: leaf folders pick, a group cascades into its
+// children (groups hold no items). ✓ marks `current`. `folders` defaults to
+// channel folders; pass state.videoFolders for Watch Later lists.
+function folderMenuItems(onPick, current, folders = state.folders) {
+  return getTopLevelFoldersOrdered(folders).map(([id]) => {
+    const children = getChildFolderIds(id, folders).sort((a, b) => (folders[a].order ?? 0) - (folders[b].order ?? 0));
+    if (!children.length) return { label: folderLabel(id, folders), checked: current === id, action: () => onPick(id) };
     return {
-      label: f.name,
-      active: children.some(([cid]) => isActive(cid)),
-      submenu: () => children.map(([cid, cf]) => ({
-        label: cf.name,
-        active: isActive(cid),
-        action: () => onPick(cid),
-      })),
+      label: folderLabel(id, folders), checked: children.includes(current),
+      submenu: () => children.map((cid) => ({ label: folderLabel(cid, folders), checked: current === cid, action: () => onPick(cid) })),
     };
   });
 }
 
-function buildFolderSubmenu(channelId, ch) {
-  const moveTo = async (folderId) => {
-    state.channels[channelId].folderId = folderId;
-    await persistLibrary({ channels: state.channels });
-    renderFolders();
-    if (currentFolderId !== "all") renderGrid();
-  };
-  return folderSubmenuItems(moveTo, (id) => ch.folderId === id);
-}
-
-// Only active languages appear in single-channel and bulk menus.
-function languageSubmenuItems(onPick, isActive = () => false) {
+// Only active languages appear in the menus (§14).
+function languageMenuItems(onPick, current) {
   return [
-    { label: "— none —", active: isActive(null), action: () => onPick(null) },
-    ...LANGUAGES.map(language => ({ label: langLabel(language), active: isActive(language), action: () => onPick(language) })),
+    { label: "— none —", checked: current === null, action: () => onPick(null) },
+    ...LANGUAGES.map((language) => ({ label: langLabel(language), color: langColor(language), checked: current === language, action: () => onPick(language) })),
   ];
 }
 
-async function setChannelLanguage(channelId, lang) {
-  const ch = state.channels[channelId];
+function showChannelContextMenu(at, id) {
+  const ch = state.channels[id];
   if (!ch) return;
-  ch.language = lang || null;
-  await persistLibrary({ channels: state.channels });
-  render(); // the filter bar gains/loses a language chip with the last channel using it
+  const ids = [id];
+  const language = canonicalLanguage(ch.language) || null;
+  openMenu(at, [
+    { label: "Move to folder", submenu: () => folderMenuItems((fid) => moveChannels(ids, fid), ch.folderId || "unsorted") },
+    { label: "Set language", submenu: () => languageMenuItems((lang) => setChannelLanguage(ids, lang), LANGUAGES.includes(language) ? language : language ? undefined : null) },
+    { label: "Tags…", action: () => openTagPopover(ids, at) },
+    { sep: true },
+    { label: ch.active ? "Mark inactive" : "Mark active", action: () => setChannelFlag(ids, "active", !ch.active) },
+    { label: ch.finished ? "Mark unfinished" : "Mark finished", action: () => setChannelFlag(ids, "finished", !ch.finished) },
+    { label: ch.trackVideos ? "Stop tracking videos" : "Track videos", action: () => setChannelFlag(ids, "trackVideos", !ch.trackVideos) },
+    { sep: true },
+    { label: "Refresh stats", action: () => runRefresh(ids) },
+    { label: "Fetch videos…", action: () => openFetchVideosModal(ids) },
+    { label: "Open channel", action: () => openChannel(id) },
+    { sep: true },
+    { label: "Delete channel", danger: true, action: () => deleteChannels(ids) },
+  ], { title: ch.name });
 }
 
-// Watch Later "move to list" submenu — the video-list equivalent of the channel
-// folder submenu.
-function buildListSubmenu(videoId, v) {
-  const moveTo = (listId) => moveVideoToList(videoId, listId);
-  return folderSubmenuItems(moveTo, (id) => (v.folderId || "unsorted") === id, state.videoFolders);
-}
-
-// ---------- Multi-select ----------
-
-// Ctrl/Cmd toggles one row; Shift add/removes the whole run from the anchor to
-// the clicked row (add vs remove is decided by the clicked row's current state).
-function handleSelectionClick(channelId, e) {
-  const ordered = getFilteredChannels().map((c) => c.id);
-
-  if (e.shiftKey && selectionAnchor && ordered.includes(selectionAnchor)) {
-    const a = ordered.indexOf(selectionAnchor);
-    const b = ordered.indexOf(channelId);
-    const [lo, hi] = a < b ? [a, b] : [b, a];
-    const adding = !selectedChannelIds.has(channelId);
-    for (let i = lo; i <= hi; i++) {
-      if (adding) selectedChannelIds.add(ordered[i]);
-      else selectedChannelIds.delete(ordered[i]);
-    }
-  } else {
-    if (selectedChannelIds.has(channelId)) selectedChannelIds.delete(channelId);
-    else selectedChannelIds.add(channelId);
-  }
-  selectionAnchor = channelId;
-  paintSelection();
-}
-
-// Toggle the .selected class on rows already in the DOM. Rows appended later by
-// the scroll pager pick up the class in buildChannelRow.
-function paintSelection() {
-  for (const row of el.channelGrid.querySelectorAll("[data-channel-id]")) {
-    row.classList.toggle("selected", selectedChannelIds.has(row.dataset.channelId));
-  }
-}
-
-function clearSelection() {
-  selectedChannelIds.clear();
-  selectionAnchor = null;
-  paintSelection();
-}
-
-// Apply `fn` to every selected channel, persist once, then clear + re-render.
-async function bulkMutate(ids, fn) {
-  for (const id of ids) {
-    const ch = state.channels[id];
-    if (ch) fn(ch);
-  }
-  await persistLibrary({ channels: state.channels });
-  clearSelection();
-  render(); // not just the grid: a language/tag edit also reshapes the filter bar
-}
-
-async function bulkDelete(ids) {
-  if (!confirm(`Delete ${ids.length} channels from MyTube? This cannot be undone.`)) return;
-  for (const id of ids) delete state.channels[id];
-  await persistLibrary({ channels: state.channels });
-  clearSelection();
-  render();
-}
-
-function showBulkContextMenu(x, y, ids) {
+function showBulkContextMenu(at, ids) {
   const n = ids.length;
   const tags = Object.entries(state.tags).sort((a, b) => a[1].name.localeCompare(b[1].name));
-
-  showContextMenu(x, y, [
-    {
-      label: `Move ${n} to folder`,
-      submenu: () => folderSubmenuItems((fid) => bulkMutate(ids, (ch) => (ch.folderId = fid))),
-    },
-    {
-      label: "Set language",
-      submenu: () => languageSubmenuItems((lang) => bulkMutate(ids, (ch) => (ch.language = lang))),
-    },
+  // The value every selected channel shares, else undefined (no ✓).
+  const common = (read) => {
+    const values = new Set(ids.map((id) => read(state.channels[id] || {})));
+    return values.size === 1 ? [...values][0] : undefined;
+  };
+  openMenu(at, [
+    { label: `Move ${n} to folder`, submenu: () => folderMenuItems((fid) => moveChannels(ids, fid), common((c) => c.folderId || "unsorted")) },
+    { label: "Set language", submenu: () => languageMenuItems((lang) => setChannelLanguage(ids, lang), common((c) => canonicalLanguage(c.language) || null)) },
     {
       label: "Add tag",
-      submenu: () =>
-        tags.length
-          ? tags.map(([tid, t]) => ({
-              label: t.name,
-              action: () =>
-                bulkMutate(ids, (ch) => {
-                  if (!ch.tags) ch.tags = [];
-                  if (!ch.tags.includes(tid)) ch.tags.push(tid);
-                }),
-            }))
-          : [{ label: "No tags yet", action: () => {} }],
+      submenu: () => tags.length
+        ? tags.map(([tid, t]) => ({ label: t.name, color: t.color, action: () => setChannelTag(ids, tid, true) }))
+        : [{ label: "No tags yet", disabled: true }],
     },
     {
       label: "Remove tag",
       submenu: () => {
-        // Only tags that at least one selected channel actually carries.
-        const present = new Set();
-        for (const id of ids) for (const tid of state.channels[id]?.tags || []) present.add(tid);
+        // Only tags at least one selected channel actually carries.
+        const present = new Set(ids.flatMap((id) => state.channels[id]?.tags || []));
         const removable = tags.filter(([tid]) => present.has(tid));
         return removable.length
-          ? removable.map(([tid, t]) => ({
-              label: t.name,
-              action: () =>
-                bulkMutate(ids, (ch) => {
-                  if (ch.tags) ch.tags = ch.tags.filter((t) => t !== tid);
-                }),
-            }))
-          : [{ label: "No tags on selection", action: () => {} }];
+          ? removable.map(([tid, t]) => ({ label: t.name, color: t.color, action: () => setChannelTag(ids, tid, false) }))
+          : [{ label: "No tags on the selection", disabled: true }];
       },
     },
-    { separator: true },
-    { label: "Mark active", action: () => bulkMutate(ids, (ch) => (ch.active = true)) },
-    { label: "Mark inactive", action: () => bulkMutate(ids, (ch) => (ch.active = false)) },
-    { label: "Mark finished", action: () => bulkMutate(ids, (ch) => (ch.finished = true)) },
-    { label: "Mark unfinished", action: () => bulkMutate(ids, (ch) => (ch.finished = false)) },
-    { separator: true },
-    { label: "Track videos", action: () => bulkMutate(ids, (ch) => (ch.trackVideos = true)) },
-    { label: "Stop tracking videos", action: () => bulkMutate(ids, (ch) => (ch.trackVideos = false)) },
-    { label: `Fetch all videos (${n})`, action: () => fetchAllVideos(ids) },
-    { separator: true },
-    { label: `Delete ${n} channels`, danger: true, action: () => bulkDelete(ids) },
-  ]);
+    { label: "Tags…", action: () => openTagPopover(ids, at) },
+    { sep: true },
+    { label: "Mark active", action: () => setChannelFlag(ids, "active", true) },
+    { label: "Mark inactive", action: () => setChannelFlag(ids, "active", false) },
+    { label: "Mark finished", action: () => setChannelFlag(ids, "finished", true) },
+    { label: "Mark unfinished", action: () => setChannelFlag(ids, "finished", false) },
+    { sep: true },
+    { label: "Track videos", action: () => setChannelFlag(ids, "trackVideos", true) },
+    { label: "Stop tracking videos", action: () => setChannelFlag(ids, "trackVideos", false) },
+    { label: `Refresh stats (${n})`, action: () => runRefresh(ids) },
+    { label: `Fetch videos (${n})…`, action: () => openFetchVideosModal(ids) },
+    { label: n > 10 ? "Open the first 10" : `Open ${n}`, action: () => ids.slice(0, 10).forEach((id) => openChannel(id, true)) },
+    { sep: true },
+    { label: `Delete ${n} channels`, danger: true, action: () => deleteChannels(ids) },
+  ], { title: plural(n, "channel") });
 }
 
-// ---------- Video multi-select (New / Watch Later) ----------
-
-// The displayed order of the active video view, for shift-range selection.
-function currentVideoOrder() {
-  return (currentView === "watchlater" ? getWatchLaterVideos() : getFilteredVideos()).map((v) => v.id);
+function showFolderContextMenu(at, id, li) {
+  const d = fdom();
+  const folder = d.folders[id];
+  if (!folder) return;
+  openMenu(at, [
+    { label: "Rename…", action: () => renameFolder(id) },
+    { label: folder.emoji ? "Change emoji…" : "Set emoji…", action: () => openEmojiInput(li, id) },
+    folder.emoji ? { label: "Remove emoji", action: () => setFolderEmoji(id, "") } : null,
+    // One nesting level: only top-level folders take subfolders.
+    !folder.parentId ? { label: `New sub${d.noun}…`, action: () => createFolder(id) } : null,
+    folder.parentId ? { label: "Move to top level", action: () => moveFolderToTopLevel(id) } : null,
+    { sep: true },
+    { label: `Delete ${d.noun}`, danger: true, action: () => deleteFolder(id) },
+  ], { title: folder.name });
 }
 
-// Ctrl/Cmd toggles one card; Shift add/removes the run from the anchor.
-function handleVideoSelectionClick(videoId, e) {
-  const ordered = currentVideoOrder();
-  if (e.shiftKey && videoSelectionAnchor && ordered.includes(videoSelectionAnchor)) {
-    const a = ordered.indexOf(videoSelectionAnchor);
-    const b = ordered.indexOf(videoId);
-    const [lo, hi] = a < b ? [a, b] : [b, a];
-    const adding = !selectedVideoIds.has(videoId);
-    for (let i = lo; i <= hi; i++) {
-      if (adding) selectedVideoIds.add(ordered[i]);
-      else selectedVideoIds.delete(ordered[i]);
-    }
+function showTagContextMenu(at, tagId) {
+  const tag = state.tags[tagId];
+  if (!tag) return;
+  openMenu(at, [
+    { label: "Rename…", action: () => renameTag(tagId) },
+    { label: "Color", submenu: () => TAG_PALETTE.map((color) => ({ label: color, color, checked: tag.color.toLowerCase() === color.toLowerCase(), action: () => setTagColor(tagId, color) })) },
+    { sep: true },
+    { label: "Delete tag", danger: true, action: () => deleteTag(tagId) },
+  ], { title: tag.name });
+}
+
+// One video card's menu. Actions read the video again when clicked — a
+// refresh can replace the record while the menu is open.
+function showVideoContextMenu(at, id) {
+  const v = state.videos[id];
+  if (!v) return;
+  const ids = [id];
+  const items = currentView === "removed"
+    ? [{ label: "Restore to New", action: () => setVideosHidden(ids, false) }, { label: "Open video", action: () => openVideo(id, false) }]
+    : [
+      { label: v.watched ? "Mark unwatched" : "Mark watched", action: () => setVideosWatched(ids, !v.watched) },
+      currentView === "watchlater" ? { label: "Move to list", submenu: () => folderMenuItems((listId) => moveVideosToList(ids, listId), v.folderId || "unsorted", state.videoFolders) } : null,
+      { label: "Open video", action: () => openVideo(id, false) },
+      { sep: true },
+      currentView === "watchlater"
+        ? { label: "Remove from Watch Later", danger: true, action: () => removeFromWatchLater(ids) }
+        : { label: "Remove", danger: true, action: () => setVideosHidden(ids, true) },
+    ];
+  openMenu(at, items, { title: v.title });
+}
+
+function showVideoBulkContextMenu(at, ids) {
+  const n = ids.length;
+  const items = [
+    { label: `Mark ${n} watched`, action: () => setVideosWatched(ids, true) },
+    { label: `Mark ${n} unwatched`, action: () => setVideosWatched(ids, false) },
+    { label: n > 10 ? "Open the first 10" : `Open ${n}`, action: () => ids.slice(0, 10).forEach((id) => openVideo(id, true)) },
+    { sep: true },
+  ];
+  if (currentView === "watchlater") {
+    items.push({ label: `Move ${n} to list`, submenu: () => folderMenuItems((listId) => moveVideosToList(ids, listId), undefined, state.videoFolders) });
+    items.push({ label: `Remove ${n} from Watch Later`, danger: true, action: () => removeFromWatchLater(ids) });
+  } else if (currentView === "removed") {
+    items.push({ label: `Restore ${n} to New`, action: () => setVideosHidden(ids, false) });
   } else {
-    if (selectedVideoIds.has(videoId)) selectedVideoIds.delete(videoId);
-    else selectedVideoIds.add(videoId);
+    items.push({ label: `Remove ${n} from feed`, danger: true, action: () => setVideosHidden(ids, true) });
   }
-  videoSelectionAnchor = videoId;
-  paintVideoSelection();
+  openMenu(at, items, { title: plural(n, "video") });
+}
+
+// ---------- Multi-select (§6) ----------
+
+// Repaint the selection on rendered rows/cards without a re-render; rows
+// appended later by the pager pick it up in buildChannelRow / videoCardHtml.
+function paintSelection() {
+  for (const row of el.channelGrid.querySelectorAll("[data-channel-id]")) {
+    row.classList.toggle("selected", channelSel.has(row.dataset.channelId));
+  }
+  renderSelectionCount();
 }
 
 function paintVideoSelection() {
   for (const card of document.querySelectorAll(".video-card[data-video-id]")) {
-    card.classList.toggle("selected", selectedVideoIds.has(card.dataset.videoId));
+    card.classList.toggle("selected", videoSel.has(card.dataset.videoId));
   }
+  renderSelectionCount();
 }
 
-function clearVideoSelection() {
-  if (!selectedVideoIds.size) return;
-  selectedVideoIds.clear();
-  videoSelectionAnchor = null;
-  paintVideoSelection();
+// "N selected" in accent next to the result count while a selection exists.
+function renderSelectionCount() {
+  const n = currentView === "channels" ? channelSel.size : videoSel.size;
+  el.selectionCount.hidden = !n;
+  el.selectionCount.textContent = n ? `${n.toLocaleString()} selected` : "";
 }
 
-// Apply `fn` to every selected video, persist once, then clear the selection.
-// The storage write re-renders both video views via onChanged.
-async function bulkVideoMutate(ids, fn) {
-  for (const id of ids) {
-    const v = state.videos[id];
-    if (v) fn(v);
+// The displayed order of the active video view — range selection and Select
+// all cover every card in it, rendered yet or not.
+function currentVideoOrder() {
+  if (currentView === "channels") return [];
+  return (currentView === "watchlater" ? getWatchLaterVideos() : getFilteredVideos()).map((v) => v.id);
+}
+
+// Marquee (drag from empty list space), Mod+A and Esc — fixed everyday
+// controls that stay on with the shortcuts turned off.
+function bindSelectionControls() {
+  const additive = (e) => selectionModifierPressed(e, controls);
+  attachMarquee(el.channelList, { scroller: el.main, rowSelector: ".channel-row", idOf: (row) => row.dataset.channelId, selection: channelSel, additive });
+  for (const grid of [el.videoFeed, el.watchLaterGrid]) {
+    attachMarquee(grid, { scroller: el.main, rowSelector: ".video-card", idOf: (card) => card.dataset.videoId, selection: videoSel, additive });
   }
-  await saveVideos();
-  clearVideoSelection();
-}
-
-async function bulkRemoveFromWatchLater(ids) {
-  for (const id of ids) {
-    const v = state.videos[id];
-    if (!v) continue;
-    v.saved = false; // kept as a tombstone — see removeFromWatchLater
-    delete v.folderId;
-  }
-  await saveVideos();
-  clearVideoSelection();
-}
-
-function showVideoBulkContextMenu(x, y, ids) {
-  const n = ids.length;
-  const items = [
-    { label: `Mark ${n} watched`, action: () => bulkVideoMutate(ids, (v) => (v.watched = true)) },
-    { label: `Mark ${n} unwatched`, action: () => bulkVideoMutate(ids, (v) => (v.watched = false)) },
-    { separator: true },
-  ];
-  if (currentView === "watchlater") {
-    items.push({
-      label: `Move ${n} to list`,
-      submenu: () => folderSubmenuItems(
-        (listId) => bulkVideoMutate(ids, (v) => { if (v.saved) v.folderId = listId; }),
-        () => false,
-        state.videoFolders
-      ),
-    });
-    items.push({ label: `Remove ${n} from Watch Later`, danger: true, action: () => bulkRemoveFromWatchLater(ids) });
-  } else if (currentView === 'removed') {
-    items.push({ label: `Restore ${n} to New`, action: () => bulkVideoMutate(ids, v => { v.hidden = false; }) });
-  } else {
-    items.push({ label: `Remove ${n} from feed`, danger: true, action: () => bulkVideoMutate(ids, (v) => (v.hidden = true)) });
-  }
-  showContextMenu(x, y, items);
-}
-
-async function deleteChannel(channelId) {
-  const ch = state.channels[channelId];
-  if (!ch) return;
-  const confirmed = confirm(`Delete "${ch.name}" from MyTube? This cannot be undone.`);
-  if (!confirmed) return;
-  delete state.channels[channelId];
-  await persistLibrary({ channels: state.channels });
-  render();
-}
-
-let tagPickerEl = null;
-
-// Dropdown anchored to a channel's "+ tag" chip: pick an existing tag to add,
-// or fall through to "+ New tag" to create one inline.
-function openTagPicker(chipEl, channelId) {
-  closeTagPicker();
-
-  const ch = state.channels[channelId];
-  const current = new Set(ch.tags || []);
-  const available = Object.entries(state.tags)
-    .filter(([id]) => !current.has(id))
-    .sort((a, b) => a[1].name.localeCompare(b[1].name));
-
-  const menu = document.createElement("div");
-  menu.className = "tag-picker context-menu";
-
-  const listWrap = document.createElement("div");
-  listWrap.className = "tag-picker-list";
-  if (available.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "tag-picker-empty";
-    empty.textContent = current.size ? "All tags added" : "No tags yet";
-    listWrap.appendChild(empty);
-  } else {
-    for (const [id, tag] of available) {
-      const row = document.createElement("div");
-      row.className = "tag-picker-item";
-
-      const addBtn = document.createElement("button");
-      addBtn.className = "tag-picker-add";
-      const swatch = document.createElement("span");
-      swatch.className = "tag-picker-swatch";
-      swatch.style.background = tag.color;
-      addBtn.appendChild(swatch);
-      addBtn.appendChild(document.createTextNode(tag.name));
-      addBtn.addEventListener("click", async () => {
-        closeTagPicker();
-        await addTagIdToChannel(channelId, id);
-      });
-
-      const delBtn = document.createElement("button");
-      delBtn.className = "tag-picker-del";
-      delBtn.textContent = "×";
-      delBtn.title = "Delete tag everywhere";
-      delBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        closeTagPicker();
-        await deleteTag(id);
-      });
-
-      row.appendChild(addBtn);
-      row.appendChild(delBtn);
-      listWrap.appendChild(row);
-    }
-  }
-  menu.appendChild(listWrap);
-
-  const sep = document.createElement("div");
-  sep.className = "context-menu-separator";
-  menu.appendChild(sep);
-
-  const newBtn = document.createElement("button");
-  newBtn.className = "tag-picker-item tag-picker-new";
-  newBtn.textContent = "+ New tag";
-  newBtn.addEventListener("click", () => showNewTagInput(menu, channelId));
-  menu.appendChild(newBtn);
-
-  document.body.appendChild(menu);
-  tagPickerEl = menu;
-  positionTagPicker(chipEl, menu);
-
-  // Defer so the click that opened the picker doesn't immediately close it.
-  setTimeout(() => document.addEventListener("click", onTagPickerOutside), 0);
-  document.addEventListener("scroll", closeTagPicker, true);
-  document.addEventListener("keydown", onTagPickerKeydown);
-}
-
-function positionTagPicker(chipEl, menu) {
-  const rect = chipEl.getBoundingClientRect();
-  const menuRect = menu.getBoundingClientRect();
-  let left = rect.left;
-  let top = rect.bottom + 4;
-  if (left + menuRect.width > window.innerWidth - 8) {
-    left = window.innerWidth - menuRect.width - 8;
-  }
-  if (top + menuRect.height > window.innerHeight - 8) {
-    top = rect.top - menuRect.height - 4;
-  }
-  menu.style.left = Math.max(8, left) + "px";
-  menu.style.top = Math.max(8, top) + "px";
-}
-
-// Swap the "+ New tag" button for an inline text field to name a new tag.
-function showNewTagInput(menu, channelId) {
-  const newBtn = menu.querySelector(".tag-picker-new");
-  if (!newBtn) return;
-
-  const input = document.createElement("input");
-  input.className = "field-input tag-picker-input";
-  input.placeholder = "tag name, press Enter";
-  newBtn.replaceWith(input);
-  input.focus();
-
-  input.addEventListener("keydown", async (e) => {
-    if (e.key === "Enter") {
-      const name = input.value.trim();
-      closeTagPicker();
-      if (name) await addTagToChannel(channelId, name);
-    } else if (e.key === "Escape") {
-      e.stopPropagation();
-      closeTagPicker();
+  document.addEventListener("keydown", (e) => {
+    if (e.defaultPrevented || e.isComposing || overlayOpen() || isTypingTarget(e.target)) return;
+    const sel = currentView === "channels" ? channelSel : videoSel;
+    if (e.key === "Escape") {
+      if (sel.clear()) e.preventDefault();
+    } else if ((IS_MAC ? e.metaKey : e.ctrlKey) && !e.altKey && !e.shiftKey && e.code === "KeyA") {
+      e.preventDefault();
+      sel.set(currentView === "channels" ? getFilteredChannels().map((c) => c.id) : currentVideoOrder(), sel.anchor);
     }
   });
-}
-
-function onTagPickerOutside(e) {
-  if (tagPickerEl && tagPickerEl.contains(e.target)) return;
-  closeTagPicker();
-}
-
-function onTagPickerKeydown(e) {
-  if (e.key === "Escape") closeTagPicker();
-}
-
-function closeTagPicker() {
-  if (!tagPickerEl) return;
-  tagPickerEl.remove();
-  tagPickerEl = null;
-  document.removeEventListener("click", onTagPickerOutside);
-  document.removeEventListener("scroll", closeTagPicker, true);
-  document.removeEventListener("keydown", onTagPickerKeydown);
-}
-
-async function addTagIdToChannel(channelId, tagId) {
-  const ch = state.channels[channelId];
-  if (!ch || !state.tags[tagId]) return;
-  if (!ch.tags) ch.tags = [];
-  if (!ch.tags.includes(tagId)) {
-    ch.tags.push(tagId);
-    await persistLibrary({ channels: state.channels });
-  }
-}
-
-async function addTagToChannel(channelId, name) {
-  let tagId = Object.keys(state.tags).find(
-    (id) => state.tags[id].name.toLowerCase() === name.toLowerCase()
-  );
-  if (!tagId) {
-    tagId = slugify(name) + "-" + Date.now().toString(36).slice(-3);
-    state.tags[tagId] = { name, color: nextTagColor() };
-    await persistLibrary({ tags: state.tags });
-  }
-  const ch = state.channels[channelId];
-  if (!ch.tags) ch.tags = [];
-  if (!ch.tags.includes(tagId)) {
-    ch.tags.push(tagId);
-    await persistLibrary({ channels: state.channels });
-  }
 }

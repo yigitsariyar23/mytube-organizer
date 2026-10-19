@@ -9,12 +9,21 @@ const db = {
   videoFolders: { unsorted: { name: 'Unfiled', order: 0 }, 'learning-1': { name: 'Learning', order: 1 } },
   tags: { 'tag-1': { name: 'Learning', color: '#A8DADC' } },
   videos: Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`v${i}`, { id: `v${i}`, channelId: `c${i % 180}`, title: `Video ${String(i).padStart(4, '0')} — exploring the world`, thumbnail: image, duration: 120 + i,
-    published: new Date(Date.now() - (i + 1) * 3600000).toISOString(), watched: i % 9 === 0, saved: i % 5 === 0, hidden: i % 11 === 0, folderId: 'unsorted', addedAt: Date.now() - i * 3600000 }])),
+    published: new Date(Date.now() - (i + 1) * 3600000).toISOString(), watched: i % 9 === 0, saved: i % 5 === 0, hidden: i % 11 === 0, folderId: 'unsorted', addedAt: Date.now() - i * 3600000, ...(i % 7 === 3 ? { kind: 'short' } : i % 13 === 5 ? { kind: 'live' } : {}) }])),
   currentView: 'new', gistToken: 'fake-fixture-token', gistId: 'fixture', lastSyncCheckAt: Date.now(), languages: ['English']
 };
 window.fixture = { db, remote: structuredClone(db), opened: [], rssFailures: new Set(), confirmations: [] };
-// Keep test confirmations inspectable without a native modal blocking automation.
-window.confirm = message => { window.fixture.confirmations.push(message); return true; };
+// The dashboard never uses a native dialog (DESIGN §3); fail loudly if it does.
+window.confirm = window.alert = window.prompt = () => { throw new Error('Native dialogs are not allowed'); };
+// Kit confirmDialogs (no text field): record the text and accept, so automation
+// isn't blocked. promptDialogs (with a field) are left for the checks to fill.
+new MutationObserver(records => {
+  for (const record of records) for (const node of record.addedNodes) {
+    if (!(node instanceof HTMLDialogElement) || !node.classList.contains('ui-dialog') || node.querySelector('input')) continue;
+    window.fixture.confirmations.push(node.textContent);
+    node.querySelector('button[value="ok"]')?.click();
+  }
+}).observe(document.body, { childList: true });
 const scenario = new URLSearchParams(location.search).get('scenario');
 if (scenario === 'sync' || scenario === 'stale') {
   window.fixture.remote.tags['tag-1'].name = 'Remote learning';

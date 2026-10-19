@@ -9,7 +9,7 @@ async function add(source, destination = source) {
   const binary = source.endsWith('.png');
   assets['/' + destination] = { type:types[path.extname(destination)], body:data.toString(binary ? 'base64':'utf8'), encoding:binary ? 'base64':'utf8' };
 }
-for (const dir of ['dashboard','shared','mobile','icons']) {
+for (const dir of ['dashboard','shared','shared/ui','mobile','icons']) {
   for (const file of await fs.readdir(path.join(root, dir))) {
     if (/\.(js|html|css|png)$/.test(file) && file !== 'server.js') await add(`${dir}/${file}`);
   }
